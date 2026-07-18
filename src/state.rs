@@ -48,6 +48,41 @@ pub enum AppMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivePane {
+    NavigationRail,
+    MillerColumns,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DriveInfo {
+    pub path: PathBuf,
+    pub label: String,
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum RailItem {
+    Header(String),
+    Location {
+        name: String,
+        path: PathBuf,
+        icon: String,
+    },
+    Drive {
+        info: DriveInfo,
+        icon: String,
+    },
+    Separator,
+}
+
+#[derive(Clone)]
+pub struct NavigationRailState {
+    pub selected: usize,
+    pub items: Vec<RailItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DividerType {
     NavToMiller,
     MillerToMiller(usize),
@@ -95,6 +130,8 @@ pub struct AppState {
     pub layout_geometry:  Arc<Mutex<LayoutGeometry>>,
     pub nav_rail_width:   u16,
     pub nav_rail_visible: bool,
+    pub active_pane:      ActivePane,
+    pub rail_state:       NavigationRailState,
 
     // Windows Native preview overlay manager
     pub native_preview: crate::native::NativePreviewManager,
@@ -116,6 +153,112 @@ impl AppState {
             selected: 0,
         };
 
+        let mut rail_items = Vec::new();
+        rail_items.push(RailItem::Header("DRIVES & LOCATIONS".to_string()));
+        
+        let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("C:\\"));
+        let username = home_dir.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "User".to_string());
+            
+        rail_items.push(RailItem::Location {
+            name: "Home".to_string(),
+            path: home_dir.clone(),
+            icon: "🏠".to_string(),
+        });
+        
+        if let Some(pictures) = dirs::picture_dir() {
+            rail_items.push(RailItem::Location {
+                name: "Gallery".to_string(),
+                path: pictures.clone(),
+                icon: "🖼️".to_string(),
+            });
+        }
+        
+        rail_items.push(RailItem::Location {
+            name: format!("{} - Personal", username),
+            path: home_dir.clone(),
+            icon: "☁️".to_string(),
+        });
+        
+        rail_items.push(RailItem::Separator);
+        
+        if let Some(desktop) = dirs::desktop_dir() {
+            rail_items.push(RailItem::Location {
+                name: "Desktop".to_string(),
+                path: desktop,
+                icon: "💻".to_string(),
+            });
+        }
+        
+        if let Some(downloads) = dirs::download_dir() {
+            rail_items.push(RailItem::Location {
+                name: "Downloads".to_string(),
+                path: downloads,
+                icon: "📥".to_string(),
+            });
+        }
+        
+        if let Some(docs) = dirs::document_dir() {
+            rail_items.push(RailItem::Location {
+                name: "Documents".to_string(),
+                path: docs,
+                icon: "📄".to_string(),
+            });
+        }
+        
+        if let Some(pictures) = dirs::picture_dir() {
+            rail_items.push(RailItem::Location {
+                name: "Pictures".to_string(),
+                path: pictures,
+                icon: "🖼️".to_string(),
+            });
+        }
+        
+        if let Some(music) = dirs::audio_dir() {
+            rail_items.push(RailItem::Location {
+                name: "Music".to_string(),
+                path: music,
+                icon: "🎵".to_string(),
+            });
+        }
+        
+        if let Some(videos) = dirs::video_dir() {
+            rail_items.push(RailItem::Location {
+                name: "Videos".to_string(),
+                path: videos,
+                icon: "🎥".to_string(),
+            });
+        }
+        
+        rail_items.push(RailItem::Location {
+            name: "Recycle Bin".to_string(),
+            path: PathBuf::from("C:\\$Recycle.Bin"),
+            icon: "🗑️".to_string(),
+        });
+        
+        rail_items.push(RailItem::Separator);
+        rail_items.push(RailItem::Header("Drives".to_string()));
+        
+        let drives = get_windows_drives();
+        for drive in drives {
+            rail_items.push(RailItem::Drive {
+                info: drive,
+                icon: "💾".to_string(),
+            });
+        }
+        
+        rail_items.push(RailItem::Location {
+            name: "Network".to_string(),
+            path: PathBuf::from("\\\\"),
+            icon: "🌐".to_string(),
+        });
+
+        let rail_state = NavigationRailState {
+            selected: 1,
+            items: rail_items,
+        };
+
         Ok(Self {
             levels:         vec![level],
             current_level:  0,
@@ -128,7 +271,9 @@ impl AppState {
             column_ratios:    vec![0.10, 0.10, 0.12, 0.18, 0.50],
             layout_geometry:  Arc::new(Mutex::new(LayoutGeometry::default())),
             nav_rail_width:   28,
-            nav_rail_visible: false,
+            nav_rail_visible: true,
+            active_pane:      ActivePane::MillerColumns,
+            rail_state,
             preview_scroll: 0,
             image_zoom: 1.0,
             image_rotation: 0,
@@ -241,15 +386,37 @@ impl AppState {
         
         if preview_width > 0 {
             let pr = geo.preview_outer_rect;
+            let is_image = if let Some(last_level) = self.levels.last() {
+                if !last_level.files.is_empty() && last_level.selected < last_level.files.len() {
+                    let selected = &last_level.files[last_level.selected];
+                    if selected.is_dir {
+                        false
+                    } else {
+                        let ext = selected.path.extension()
+                            .and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                        matches!(ext.as_str(), "jpg"|"jpeg"|"png"|"bmp"|"gif"|"webp"|"tiff"|"tif"|"ico")
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
             let has_metadata_space = pr.height > 20;
-            let metadata_height = if has_metadata_space { 12 } else { 0 };
+            let metadata_height = if has_metadata_space {
+                if is_image { 10 } else { 6 }
+            } else {
+                0
+            };
+            let controls_height = if is_image { 3 } else { 0 };
             
             let preview_vertical = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(4), // Header
                     Constraint::Min(0),    // Viewport
-                    Constraint::Length(3), // Controls/separator
+                    Constraint::Length(controls_height), // Controls/separator
                     Constraint::Length(metadata_height), // Metadata
                 ])
                 .split(pr);
@@ -292,6 +459,59 @@ impl AppState {
         }
         
         geo
+    }
+
+    pub fn move_down_rail(&mut self) {
+        let items_len = self.rail_state.items.len();
+        if items_len == 0 { return; }
+        let mut idx = self.rail_state.selected;
+        loop {
+            idx = (idx + 1) % items_len;
+            match &self.rail_state.items[idx] {
+                RailItem::Header(_) | RailItem::Separator => continue,
+                _ => break,
+            }
+        }
+        self.rail_state.selected = idx;
+    }
+
+    pub fn move_up_rail(&mut self) {
+        let items_len = self.rail_state.items.len();
+        if items_len == 0 { return; }
+        let mut idx = self.rail_state.selected;
+        loop {
+            idx = (idx + items_len - 1) % items_len;
+            match &self.rail_state.items[idx] {
+                RailItem::Header(_) | RailItem::Separator => continue,
+                _ => break,
+            }
+        }
+        self.rail_state.selected = idx;
+    }
+
+    pub fn select_rail_item(&mut self) -> anyhow::Result<()> {
+        let idx = self.rail_state.selected;
+        if idx < self.rail_state.items.len() {
+            let path = match &self.rail_state.items[idx] {
+                RailItem::Location { path, .. } => Some(path.clone()),
+                RailItem::Drive { info, .. } => Some(info.path.clone()),
+                _ => None,
+            };
+            if let Some(p) = path {
+                if let Ok(files) = list_dir(&p) {
+                    let level = DirLevel {
+                        path: p,
+                        files,
+                        selected: 0,
+                    };
+                    self.levels = vec![level];
+                    self.current_level = 0;
+                    self.active_pane = ActivePane::MillerColumns;
+                    self.reset_image_state();
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn handle_events(&mut self) -> anyhow::Result<bool> {
@@ -497,17 +717,79 @@ impl AppState {
                     }
 
                     // ── Navigation — only when Normal mode ──────────────────
-                    (KeyCode::Down, _) if self.mode == AppMode::Normal => self.move_down(),
-                    (KeyCode::Up, _)   if self.mode == AppMode::Normal => self.move_up(),
-                    (KeyCode::Left, _) if self.mode == AppMode::Normal => { self.go_left()?; self.reset_image_state(); }
-                    (KeyCode::Right, _) if self.mode == AppMode::Normal => { self.go_right()?; self.reset_image_state(); }
-                    (KeyCode::Enter, _) if self.mode == AppMode::Normal => { self.open_selected(); }
+                    (KeyCode::Down, _) if self.mode == AppMode::Normal => {
+                        if self.active_pane == ActivePane::NavigationRail {
+                            self.move_down_rail();
+                        } else {
+                            self.move_down();
+                        }
+                    }
+                    (KeyCode::Up, _) if self.mode == AppMode::Normal => {
+                        if self.active_pane == ActivePane::NavigationRail {
+                            self.move_up_rail();
+                        } else {
+                            self.move_up();
+                        }
+                    }
+                    (KeyCode::Left, _) if self.mode == AppMode::Normal => {
+                        if self.active_pane == ActivePane::NavigationRail {
+                            // Do nothing
+                        } else if self.current_level == 0 {
+                            self.active_pane = ActivePane::NavigationRail;
+                        } else {
+                            self.go_left()?;
+                            self.reset_image_state();
+                        }
+                    }
+                    (KeyCode::Right, _) if self.mode == AppMode::Normal => {
+                        if self.active_pane == ActivePane::NavigationRail {
+                            self.select_rail_item()?;
+                        } else {
+                            self.go_right()?;
+                            self.reset_image_state();
+                        }
+                    }
+                    (KeyCode::Enter, _) if self.mode == AppMode::Normal => {
+                        if self.active_pane == ActivePane::NavigationRail {
+                            self.select_rail_item()?;
+                        } else {
+                            self.open_selected();
+                        }
+                    }
 
                     // ── Navigation — Vim keys ────────────────────────────────
-                    (KeyCode::Char('j'), KeyModifiers::NONE) if self.mode == AppMode::Normal => self.move_down(),
-                    (KeyCode::Char('k'), KeyModifiers::NONE) if self.mode == AppMode::Normal => self.move_up(),
-                    (KeyCode::Char('h'), KeyModifiers::NONE) if self.mode == AppMode::Normal => { self.go_left()?; self.reset_image_state(); }
-                    (KeyCode::Char('l'), KeyModifiers::NONE) if self.mode == AppMode::Normal => { self.go_right()?; self.reset_image_state(); }
+                    (KeyCode::Char('j'), KeyModifiers::NONE) if self.mode == AppMode::Normal => {
+                        if self.active_pane == ActivePane::NavigationRail {
+                            self.move_down_rail();
+                        } else {
+                            self.move_down();
+                        }
+                    }
+                    (KeyCode::Char('k'), KeyModifiers::NONE) if self.mode == AppMode::Normal => {
+                        if self.active_pane == ActivePane::NavigationRail {
+                            self.move_up_rail();
+                        } else {
+                            self.move_up();
+                        }
+                    }
+                    (KeyCode::Char('h'), KeyModifiers::NONE) if self.mode == AppMode::Normal => {
+                        if self.active_pane == ActivePane::NavigationRail {
+                            // Do nothing
+                        } else if self.current_level == 0 {
+                            self.active_pane = ActivePane::NavigationRail;
+                        } else {
+                            self.go_left()?;
+                            self.reset_image_state();
+                        }
+                    }
+                    (KeyCode::Char('l'), KeyModifiers::NONE) if self.mode == AppMode::Normal => {
+                        if self.active_pane == ActivePane::NavigationRail {
+                            self.select_rail_item()?;
+                        } else {
+                            self.go_right()?;
+                            self.reset_image_state();
+                        }
+                    }
 
                     // ── Jump top / bottom ────────────────────────────────────
                     (KeyCode::Char('g'), KeyModifiers::NONE) if self.mode == AppMode::Normal => self.jump_top(),
@@ -602,18 +884,30 @@ impl AppState {
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
                         let geo = self.layout_geometry.lock().clone();
-                        let mut divider_found = false;
+                        let mut click_processed = false;
                         
-                        // Check dividers first
-                        for (idx, dr) in geo.divider_rects.iter().enumerate() {
-                            if mouse.column >= dr.x && mouse.column < dr.x + dr.width {
-                                self.dragging_divider = Some(idx);
-                                divider_found = true;
+                        // Check navigation rail rows first!
+                        for (item_idx, rect) in geo.nav_row_rects.iter() {
+                            if mouse.column >= rect.x && mouse.column < rect.x + rect.width && mouse.row == rect.y {
+                                self.rail_state.selected = *item_idx;
+                                let _ = self.select_rail_item();
+                                click_processed = true;
                                 break;
                             }
                         }
                         
-                        if !divider_found {
+                        if !click_processed {
+                            // Check dividers first
+                            for (idx, dr) in geo.divider_rects.iter().enumerate() {
+                                if mouse.column >= dr.x && mouse.column < dr.x + dr.width {
+                                    self.dragging_divider = Some(idx);
+                                    click_processed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        if !click_processed {
                             // Check breadcrumbs
                             if mouse.row == geo.header_rect.y && mouse.column >= geo.header_rect.x && mouse.column < geo.header_rect.x + geo.header_rect.width {
                                 // TODO: Breadcrumb navigation
@@ -623,7 +917,9 @@ impl AppState {
                                 for (pane_idx, rows) in geo.row_rects.iter() {
                                     for (file_idx, rect) in rows {
                                         if mouse.column >= rect.x && mouse.column < rect.x + rect.width && mouse.row == rect.y {
-                                            // Clicked a row!
+                                            // Clicked a row! Shift focus to Miller columns
+                                            self.active_pane = ActivePane::MillerColumns;
+                                            
                                             let num = self.levels.len();
                                             let start = if num > 4 { num - 4 } else { 0 };
                                             let real_level_idx = start + pane_idx;
@@ -1090,6 +1386,104 @@ pub fn list_windows_drives() -> Vec<DirEntryInfo> {
             DirEntryInfo { path, is_dir: true }
         })
         .collect()
+}
+
+/// Query detailed Windows drive information (label, total space, free space).
+#[cfg(windows)]
+pub fn get_windows_drives() -> Vec<DriveInfo> {
+    use windows_sys::Win32::Storage::FileSystem::*;
+    let mut drives = Vec::new();
+    unsafe {
+        let mut buffer = [0u16; 512];
+        let len = GetLogicalDriveStringsW(512, buffer.as_mut_ptr());
+        if len > 0 && len < 512 {
+            let mut i = 0;
+            while i < len as usize {
+                if buffer[i] == 0 {
+                    break;
+                }
+                let mut path_chars = Vec::new();
+                while i < len as usize && buffer[i] != 0 {
+                    path_chars.push(buffer[i]);
+                    i += 1;
+                }
+                i += 1; // skip null character
+                
+                let drive_path = String::from_utf16_lossy(&path_chars);
+                let path = PathBuf::from(&drive_path);
+                
+                // Get free space
+                let mut free_avail = 0u64;
+                let mut total_bytes = 0u64;
+                let mut total_free = 0u64;
+                
+                let drive_path_w: Vec<u16> = drive_path.encode_utf16().chain(std::iter::once(0)).collect();
+                let success = GetDiskFreeSpaceExW(
+                    drive_path_w.as_ptr(),
+                    &mut free_avail,
+                    &mut total_bytes,
+                    &mut total_free,
+                );
+                
+                let (free, total) = if success != 0 {
+                    (free_avail, total_bytes)
+                } else {
+                    (0, 0)
+                };
+                
+                // Get Volume Label
+                let mut volume_name = [0u16; 261];
+                let mut file_system_name = [0u16; 261];
+                let mut serial_number = 0u32;
+                let mut max_component_len = 0u32;
+                let mut flags = 0u32;
+                
+                let success_vol = GetVolumeInformationW(
+                    drive_path_w.as_ptr(),
+                    volume_name.as_mut_ptr(),
+                    261,
+                    &mut serial_number,
+                    &mut max_component_len,
+                    &mut flags,
+                    file_system_name.as_mut_ptr(),
+                    261,
+                );
+                
+                let label = if success_vol != 0 {
+                    let len_vol = volume_name.iter().position(|&c| c == 0).unwrap_or(volume_name.len());
+                    let vol_str = String::from_utf16_lossy(&volume_name[..len_vol]);
+                    if vol_str.trim().is_empty() {
+                        if drive_path.contains("C:") {
+                            "OS".to_string()
+                        } else {
+                            "Local Disk".to_string()
+                        }
+                    } else {
+                        vol_str
+                    }
+                } else {
+                    if drive_path.contains("C:") {
+                        "OS".to_string()
+                    } else {
+                        "Local Disk".to_string()
+                    }
+                };
+                
+                drives.push(DriveInfo {
+                    path,
+                    label,
+                    total_bytes: total,
+                    free_bytes: free,
+                });
+            }
+        }
+    }
+    drives
+}
+
+#[cfg(not(windows))]
+pub fn get_windows_drives() -> Vec<DriveInfo> {
+    Vec::new()
 }
 
 // ── Recursive copy helper ─────────────────────────────────────────────────────

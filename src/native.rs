@@ -313,6 +313,10 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
 
         SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
 
+        let mut last_img_ptr: usize = 0;
+        let mut last_fw = 0;
+        let mut last_fh = 0;
+
         loop {
             // Process Win32 messages
             let mut msg: MSG = std::mem::zeroed();
@@ -399,14 +403,21 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
                             // Native window is sized and positioned to match the viewport EXACTLY
                             SetWindowPos(hwnd, std::ptr::null_mut(), px, py, pw, ph, SWP_SHOWWINDOW);
 
-                            // Decode/resize outside of WM_PAINT
-                            let resized = img.resize_exact(fw, fh, image::imageops::FilterType::Lanczos3);
-                            let bgra: Vec<u8> = resized.to_rgba8().pixels().flat_map(|p| vec![p[2], p[1], p[0], 255]).collect();
-                            
-                            if let Ok(mut state) = (*state_ptr).lock() {
-                                state.img_bgra = bgra;
-                                state.img_w = fw;
-                                state.img_h = fh;
+                            let img_ptr = Arc::as_ptr(&img) as usize;
+                            if img_ptr != last_img_ptr || fw != last_fw || fh != last_fh {
+                                last_img_ptr = img_ptr;
+                                last_fw = fw;
+                                last_fh = fh;
+
+                                // Decode/resize outside of WM_PAINT
+                                let resized = img.resize_exact(fw, fh, image::imageops::FilterType::Lanczos3);
+                                let bgra: Vec<u8> = resized.to_rgba8().pixels().flat_map(|p| vec![p[2], p[1], p[0], 255]).collect();
+                                
+                                if let Ok(mut state) = (*state_ptr).lock() {
+                                    state.img_bgra = bgra;
+                                    state.img_w = fw;
+                                    state.img_h = fh;
+                                }
                             }
                             
                             InvalidateRect(hwnd, std::ptr::null(), 0);

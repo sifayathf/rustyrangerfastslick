@@ -55,6 +55,7 @@ struct ImgCache {
 }
 
 static IMG_CACHE: Lazy<Mutex<Option<ImgCache>>> = Lazy::new(|| Mutex::new(None));
+static DECODING_PATH: Lazy<Mutex<Option<PathBuf>>> = Lazy::new(|| Mutex::new(None));
 
 fn get_or_decode(path: &PathBuf, rotation: u32, flip_h: bool) -> Option<Arc<image::DynamicImage>> {
     {
@@ -65,19 +66,50 @@ fn get_or_decode(path: &PathBuf, rotation: u32, flip_h: bool) -> Option<Arc<imag
             }
         }
     }
-    let raw = image::open(path).ok()?;
-    let rotated = match rotation {
-        90  => raw.rotate90(),
-        180 => raw.rotate180(),
-        270 => raw.rotate270(),
-        _   => raw,
-    };
-    let final_img = if flip_h { rotated.fliph() } else { rotated };
-    let arc = Arc::new(final_img);
-    *IMG_CACHE.lock() = Some(ImgCache {
-        path: path.clone(), rotation, flip_h, img: Arc::clone(&arc)
+    
+    // Cache miss! Check if we are already decoding this path.
+    {
+        let mut decoding = DECODING_PATH.lock();
+        if let Some(dp) = decoding.as_ref() {
+            if dp == path {
+                return None; // still decoding in background
+            }
+        }
+        // Start decoding this path in the background
+        *decoding = Some(path.clone());
+    }
+
+    let path_clone = path.clone();
+    std::thread::spawn(move || {
+        if let Ok(raw) = image::open(&path_clone) {
+            let rotated = match rotation {
+                90  => raw.rotate90(),
+                180 => raw.rotate180(),
+                270 => raw.rotate270(),
+                _   => raw,
+            };
+            let final_img = if flip_h { rotated.fliph() } else { rotated };
+            let arc = Arc::new(final_img);
+            
+            // Lock and update the image cache
+            *IMG_CACHE.lock() = Some(ImgCache {
+                path: path_clone.clone(),
+                rotation,
+                flip_h,
+                img: Arc::clone(&arc),
+            });
+        }
+        
+        // Clear decoding path if it matches our path
+        let mut decoding = DECODING_PATH.lock();
+        if let Some(dp) = decoding.as_ref() {
+            if dp == &path_clone {
+                *decoding = None;
+            }
+        }
     });
-    Some(arc)
+
+    None
 }
 
 // ── Directory listing cache ───────────────────────────────────────────────────
