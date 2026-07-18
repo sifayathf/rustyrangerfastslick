@@ -7,6 +7,7 @@ build/
 
 # Compiled files / binaries
 *.exe
+!rusty_ranger_fast.exe
 *.pdb
 *.dll
 *.so

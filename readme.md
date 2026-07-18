@@ -64,11 +64,16 @@ This edition features a cross-platform backend optimized for Windows terminal en
 *   **Rust Compiler** (v1.56 or later). [Install Rust](https://www.rust-lang.org/tools/install).
 *   *Optional (Unix-only)*: `ueberzugpp` for pixel-perfect overlays. On Windows, inline half-block rendering is used automatically.
 
-### Running & Building
+### 🚀 Quick Start (Precompiled Binary)
+If you are on Windows, you can run the application immediately without installing Rust:
+1. Download or clone this repository.
+2. Double-click or run `rusty_ranger_fast.exe` from the command line in the repository root.
+
+### Running & Building from Source
 1.  **Clone the Repository**:
     ```bash
-    git clone https://github.com/sifayathf/rustyrangerfastwindows.git
-    cd rustyrangerfastwindows
+    git clone https://github.com/sifayathf/rustyrangerfastslick.git
+    cd rustyrangerfastslick
     ```
 2.  **Build in Release Mode**:
     ```bash
