@@ -1,0 +1,21 @@
+# Rust build artifacts
+target/
+
+# C++ / CMake build artifacts
+**/build/
+build/
+
+# Compiled files / binaries
+*.exe
+*.pdb
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+*.o
+*.obj
+
+# OS generated files
+.DS_Store
+Thumbs.db
