@@ -1,7 +1,7 @@
 // ================= src/ui.rs =================
 use ratatui::{
     Frame,
-    layout::{Layout, Direction, Constraint, Rect},
+    layout::Rect,
     widgets::{Block, Borders, BorderType, List, ListItem, Paragraph, Wrap, Clear},
     style::{Style, Color, Modifier},
     text::{Text, Line, Span},
@@ -14,26 +14,25 @@ use crate::preview::{self, PreviewContent};
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub fn draw(f: &mut Frame, app: &AppState) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // breadcrumb
-            Constraint::Min(0),    // panes
-            Constraint::Length(1), // status bar
-        ])
-        .split(f.size());
-
-    let mut geo = app.layout_geometry.lock();
-    geo.breadcrumb_rect = chunks[0];
-    geo.status_rect = chunks[2];
-    geo.pane_rects.clear();
-    geo.preview_rect = None;
-    geo.row_rects.clear();
-    geo.divider_rects.clear();
-
-    draw_breadcrumb(f, app, chunks[0]);
-    draw_panes(f, app, chunks[1], &mut geo);
-    draw_status_bar(f, app, chunks[2]);
+    let mut layout = app.calculate_layout(f.size());
+    layout.row_rects.clear();
+    layout.nav_row_rects.clear();
+    
+    // Store layout in AppState's layout_geometry
+    {
+        let mut geo = app.layout_geometry.lock();
+        *geo = layout.clone();
+    }
+    
+    draw_breadcrumb(f, app, layout.header_rect);
+    
+    // Draw panes using the active layout geometry guard
+    {
+        let mut geo_guard = app.layout_geometry.lock();
+        draw_panes(f, app, &mut *geo_guard);
+    }
+    
+    draw_status_bar(f, app, layout.status_rect);
     
     if app.mode == AppMode::Rename || app.mode == AppMode::NewFolder {
         draw_input_modal(f, app);
@@ -106,65 +105,22 @@ fn draw_breadcrumb(f: &mut Frame, app: &AppState, area: Rect) {
 // Multi-pane layout
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn draw_panes(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeometry) {
+fn draw_panes(f: &mut Frame, app: &AppState, geo: &mut LayoutGeometry) {
     let num   = app.levels.len();
     let start = if num > 4 { num - 4 } else { 0 };
     let panes = &app.levels[start..];
-    let np    = panes.len();
 
-    let has_preview = panes.last().map_or(false, |l| !l.files.is_empty());
-
-    let n_cols = if has_preview { np + 1 } else { np };
-
-    // Get the normalized column ratios from AppState!
-    let start_idx = 5 - n_cols;
-    let mut sub_ratios = app.column_ratios[start_idx..].to_vec();
-    let sum: f32 = sub_ratios.iter().sum();
-    if sum > 0.0 {
-        for r in sub_ratios.iter_mut() {
-            *r /= sum;
-        }
-    }
-
-    let mut constraints: Vec<Constraint> = sub_ratios.iter().take(n_cols.saturating_sub(1)).map(|&r| {
-        Constraint::Percentage((r * 100.0) as u16)
-    }).collect();
-    if n_cols > 0 {
-        constraints.push(Constraint::Min(0));
-    }
-
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(constraints)
-        .split(area);
-        
-    for i in 0..chunks.len().saturating_sub(1) {
-        let current_chunk = chunks[i];
-        if current_chunk.width > 0 {
-            let next_chunk = chunks[i+1];
-            let divider_x = if current_chunk.x + current_chunk.width == next_chunk.x {
-                current_chunk.x + current_chunk.width - 1
-            } else {
-                next_chunk.x.saturating_sub(1)
-            };
-            geo.divider_rects.push(Rect {
-                x: divider_x,
-                y: current_chunk.y,
-                width: 2, // slightly larger hit area
-                height: current_chunk.height,
-            });
-        }
-    }
-
+    // Draw directory panes
     for (i, level) in panes.iter().enumerate() {
-        geo.pane_rects.push(chunks[i]);
-        draw_dir_pane(f, level, (start + i) == app.current_level, chunks[i], geo, (start + i) - start);
+        if i < geo.pane_rects.len() {
+            draw_dir_pane(f, level, (start + i) == app.current_level, geo.pane_rects[i], geo, i);
+        }
     }
 
-    if has_preview {
+    // Draw preview pane
+    if geo.preview_outer_rect.width > 0 {
         if let Some(current) = panes.last() {
-            geo.preview_rect = Some(chunks[np]);
-            draw_preview_pane(f, app, current, chunks[np]);
+            draw_preview_pane(f, app, current, geo.preview_outer_rect, geo.preview_viewport_rect);
         }
     }
 }
@@ -280,7 +236,7 @@ fn draw_dir_pane(f: &mut Frame, level: &DirLevel, is_current: bool, area: Rect, 
 // Preview pane
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect) {
+fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect, viewport_rect: Rect) {
     if level.files.is_empty() {
         app.native_preview.hide();
         f.render_widget(
@@ -404,13 +360,12 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
             let mut top_margin = 0;
             if let Some(img) = &info.img {
                 let (cols, rows) = crossterm::terminal::size().unwrap_or((0, 0));
-                // We need to offset the image downwards by 4 cells so it doesn't cover the header
-                let mut img_rect = inner;
-                if img_rect.height > 6 {
-                    img_rect.y += 4;
-                    img_rect.height -= 4;
+                let img_rect = viewport_rect;
+                if app.mode == AppMode::Normal {
+                    app.native_preview.show(std::sync::Arc::clone(img), img_rect, cols, rows);
+                } else {
+                    app.native_preview.hide();
                 }
-                app.native_preview.show(std::sync::Arc::clone(img), img_rect, cols, rows);
                 top_margin = img_rect.y - inner.y;
             } else {
                 app.native_preview.hide();

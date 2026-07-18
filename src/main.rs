@@ -15,6 +15,10 @@ mod overlay;
 use state::AppState;
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    unsafe {
+        windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
     std::env::set_var("COLORTERM", "truecolor");
     enable_raw_mode()?;
     let mut stdout = io::stdout();

@@ -8,7 +8,7 @@ use std::{
 use parking_lot::Mutex;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers, KeyEventKind, MouseEventKind, MouseButton};
 use once_cell::sync::Lazy;
-use ratatui::layout::Rect;
+use ratatui::layout::{Layout, Direction, Constraint, Rect};
 
 // ── Directory listing cache ───────────────────────────────────────────────────
 // TTL prevents re-reading the filesystem every frame when the preview pane
@@ -47,15 +47,29 @@ pub enum AppMode {
     NewFolder,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DividerType {
+    NavToMiller,
+    MillerToMiller(usize),
+    MillerToPreview,
+}
+
 #[derive(Default, Clone)]
 pub struct LayoutGeometry {
-    pub breadcrumb_rect: Rect,
-    pub status_rect: Rect,
+    pub header_rect: Rect,
+    pub nav_rail_rect: Rect,
+    pub miller_region_rect: Rect,
     pub pane_rects: Vec<Rect>,
-    pub preview_rect: Option<Rect>,
-    // Maps visible pane index to a list of (file_index, Rect)
-    pub row_rects: HashMap<usize, Vec<(usize, Rect)>>,
+    pub preview_outer_rect: Rect,
+    pub preview_header_rect: Rect,
+    pub preview_viewport_rect: Rect,
+    pub preview_controls_rect: Rect,
+    pub preview_metadata_rect: Rect,
+    pub status_rect: Rect,
     pub divider_rects: Vec<Rect>,
+    pub divider_types: Vec<DividerType>,
+    pub row_rects: HashMap<usize, Vec<(usize, Rect)>>,
+    pub nav_row_rects: Vec<(usize, Rect)>,
 }
 
 pub struct AppState {
@@ -79,6 +93,8 @@ pub struct AppState {
     pub dragging_divider: Option<usize>,
     pub column_ratios:    Vec<f32>,
     pub layout_geometry:  Arc<Mutex<LayoutGeometry>>,
+    pub nav_rail_width:   u16,
+    pub nav_rail_visible: bool,
 
     // Windows Native preview overlay manager
     pub native_preview: crate::native::NativePreviewManager,
@@ -111,6 +127,8 @@ impl AppState {
             dragging_divider: None,
             column_ratios:    vec![0.10, 0.10, 0.12, 0.18, 0.50],
             layout_geometry:  Arc::new(Mutex::new(LayoutGeometry::default())),
+            nav_rail_width:   28,
+            nav_rail_visible: false,
             preview_scroll: 0,
             image_zoom: 1.0,
             image_rotation: 0,
@@ -125,6 +143,155 @@ impl AppState {
 
     pub fn current_mut(&mut self) -> &mut DirLevel {
         &mut self.levels[self.current_level]
+    }
+
+    pub fn has_preview(&self) -> bool {
+        let cur = self.current();
+        !cur.files.is_empty()
+    }
+
+    pub fn calculate_layout(&self, area: Rect) -> LayoutGeometry {
+        let mut geo = LayoutGeometry::default();
+        
+        let vertical_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // breadcrumb
+                Constraint::Min(0),    // panes
+                Constraint::Length(1), // status bar
+            ])
+            .split(area);
+            
+        geo.header_rect = vertical_chunks[0];
+        geo.status_rect = vertical_chunks[2];
+        
+        let panes_area = vertical_chunks[1];
+        
+        let rail_width = if self.nav_rail_visible {
+            if panes_area.width < 100 {
+                0
+            } else {
+                self.nav_rail_width
+            }
+        } else {
+            0
+        };
+        
+        let preview_width = if self.has_preview() {
+            let min_preview = 50;
+            let mut pw = (panes_area.width as f32 * self.column_ratios[4]) as u16;
+            if pw < min_preview {
+                pw = min_preview;
+            }
+            if pw >= panes_area.width.saturating_sub(rail_width + 30) {
+                pw = panes_area.width.saturating_sub(rail_width + 30);
+            }
+            pw
+        } else {
+            0
+        };
+        
+        let miller_width = panes_area.width.saturating_sub(rail_width + preview_width);
+        
+        let horizontal_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(rail_width),
+                Constraint::Length(miller_width),
+                Constraint::Length(preview_width),
+            ])
+            .split(panes_area);
+            
+        geo.nav_rail_rect = horizontal_chunks[0];
+        geo.miller_region_rect = horizontal_chunks[1];
+        geo.preview_outer_rect = horizontal_chunks[2];
+        
+        let num = self.levels.len();
+        let start = if num > 4 { num - 4 } else { 0 };
+        let panes = &self.levels[start..];
+        let np = panes.len();
+        
+        if np > 0 {
+            let has_prev = preview_width > 0;
+            let total_cols = np + if has_prev { 1 } else { 0 };
+            let start_idx = 5 - total_cols;
+            let mut sub_ratios = self.column_ratios[start_idx..].to_vec();
+            
+            let sum: f32 = sub_ratios.iter().take(np).sum();
+            if sum > 0.0 {
+                for r in sub_ratios.iter_mut().take(np) {
+                    *r /= sum;
+                }
+            }
+            
+            let mut constraints: Vec<Constraint> = sub_ratios.iter().take(np.saturating_sub(1)).map(|&r| {
+                Constraint::Percentage((r * 100.0) as u16)
+            }).collect();
+            constraints.push(Constraint::Min(0));
+            
+            let miller_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints(constraints)
+                .split(geo.miller_region_rect);
+                
+            for i in 0..np {
+                geo.pane_rects.push(miller_chunks[i]);
+            }
+        }
+        
+        if preview_width > 0 {
+            let pr = geo.preview_outer_rect;
+            let has_metadata_space = pr.height > 20;
+            let metadata_height = if has_metadata_space { 12 } else { 0 };
+            
+            let preview_vertical = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(4), // Header
+                    Constraint::Min(0),    // Viewport
+                    Constraint::Length(3), // Controls/separator
+                    Constraint::Length(metadata_height), // Metadata
+                ])
+                .split(pr);
+                
+            geo.preview_header_rect = preview_vertical[0];
+            geo.preview_viewport_rect = preview_vertical[1];
+            geo.preview_controls_rect = preview_vertical[2];
+            geo.preview_metadata_rect = preview_vertical[3];
+        }
+        
+        if rail_width > 0 {
+            geo.divider_rects.push(Rect {
+                x: geo.nav_rail_rect.x + geo.nav_rail_rect.width - 1,
+                y: panes_area.y,
+                width: 2,
+                height: panes_area.height,
+            });
+            geo.divider_types.push(DividerType::NavToMiller);
+        }
+        
+        for i in 0..geo.pane_rects.len().saturating_sub(1) {
+            let current_pane = geo.pane_rects[i];
+            geo.divider_rects.push(Rect {
+                x: current_pane.x + current_pane.width - 1,
+                y: panes_area.y,
+                width: 2,
+                height: panes_area.height,
+            });
+            geo.divider_types.push(DividerType::MillerToMiller(i));
+        }
+        
+        if preview_width > 0 {
+            geo.divider_rects.push(Rect {
+                x: geo.miller_region_rect.x + geo.miller_region_rect.width - 1,
+                y: panes_area.y,
+                width: 2,
+                height: panes_area.height,
+            });
+            geo.divider_types.push(DividerType::MillerToPreview);
+        }
+        
+        geo
     }
 
     pub fn handle_events(&mut self) -> anyhow::Result<bool> {
@@ -383,12 +550,10 @@ impl AppState {
                 match mouse.kind {
                     MouseEventKind::ScrollDown => {
                         let geo = self.layout_geometry.lock().clone();
-                        // Find which pane we are over
                         let mut over_preview = false;
-                        if let Some(pr) = geo.preview_rect {
-                            if mouse.column >= pr.x && mouse.column < pr.x + pr.width && mouse.row >= pr.y && mouse.row < pr.y + pr.height {
-                                over_preview = true;
-                            }
+                        let pr = geo.preview_outer_rect;
+                        if pr.width > 0 && mouse.column >= pr.x && mouse.column < pr.x + pr.width && mouse.row >= pr.y && mouse.row < pr.y + pr.height {
+                            over_preview = true;
                         }
                         if over_preview {
                             self.preview_scroll = self.preview_scroll.saturating_add(5);
@@ -413,10 +578,9 @@ impl AppState {
                     MouseEventKind::ScrollUp => {
                         let geo = self.layout_geometry.lock().clone();
                         let mut over_preview = false;
-                        if let Some(pr) = geo.preview_rect {
-                            if mouse.column >= pr.x && mouse.column < pr.x + pr.width && mouse.row >= pr.y && mouse.row < pr.y + pr.height {
-                                over_preview = true;
-                            }
+                        let pr = geo.preview_outer_rect;
+                        if pr.width > 0 && mouse.column >= pr.x && mouse.column < pr.x + pr.width && mouse.row >= pr.y && mouse.row < pr.y + pr.height {
+                            over_preview = true;
                         }
                         if over_preview {
                             self.preview_scroll = self.preview_scroll.saturating_sub(5);
@@ -451,7 +615,7 @@ impl AppState {
                         
                         if !divider_found {
                             // Check breadcrumbs
-                            if mouse.row == geo.breadcrumb_rect.y && mouse.column >= geo.breadcrumb_rect.x && mouse.column < geo.breadcrumb_rect.x + geo.breadcrumb_rect.width {
+                            if mouse.row == geo.header_rect.y && mouse.column >= geo.header_rect.x && mouse.column < geo.header_rect.x + geo.header_rect.width {
                                 // TODO: Breadcrumb navigation
                             }
                             // Check row clicks
@@ -523,32 +687,60 @@ impl AppState {
                     MouseEventKind::Drag(MouseButton::Left) => {
                         if let Some(idx) = self.dragging_divider {
                             let geo = self.layout_geometry.lock().clone();
-                            if let Some(first_pane) = geo.pane_rects.first() {
+                            if let Some(&div_type) = geo.divider_types.get(idx) {
                                 let term_w = crossterm::terminal::size().unwrap_or((100, 30)).0;
                                 let old_bound = geo.divider_rects.get(idx).map(|r| r.x).unwrap_or(0);
                                 let new_bound = mouse.column;
                                 
                                 if old_bound > 0 && new_bound != old_bound && new_bound > 0 && new_bound < term_w {
-                                    let delta_ratio = (new_bound as f32 - old_bound as f32) / term_w as f32;
+                                    let delta_px = new_bound as i32 - old_bound as i32;
+                                    let delta_ratio = delta_px as f32 / term_w as f32;
                                     
-                                    let num = self.levels.len();
-                                    let start = if num > 4 { num - 4 } else { 0 };
-                                    let panes = &self.levels[start..];
-                                    let np = panes.len();
-                                    let has_preview = panes.last().map_or(false, |l| !l.files.is_empty());
-                                    let n_cols = if has_preview { np + 1 } else { np };
-                                    
-                                    let start_ratio_idx = 5 - n_cols;
-                                    let ratio_idx_left = start_ratio_idx + idx;
-                                    let ratio_idx_right = ratio_idx_left + 1;
-                                    
-                                    if ratio_idx_left < self.column_ratios.len() && ratio_idx_right < self.column_ratios.len() {
-                                        let val_left = self.column_ratios[ratio_idx_left] + delta_ratio;
-                                        let val_right = self.column_ratios[ratio_idx_right] - delta_ratio;
-                                        
-                                        if val_left > 0.05 && val_right > 0.05 {
-                                            self.column_ratios[ratio_idx_left] = val_left;
-                                            self.column_ratios[ratio_idx_right] = val_right;
+                                    match div_type {
+                                        DividerType::NavToMiller => {
+                                            let new_w = (self.nav_rail_width as i32 + delta_px).clamp(10, 45);
+                                            self.nav_rail_width = new_w as u16;
+                                        }
+                                        DividerType::MillerToMiller(m_idx) => {
+                                            let num = self.levels.len();
+                                            let start = if num > 4 { num - 4 } else { 0 };
+                                            let panes = &self.levels[start..];
+                                            let np = panes.len();
+                                            let has_prev = self.has_preview();
+                                            let total_cols = np + if has_prev { 1 } else { 0 };
+                                            
+                                            let start_ratio_idx = 5 - total_cols;
+                                            let ratio_idx_left = start_ratio_idx + m_idx;
+                                            let ratio_idx_right = ratio_idx_left + 1;
+                                            
+                                            if ratio_idx_left < self.column_ratios.len() && ratio_idx_right < self.column_ratios.len() {
+                                                let val_left = self.column_ratios[ratio_idx_left] + delta_ratio;
+                                                let val_right = self.column_ratios[ratio_idx_right] - delta_ratio;
+                                                if val_left > 0.05 && val_right > 0.05 {
+                                                    self.column_ratios[ratio_idx_left] = val_left;
+                                                    self.column_ratios[ratio_idx_right] = val_right;
+                                                }
+                                            }
+                                        }
+                                        DividerType::MillerToPreview => {
+                                            let num = self.levels.len();
+                                            let start = if num > 4 { num - 4 } else { 0 };
+                                            let panes = &self.levels[start..];
+                                            let np = panes.len();
+                                            let total_cols = np + 1;
+                                            
+                                            let start_ratio_idx = 5 - total_cols;
+                                            let ratio_idx_left = start_ratio_idx + np - 1;
+                                            let ratio_idx_right = 5 - 1;
+                                            
+                                            if ratio_idx_left < self.column_ratios.len() && ratio_idx_right < self.column_ratios.len() {
+                                                let val_left = self.column_ratios[ratio_idx_left] + delta_ratio;
+                                                let val_right = self.column_ratios[ratio_idx_right] - delta_ratio;
+                                                if val_left > 0.05 && val_right > 0.05 {
+                                                    self.column_ratios[ratio_idx_left] = val_left;
+                                                    self.column_ratios[ratio_idx_right] = val_right;
+                                                }
+                                            }
                                         }
                                     }
                                 }
