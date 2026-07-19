@@ -13,6 +13,9 @@ use ratatui::layout::Rect as TuiRect;
 pub enum PreviewCmd {
     ShowImage {
         img: Arc<DynamicImage>,
+        path: std::path::PathBuf,
+        rotation: u32,
+        flip_h: bool,
         cell_rect: TuiRect,
         term_cols: u16,
         term_rows: u16,
@@ -34,8 +37,8 @@ impl NativePreviewManager {
         Self { sender: tx }
     }
 
-    pub fn show(&self, img: Arc<DynamicImage>, cell_rect: TuiRect, term_cols: u16, term_rows: u16) {
-        let _ = self.sender.send(PreviewCmd::ShowImage { img, cell_rect, term_cols, term_rows });
+    pub fn show(&self, img: Arc<DynamicImage>, path: std::path::PathBuf, rotation: u32, flip_h: bool, cell_rect: TuiRect, term_cols: u16, term_rows: u16) {
+        let _ = self.sender.send(PreviewCmd::ShowImage { img, path, rotation, flip_h, cell_rect, term_cols, term_rows });
     }
 
     pub fn hide(&self) {
@@ -313,9 +316,36 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
 
         SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
 
-        let mut last_img_ptr: usize = 0;
-        let mut last_fw = 0;
-        let mut last_fh = 0;
+        // ── Caches to keep the per-tick work cheap ──────────────────────────
+        // Resolving the terminal window used to call EnumWindows over every
+        // top-level window on the system, plus a full process-tree walk, on
+        // *every* ShowImage message (i.e. every redraw). That single call
+        // could easily cost several milliseconds; done 60x/sec it was the
+        // main cause of visible flicker and the preview "hanging" under any
+        // mouse movement. Now we resolve it once and only re-resolve if it
+        // goes stale (window closed/replaced) or periodically as a safety net.
+        let mut cached_term_hwnd: HWND = term_hwnd;
+        let mut cached_bridge: Option<(HWND, i32)> = None; // (bridge_hwnd, padding)
+        let mut term_cache_at = std::time::Instant::now();
+        const TERM_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3);
+
+        // Last successfully-applied state, so unchanged frames are a no-op.
+        // NOTE: we key on (path, rotation, flip_h) rather than the Arc's
+        // pointer — the source cache holds only one entry at a time, so a
+        // freed image's allocation can be immediately reused by the next
+        // one. That's especially likely for office-doc thumbnails (PDF/DOCX/
+        // PPTX), which are all near-identically-sized generated PNGs — using
+        // pointer identity there caused the overlay to wrongly think a
+        // brand-new preview was "the same image" and skip repainting.
+        let mut last_key: Option<(std::path::PathBuf, u32, bool)> = None;
+        let mut last_cell_rect: TuiRect = TuiRect { x: 0, y: 0, width: 0, height: 0 };
+        let mut last_term_cols: u16 = 0;
+        let mut last_term_rows: u16 = 0;
+        let mut last_applied_rect: (i32, i32, i32, i32) = (i32::MIN, 0, 0, 0);
+        let mut last_shown: Option<(Arc<DynamicImage>, TuiRect, u16, u16)> = None;
+        let mut is_visible = false;
+        let mut last_resync_at = std::time::Instant::now();
+        const RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
 
         loop {
             // Process Win32 messages
@@ -329,102 +359,62 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
                 DispatchMessageW(&msg);
             }
 
-            // Coalesce incoming commands
+            // Coalesce incoming commands — only the newest matters.
             let mut latest_cmd = None;
             while let Ok(cmd) = rx.try_recv() {
                 latest_cmd = Some(cmd);
             }
 
+            let due_for_resync = is_visible && last_resync_at.elapsed() >= RESYNC_INTERVAL;
+
+            if latest_cmd.is_none() && due_for_resync {
+                // Nothing new to show, but periodically re-check the terminal's
+                // on-screen position so the overlay follows a dragged/moved
+                // window. This is position-only: no image decode, no resize.
+                if let Some((img, cell_rect, cols, rows)) = last_shown.clone() {
+                    reposition_overlay(
+                        hwnd, &img, cell_rect, cols, rows,
+                        &mut cached_term_hwnd, &mut cached_bridge, &mut term_cache_at, TERM_CACHE_TTL,
+                        &mut last_applied_rect, state_ptr, false,
+                    );
+                }
+                last_resync_at = std::time::Instant::now();
+            }
+
             if let Some(cmd) = latest_cmd {
                 match cmd {
-                    PreviewCmd::ShowImage { img, cell_rect, term_cols, term_rows } => {
-                        let term_hwnd = find_terminal_window();
-                        if !term_hwnd.is_null() && term_cols > 0 && term_rows > 0 {
-                            let mut class_buf = [0u16; 256];
-                            let class_len = GetClassNameW(term_hwnd, class_buf.as_mut_ptr(), 256);
-                            let term_class = String::from_utf16_lossy(&class_buf[..class_len as usize]);
+                    PreviewCmd::ShowImage { img, path, rotation, flip_h, cell_rect, term_cols, term_rows } => {
+                        let key = (path, rotation, flip_h);
+                        let unchanged = Some(&key) == last_key.as_ref()
+                            && cell_rect == last_cell_rect
+                            && term_cols == last_term_cols
+                            && term_rows == last_term_rows
+                            && is_visible;
 
-                            let (bridge_hwnd, padding) = if term_class == "CASCADIA_HOSTING_WINDOW_CLASS" {
-                                let bridge = find_child_window_by_class(term_hwnd, "Windows.UI.Composition.DesktopWindowContentBridge");
-                                if !bridge.is_null() {
-                                    let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(term_hwnd);
-                                    let pad = (8.0f32 * (dpi as f32) / 96.0f32).round() as i32;
-                                    (bridge, pad)
-                                } else {
-                                    (term_hwnd, 0)
-                                }
-                            } else {
-                                (term_hwnd, 0)
-                            };
+                        if !unchanged {
+                            last_cell_rect = cell_rect;
+                            last_term_cols = term_cols;
+                            last_term_rows = term_rows;
 
-                            let mut client_rect: RECT = std::mem::zeroed();
-                            GetClientRect(bridge_hwnd, &mut client_rect);
-                            
-                            let width = client_rect.right - client_rect.left;
-                            let height = client_rect.bottom - client_rect.top;
-                            
-                            let grid_width = (width - 2 * padding).max(1);
-                            let grid_height = (height - 2 * padding).max(1);
-                            
-                            let cw = grid_width / term_cols as i32;
-                            let ch = grid_height / term_rows as i32;
-                            
-                            let mut pt = POINT { x: 0, y: 0 };
-                            ClientToScreen(bridge_hwnd, &mut pt);
-                            
-                            let px = pt.x + padding + cell_rect.x as i32 * cw;
-                            let py = pt.y + padding + cell_rect.y as i32 * ch;
-                            let pw = cell_rect.width as i32 * cw;
-                            let ph = cell_rect.height as i32 * ch;
-                            
-                            let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(term_hwnd);
-                            log_debug(&format!(
-                                "[OVERLAY]\n\
-                                 terminal hwnd = {:?}\n\
-                                 terminal client rect = L: {}, T: {}, R: {}, B: {}\n\
-                                 terminal cols/rows = {}/{}\n\
-                                 preview cell rect = x: {}, y: {}, w: {}, h: {}\n\
-                                 calculated pixel rect = x: {}, y: {}, w: {}, h: {}\n\
-                                 DPI = {}\n\
-                                 image source dimensions = {} × {}\n",
-                                term_hwnd, client_rect.left, client_rect.top, client_rect.right, client_rect.bottom,
-                                term_cols, term_rows, cell_rect.x, cell_rect.y, cell_rect.width, cell_rect.height,
-                                px, py, pw, ph, dpi, img.width(), img.height()
-                            ));
-
-                            // Fit image inside pw x ph
-                            let img_w = img.width() as f32;
-                            let img_h = img.height() as f32;
-                            
-                            let scale = (pw as f32 / img_w).min(ph as f32 / img_h).min(1.0);
-                            let fw = (img_w * scale) as u32;
-                            let fh = (img_h * scale) as u32;
-
-                            // Native window is sized and positioned to match the viewport EXACTLY
-                            SetWindowPos(hwnd, std::ptr::null_mut(), px, py, pw, ph, SWP_SHOWWINDOW);
-
-                            let img_ptr = Arc::as_ptr(&img) as usize;
-                            if img_ptr != last_img_ptr || fw != last_fw || fh != last_fh {
-                                last_img_ptr = img_ptr;
-                                last_fw = fw;
-                                last_fh = fh;
-
-                                // Decode/resize outside of WM_PAINT
-                                let resized = img.resize_exact(fw, fh, image::imageops::FilterType::Lanczos3);
-                                let bgra: Vec<u8> = resized.to_rgba8().pixels().flat_map(|p| vec![p[2], p[1], p[0], 255]).collect();
-                                
-                                if let Ok(mut state) = (*state_ptr).lock() {
-                                    state.img_bgra = bgra;
-                                    state.img_w = fw;
-                                    state.img_h = fh;
-                                }
-                            }
-                            
-                            InvalidateRect(hwnd, std::ptr::null(), 0);
+                            reposition_overlay(
+                                hwnd, &img, cell_rect, term_cols, term_rows,
+                                &mut cached_term_hwnd, &mut cached_bridge, &mut term_cache_at, TERM_CACHE_TTL,
+                                &mut last_applied_rect, state_ptr, true,
+                            );
+                            is_visible = true;
+                            last_shown = Some((img, cell_rect, term_cols, term_rows));
+                            last_key = Some(key);
+                            last_resync_at = std::time::Instant::now();
                         }
                     }
                     PreviewCmd::Hide => {
-                        ShowWindow(hwnd, SW_HIDE);
+                        if is_visible {
+                            ShowWindow(hwnd, SW_HIDE);
+                            is_visible = false;
+                            last_shown = None;
+                            last_key = None;
+                            last_applied_rect = (i32::MIN, 0, 0, 0);
+                        }
                     }
                     PreviewCmd::Quit => {
                         let _ = Box::from_raw(state_ptr);
@@ -436,4 +426,123 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
             thread::sleep(std::time::Duration::from_millis(16));
         }
     }
+}
+
+/// Resolve (with caching) where the overlay should sit on screen and apply
+/// it. `allow_resize` gates the expensive Lanczos3 decode/resize + repaint;
+/// periodic resyncs pass `false` and only move the window if its position
+/// actually changed.
+unsafe fn reposition_overlay(
+    hwnd: HWND,
+    img: &Arc<DynamicImage>,
+    cell_rect: TuiRect,
+    term_cols: u16,
+    term_rows: u16,
+    cached_term_hwnd: &mut HWND,
+    cached_bridge: &mut Option<(HWND, i32)>,
+    term_cache_at: &mut std::time::Instant,
+    term_cache_ttl: std::time::Duration,
+    last_applied_rect: &mut (i32, i32, i32, i32),
+    state_ptr: *mut Mutex<WindowState>,
+    allow_resize: bool,
+) {
+    if term_cols == 0 || term_rows == 0 {
+        return;
+    }
+
+    // Re-resolve the terminal/bridge window only occasionally, or if the
+    // cached handle has gone stale — never on every tick.
+    let stale = IsWindow(*cached_term_hwnd) == 0 || term_cache_at.elapsed() > term_cache_ttl;
+    if stale || cached_bridge.is_none() {
+        let resolved = find_terminal_window();
+        if !resolved.is_null() {
+            *cached_term_hwnd = resolved;
+        }
+        *term_cache_at = std::time::Instant::now();
+
+        let mut class_buf = [0u16; 256];
+        let class_len = GetClassNameW(*cached_term_hwnd, class_buf.as_mut_ptr(), 256);
+        let term_class = String::from_utf16_lossy(&class_buf[..class_len as usize]);
+
+        *cached_bridge = Some(if term_class == "CASCADIA_HOSTING_WINDOW_CLASS" {
+            let bridge = find_child_window_by_class(*cached_term_hwnd, "Windows.UI.Composition.DesktopWindowContentBridge");
+            if !bridge.is_null() {
+                let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(*cached_term_hwnd);
+                let pad = (8.0f32 * (dpi as f32) / 96.0f32).round() as i32;
+                (bridge, pad)
+            } else {
+                (*cached_term_hwnd, 0)
+            }
+        } else {
+            (*cached_term_hwnd, 0)
+        });
+    }
+
+    let Some((bridge_hwnd, padding)) = *cached_bridge else { return; };
+
+    let mut client_rect: RECT = std::mem::zeroed();
+    GetClientRect(bridge_hwnd, &mut client_rect);
+
+    let width = client_rect.right - client_rect.left;
+    let height = client_rect.bottom - client_rect.top;
+
+    let grid_width = (width - 2 * padding).max(1);
+    let grid_height = (height - 2 * padding).max(1);
+
+    let cw = (grid_width / term_cols as i32).max(1);
+    let ch = (grid_height / term_rows as i32).max(1);
+
+    let mut pt = POINT { x: 0, y: 0 };
+    ClientToScreen(bridge_hwnd, &mut pt);
+
+    let px = pt.x + padding + cell_rect.x as i32 * cw;
+    let py = pt.y + padding + cell_rect.y as i32 * ch;
+    let pw = cell_rect.width as i32 * cw;
+    let ph = cell_rect.height as i32 * ch;
+
+    let rect_changed = (px, py, pw, ph) != *last_applied_rect;
+
+    if !allow_resize {
+        // Periodic position-only resync: move the window if it drifted
+        // (e.g. the terminal was dragged), but never touch image content.
+        if rect_changed {
+            SetWindowPos(hwnd, std::ptr::null_mut(), px, py, pw, ph, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+            *last_applied_rect = (px, py, pw, ph);
+        }
+        return;
+    }
+
+    if rect_changed {
+        SetWindowPos(hwnd, std::ptr::null_mut(), px, py, pw, ph, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+        *last_applied_rect = (px, py, pw, ph);
+    } else {
+        // Window is already exactly where it needs to be — still make sure
+        // it's shown (covers the very first ShowImage after startup/hide).
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+
+    // Fit image inside pw x ph
+    let img_w = img.width() as f32;
+    let img_h = img.height() as f32;
+    if img_w <= 0.0 || img_h <= 0.0 || pw <= 0 || ph <= 0 {
+        return;
+    }
+
+    let scale = (pw as f32 / img_w).min(ph as f32 / img_h).min(1.0);
+    let fw = ((img_w * scale) as u32).max(1);
+    let fh = ((img_h * scale) as u32).max(1);
+
+    // Decode/resize outside of WM_PAINT — this is the expensive step
+    // (Lanczos3), so it only ever runs when the image or its target size
+    // actually changed, not on every redraw tick.
+    let resized = img.resize_exact(fw, fh, image::imageops::FilterType::Lanczos3);
+    let bgra: Vec<u8> = resized.to_rgba8().pixels().flat_map(|p| [p[2], p[1], p[0], 255]).collect();
+
+    if let Ok(mut state) = (*state_ptr).lock() {
+        state.img_bgra = bgra;
+        state.img_w = fw;
+        state.img_h = fh;
+    }
+
+    InvalidateRect(hwnd, std::ptr::null(), 0);
 }

@@ -1,297 +1,577 @@
 // ================= src/ui.rs =================
 use ratatui::{
     Frame,
-    layout::Rect,
+    layout::{Layout, Direction, Constraint, Rect},
     widgets::{Block, Borders, BorderType, List, ListItem, Paragraph, Wrap, Clear},
     style::{Style, Color, Modifier},
     text::{Text, Line, Span},
 };
-use crate::state::{AppState, AppMode, DirLevel, LayoutGeometry, ActivePane, RailItem, get_windows_drives};
+use crate::state::{AppState, AppMode, DirLevel, LayoutGeometry, ContextAction};
 use crate::preview::{self, PreviewContent};
+
+// ── Theme ────────────────────────────────────────────────────────────────────
+const C_ACCENT:   Color = Color::Rgb(97, 214, 214);   // cyan focus accent
+const C_ACCENT2:  Color = Color::Rgb(137, 180, 250);  // soft blue
+const C_BG_PANEL: Color = Color::Rgb(24, 26, 34);
+const C_BORDER:   Color = Color::Rgb(58, 62, 78);
+const C_BORDER_LO:Color = Color::Rgb(40, 43, 54);
+const C_TEXT:     Color = Color::Rgb(214, 218, 230);
+const C_MUTED:    Color = Color::Rgb(120, 126, 145);
+const C_WARN:     Color = Color::Rgb(240, 198, 116);
+const C_OK:       Color = Color::Rgb(137, 220, 165);
+const C_ERR:      Color = Color::Rgb(240, 120, 120);
+const C_SEL_BG:   Color = Color::Rgb(45, 90, 92);
+const C_SEL_BG_INACTIVE: Color = Color::Rgb(52, 55, 68);
+const C_MARK:     Color = Color::Rgb(210, 160, 90);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Top-level draw
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub fn draw(f: &mut Frame, app: &AppState) {
-    let mut layout = app.calculate_layout(f.size());
-    layout.row_rects.clear();
-    layout.nav_row_rects.clear();
-    
-    // Store layout in AppState's layout_geometry
-    {
-        let mut geo = app.layout_geometry.lock();
-        *geo = layout.clone();
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),    // sidebar + content
+            Constraint::Length(1), // status bar (hints live here — no more duplicate top bar)
+        ])
+        .split(f.size());
+
+    let mut geo = app.layout_geometry.lock();
+    geo.status_rect = root[1];
+    geo.pane_rects.clear();
+    geo.preview_rect = None;
+    geo.row_rects.clear();
+    geo.divider_rects.clear();
+    geo.sidebar_item_rects.clear();
+    geo.breadcrumb_segment_rects.clear();
+    geo.context_menu_item_rects.clear();
+    geo.context_menu_rect = None;
+
+    // Responsive: hide the sidebar on very narrow terminals so panes stay usable.
+    let show_sidebar = root[0].width >= 60;
+    let sidebar_w = if show_sidebar { app.sidebar_width.min(root[0].width.saturating_sub(30)) } else { 0 };
+
+    let body = if show_sidebar {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(sidebar_w), Constraint::Length(1), Constraint::Min(0)])
+            .split(root[0])
+    } else {
+        Layout::default().constraints([Constraint::Min(0)]).split(root[0])
+    };
+
+    if show_sidebar {
+        geo.sidebar_rect = body[0];
+        geo.sidebar_divider_rect = body[1];
+        draw_sidebar(f, app, body[0], &mut geo);
+        draw_vertical_divider(f, body[1]);
+    } else {
+        geo.sidebar_rect = Rect::default();
+        geo.sidebar_divider_rect = Rect::default();
     }
-    
-    draw_breadcrumb(f, app, layout.header_rect);
-    
-    if app.nav_rail_visible {
-        draw_nav_rail(f, app, layout.nav_rail_rect);
-    }
-    
-    // Draw panes using the active layout geometry guard
-    {
-        let mut geo_guard = app.layout_geometry.lock();
-        draw_panes(f, app, &mut *geo_guard);
-    }
-    
-    draw_status_bar(f, app, layout.status_rect);
-    
+
+    let main_area = if show_sidebar { body[2] } else { body[0] };
+    let main = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(main_area);
+
+    geo.breadcrumb_rect = main[0];
+    draw_breadcrumb(f, app, main[0], &mut geo);
+    draw_panes(f, app, main[1], &mut geo);
+    draw_status_bar(f, app, root[1]);
+
     if app.mode == AppMode::Rename || app.mode == AppMode::NewFolder {
         draw_input_modal(f, app);
+    }
+    if app.mode == AppMode::ConfirmDelete || app.mode == AppMode::ConfirmDeletePermanent {
+        draw_confirm_modal(f, app);
+    }
+    if app.mode == AppMode::Properties {
+        draw_properties_modal(f, app);
+    }
+    if app.mode == AppMode::ContextMenu {
+        draw_context_menu(f, app, &mut geo);
+    }
+}
+
+fn draw_vertical_divider(f: &mut Frame, area: Rect) {
+    for y in area.y..area.y + area.height {
+        f.render_widget(
+            Paragraph::new(Span::styled("│", Style::default().fg(C_BORDER_LO))),
+            Rect { x: area.x, y, width: 1, height: 1 },
+        );
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Input Modal
+// Left sidebar: Quick Access + Drives (click to navigate)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeometry) {
+    let block = Block::default()
+        .title(" DRIVES & LOCATIONS ")
+        .title_style(Style::default().fg(C_MUTED).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(C_BORDER_LO))
+        .style(Style::default().bg(C_BG_PANEL));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let cur_path = &app.current().path;
+    let mut y = inner.y;
+    let max_y = inner.y + inner.height;
+
+    push_line(f, geo, inner, &mut y, max_y,
+        Line::from(Span::styled(" QUICK ACCESS", Style::default().fg(C_MUTED).add_modifier(Modifier::BOLD))), None);
+    for (label, path) in app.quick_access.iter() {
+        let is_active = *path == *cur_path;
+        let (bullet_style, text_style) = if is_active {
+            (Style::default().fg(Color::Black).bg(C_ACCENT), Style::default().fg(Color::Black).bg(C_ACCENT).add_modifier(Modifier::BOLD))
+        } else {
+            (Style::default().fg(C_ACCENT2), Style::default().fg(C_TEXT))
+        };
+        // Strip the old emoji prefix baked into quick_access labels (e.g. "🏠 Home") —
+        // we now draw a single consistent glyph instead, so alignment stays stable
+        // across whatever font the terminal is using.
+        let clean_label = label.splitn(2, ' ').nth(1).unwrap_or(label);
+        push_line(f, geo, inner, &mut y, max_y,
+            Line::from(vec![
+                Span::styled(" \u{25B8} ", bullet_style),
+                Span::styled(clean_label.to_string(), text_style),
+            ]),
+            Some(path.clone()));
+    }
+
+    y += 1;
+    push_line(f, geo, inner, &mut y, max_y,
+        Line::from(Span::styled(" DRIVES", Style::default().fg(C_MUTED).add_modifier(Modifier::BOLD))), None);
+
+    for d in app.drives.iter() {
+        if y + 2 >= max_y { break; }
+        let is_active = d.path == *cur_path;
+        let name_style = if is_active {
+            Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(C_TEXT)
+        };
+        let dot_color = match d.kind.as_str() {
+            "Removable" => C_WARN,
+            "Network"   => C_OK,
+            "CD-ROM"    => C_MUTED,
+            _           => C_ACCENT2,
+        };
+        let letter = d.path.to_string_lossy().trim_end_matches('\\').to_string();
+        push_line(f, geo, inner, &mut y, max_y,
+            Line::from(vec![
+                Span::styled(" \u{25CF} ", Style::default().fg(dot_color)),
+                Span::styled(format!("{}  ", letter), name_style),
+                Span::styled(truncate(&d.label, inner.width.saturating_sub(8) as usize), Style::default().fg(C_MUTED)),
+            ]),
+            Some(d.path.clone()));
+
+        if d.total > 0 {
+            let used = d.total.saturating_sub(d.free);
+            let frac = (used as f64 / d.total as f64).clamp(0.0, 1.0);
+            let bar_w = inner.width.saturating_sub(2) as usize;
+            let filled = ((bar_w as f64) * frac).round() as usize;
+            let bar_color = if frac > 0.9 { C_ERR } else if frac > 0.75 { C_WARN } else { C_ACCENT2 };
+            let mut bar = String::new();
+            bar.push_str(&"█".repeat(filled.min(bar_w)));
+            bar.push_str(&"░".repeat(bar_w.saturating_sub(filled)));
+            let free_gb = d.free as f64 / 1_073_741_824.0;
+            let total_gb = d.total as f64 / 1_073_741_824.0;
+            push_line(f, geo, inner, &mut y, max_y,
+                Line::from(vec![
+                    Span::styled(format!(" {}", bar), Style::default().fg(bar_color)),
+                ]),
+                None);
+            push_line(f, geo, inner, &mut y, max_y,
+                Line::from(vec![Span::styled(
+                    format!(" {:.0} GB free of {:.0} GB", free_gb, total_gb),
+                    Style::default().fg(C_MUTED),
+                )]),
+                None);
+        }
+    }
+}
+
+/// Renders one sidebar row at the current `y` cursor, advances it, and
+/// (optionally) registers a click-navigation hitbox for it.
+fn push_line(
+    f: &mut Frame,
+    geo: &mut LayoutGeometry,
+    inner: Rect,
+    y: &mut u16,
+    max_y: u16,
+    content: Line<'static>,
+    click_path: Option<std::path::PathBuf>,
+) {
+    if *y >= max_y { return; }
+    let rect = Rect { x: inner.x, y: *y, width: inner.width, height: 1 };
+    f.render_widget(Paragraph::new(content), rect);
+    if let Some(p) = click_path {
+        geo.sidebar_item_rects.push((rect, p));
+    }
+    *y += 1;
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max { return s.to_string(); }
+    if max <= 1 { return "…".to_string(); }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Notifications / non-blocking toasts
+// ─────────────────────────────────────────────────────────────────────────────
+
+// (rendered inline in the status bar — see draw_status_bar)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Input Modal (Rename / New Folder) — shows cursor + selection
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn draw_input_modal(f: &mut Frame, app: &AppState) {
     let title = if app.mode == AppMode::Rename { " Rename " } else { " New Folder " };
     let term_size = f.size();
-    
-    let width = 60.min(term_size.width.saturating_sub(4));
+
+    let width = 64.min(term_size.width.saturating_sub(4)).max(20);
     let height = 3;
-    
+
     let area = Rect {
         x: term_size.x + (term_size.width.saturating_sub(width)) / 2,
         y: term_size.y + (term_size.height.saturating_sub(height)) / 2,
         width,
         height,
     };
-    
+
     f.render_widget(Clear, area);
-    
+
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Yellow));
-        
-    let para = Paragraph::new(app.input_buffer.as_str())
-        .block(block)
-        .style(Style::default().fg(Color::White));
-        
-    f.render_widget(para, area);
-}
+        .border_style(Style::default().fg(C_ACCENT))
+        .style(Style::default().bg(Color::Rgb(28, 30, 38)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Breadcrumb
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn draw_breadcrumb(f: &mut Frame, app: &AppState, area: Rect) {
-    let path = app.current().path.display().to_string();
-    let mut ancestors = Vec::new();
-    let spans = if path == "\\\\drives" {
-        vec![
-            Span::styled(" 💾  This PC", Style::default().fg(Color::Rgb(100, 150, 240)).add_modifier(Modifier::BOLD)),
-            Span::styled(" › ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Drives", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        ]
+    let chars: Vec<char> = app.input_buffer.chars().collect();
+    let (lo, hi) = if app.input_sel_start <= app.input_cursor {
+        (app.input_sel_start, app.input_cursor)
     } else {
-        let mut parts = Vec::new();
-        parts.push(Span::styled(" 📁 ", Style::default().fg(Color::Rgb(100, 150, 240))));
-        
-        let path_buf = &app.current().path;
-        for component in path_buf.components() {
-            let s = component.as_os_str().to_string_lossy().to_string();
-            if !s.is_empty() {
-                ancestors.push(s);
-            }
-        }
-        
-        let len = ancestors.len();
-        for (idx, part) in ancestors.iter().enumerate() {
-            let clean_part = part.trim_end_matches(['\\', '/']);
-            if idx == len.saturating_sub(1) {
-                parts.push(Span::styled(clean_part, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
-            } else {
-                parts.push(Span::styled(clean_part, Style::default().fg(Color::Rgb(100, 150, 240))));
-                parts.push(Span::styled(" › ", Style::default().fg(Color::DarkGray)));
-            }
-        }
-        parts
+        (app.input_cursor, app.input_sel_start)
     };
 
-    let mode_badge = match app.mode {
-        AppMode::Rename => "  ✏ RENAME  ",
-        AppMode::ConfirmDelete => "  ❌ DELETE?  ",
-        AppMode::NewFolder => "  📁 NEW FOLDER  ",
-        _ => "",
-    };
-
-    let mut line_spans = spans;
-    if !mode_badge.is_empty() {
-        line_spans.push(Span::styled(mode_badge, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+    let mut spans = Vec::new();
+    for (i, c) in chars.iter().enumerate() {
+        let selected = i >= lo && i < hi;
+        let style = if selected {
+            Style::default().fg(Color::Black).bg(C_ACCENT2)
+        } else {
+            Style::default().fg(C_TEXT)
+        };
+        spans.push(Span::styled(c.to_string(), style));
+    }
+    // Cursor caret (only when there's no active selection to show).
+    if lo == hi {
+        let cursor_pos = app.input_cursor.min(spans.len());
+        spans.insert(cursor_pos, Span::styled("│", Style::default().fg(C_ACCENT).add_modifier(Modifier::RAPID_BLINK)));
     }
 
-    f.render_widget(Paragraph::new(Line::from(line_spans)), area);
+    f.render_widget(Paragraph::new(Line::from(spans)), inner);
+}
+
+fn draw_confirm_modal(f: &mut Frame, app: &AppState) {
+    let permanent = app.mode == AppMode::ConfirmDeletePermanent;
+    let n = app.selected_paths().len().max(1);
+    let title = if permanent { " Permanently Delete " } else { " Delete " };
+    let msg = if permanent {
+        format!("Permanently delete {} item(s)? This cannot be undone.", n)
+    } else {
+        format!("Delete {} item(s)?", n)
+    };
+
+    let term_size = f.size();
+    let width = 56.min(term_size.width.saturating_sub(4)).max(20);
+    let height = 5;
+    let area = Rect {
+        x: term_size.x + (term_size.width.saturating_sub(width)) / 2,
+        y: term_size.y + (term_size.height.saturating_sub(height)) / 2,
+        width, height,
+    };
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(C_ERR))
+        .style(Style::default().bg(Color::Rgb(28, 30, 38)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let text = vec![
+        Line::from(Span::styled(msg, Style::default().fg(C_TEXT))),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Y ", Style::default().fg(Color::Black).bg(C_ERR)),
+            Span::raw(" confirm     "),
+            Span::styled(" Esc ", Style::default().fg(Color::Black).bg(C_MUTED)),
+            Span::raw(" cancel"),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(text), inner);
+}
+
+fn draw_properties_modal(f: &mut Frame, app: &AppState) {
+    let Some(path) = app.selected_file().or_else(|| {
+        let cur = app.current();
+        if cur.files.is_empty() { None } else { Some(cur.files[cur.selected].path.clone()) }
+    }) else { return; };
+
+    let term_size = f.size();
+    let width = 62.min(term_size.width.saturating_sub(4)).max(30);
+    let height = 12.min(term_size.height.saturating_sub(4)).max(8);
+    let area = Rect {
+        x: term_size.x + (term_size.width.saturating_sub(width)) / 2,
+        y: term_size.y + (term_size.height.saturating_sub(height)) / 2,
+        width, height,
+    };
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Properties ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(C_ACCENT))
+        .style(Style::default().bg(Color::Rgb(28, 30, 38)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let meta = std::fs::metadata(&path);
+    let mut lines = vec![
+        Line::from(vec![Span::styled("Name:      ", Style::default().fg(C_MUTED)), Span::styled(name, Style::default().fg(C_TEXT).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![Span::styled("Location:  ", Style::default().fg(C_MUTED)), Span::styled(path.parent().map(|p| p.display().to_string()).unwrap_or_default(), Style::default().fg(C_TEXT))]),
+    ];
+    match meta {
+        Ok(m) => {
+            let kind = if m.is_dir() { "Folder".to_string() } else { "File".to_string() };
+            lines.push(Line::from(vec![Span::styled("Type:      ", Style::default().fg(C_MUTED)), Span::styled(kind, Style::default().fg(C_TEXT))]));
+            if !m.is_dir() {
+                lines.push(Line::from(vec![Span::styled("Size:      ", Style::default().fg(C_MUTED)), Span::styled(preview::human_size(m.len()), Style::default().fg(C_TEXT))]));
+            }
+            if let Ok(modified) = m.modified() {
+                if let Ok(dt) = modified.duration_since(std::time::UNIX_EPOCH) {
+                    lines.push(Line::from(vec![Span::styled("Modified:  ", Style::default().fg(C_MUTED)), Span::styled(format_epoch(dt.as_secs()), Style::default().fg(C_TEXT))]));
+                }
+            }
+            let mut attrs = Vec::new();
+            if m.permissions().readonly() { attrs.push("Read-only"); }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                let a = m.file_attributes();
+                if a & 0x2 != 0 { attrs.push("Hidden"); }
+                if a & 0x4 != 0 { attrs.push("System"); }
+            }
+            if !attrs.is_empty() {
+                lines.push(Line::from(vec![Span::styled("Attributes:", Style::default().fg(C_MUTED)), Span::styled(format!(" {}", attrs.join(", ")), Style::default().fg(C_WARN))]));
+            }
+        }
+        Err(e) => {
+            lines.push(Line::from(vec![Span::styled("Error:     ", Style::default().fg(C_ERR)), Span::styled(e.to_string(), Style::default().fg(C_ERR))]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("Esc to close", Style::default().fg(C_MUTED))));
+
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn format_epoch(secs: u64) -> String {
+    // Lightweight, dependency-free UTC formatting (no timezone database needed).
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Days since 1970-01-01 -> Y-M-D (civil_from_days algorithm).
+    let z = days as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mth = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if mth <= 2 { y + 1 } else { y };
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", year, mth, d, h, m, s)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Multi-pane layout
+// Right-click context menu
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Navigation Rail (Drives & Locations)
-// ─────────────────────────────────────────────────────────────────────────────
+fn draw_context_menu(f: &mut Frame, app: &AppState, geo: &mut LayoutGeometry) {
+    let items = &app.context_menu_items;
+    if items.is_empty() { return; }
 
-fn draw_nav_rail(f: &mut Frame, app: &AppState, area: Rect) {
+    let term = f.size();
+    let width: u16 = items.iter().map(|a| a.label().len() as u16).max().unwrap_or(10) + 6;
+    let height = items.len() as u16 + 2;
+
+    let (mx, my) = app.pending_menu_pos;
+    let mut x = mx;
+    let mut y = my.saturating_add(1);
+    if x + width > term.width { x = term.width.saturating_sub(width); }
+    if y + height > term.height { y = term.height.saturating_sub(height); }
+
+    let area = Rect { x, y, width: width.min(term.width), height: height.min(term.height) };
+    f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(if app.active_pane == ActivePane::NavigationRail {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::Rgb(40, 45, 60))
-        });
-        
-    let inner_area = block.inner(area);
+        .border_style(Style::default().fg(C_ACCENT))
+        .style(Style::default().bg(Color::Rgb(30, 32, 40)));
+    let inner = block.inner(area);
     f.render_widget(block, area);
-    
-    let mut row_rects = Vec::new();
-    let mut render_y = inner_area.y;
-    
-    for (i, item) in app.rail_state.items.iter().enumerate() {
-        if render_y >= inner_area.y + inner_area.height {
-            break;
+
+    for (i, action) in items.iter().enumerate() {
+        if i as u16 >= inner.height { break; }
+        let rect = Rect { x: inner.x, y: inner.y + i as u16, width: inner.width, height: 1 };
+        let label = if matches!(action, ContextAction::Delete) {
+            Span::styled(format!(" {}", action.label()), Style::default().fg(C_ERR))
+        } else {
+            Span::styled(format!(" {}", action.label()), Style::default().fg(C_TEXT))
+        };
+        f.render_widget(Paragraph::new(Line::from(label)), rect);
+        geo.context_menu_item_rects.push((rect, *action));
+    }
+    geo.context_menu_rect = Some(area);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Breadcrumb — clickable path segments
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn draw_breadcrumb(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeometry) {
+    let path = app.current().path.clone();
+    let path_str = path.display().to_string();
+
+    if path_str == "\\\\drives" {
+        f.render_widget(
+            Paragraph::new(Span::styled(" ◉  This PC — Drives", Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD))),
+            area,
+        );
+        return;
+    }
+
+    // Build clickable segments: C:\ > Users > sifay > Pictures
+    let mut spans = vec![Span::styled(" ▸  ", Style::default().fg(C_MUTED))];
+    let mut segments: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let mut acc = std::path::PathBuf::new();
+    for comp in path.components() {
+        acc.push(comp.as_os_str());
+        let label = comp.as_os_str().to_string_lossy().to_string();
+        segments.push((label, acc.clone()));
+    }
+
+    let mut x = area.x + 5;
+    for (i, (label, seg_path)) in segments.iter().enumerate() {
+        let is_last = i == segments.len() - 1;
+        let style = if is_last {
+            Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(C_TEXT)
+        };
+        let text = label.trim_end_matches(['\\', '/']).to_string();
+        let text = if text.is_empty() { label.clone() } else { text };
+        let w = text.chars().count() as u16;
+        if x + w <= area.x + area.width {
+            geo.breadcrumb_segment_rects.push((Rect { x, y: area.y, width: w, height: 1 }, seg_path.clone()));
         }
-        
-        let is_selected = i == app.rail_state.selected;
-        let is_rail_focused = app.active_pane == ActivePane::NavigationRail;
-        
-        match item {
-            RailItem::Header(text) => {
-                let span = Span::styled(text.as_str(), Style::default().fg(Color::Rgb(100, 150, 240)).add_modifier(Modifier::BOLD));
-                f.render_widget(Paragraph::new(Line::from(vec![span])), Rect {
-                    x: inner_area.x + 1,
-                    y: render_y,
-                    width: inner_area.width.saturating_sub(2),
-                    height: 1,
-                });
-                render_y += 1;
-            }
-            RailItem::Separator => {
-                let span = Span::styled("─".repeat(inner_area.width.saturating_sub(2) as usize), Style::default().fg(Color::Rgb(40, 45, 60)));
-                f.render_widget(Paragraph::new(Line::from(vec![span])), Rect {
-                    x: inner_area.x + 1,
-                    y: render_y,
-                    width: inner_area.width.saturating_sub(2),
-                    height: 1,
-                });
-                render_y += 1;
-            }
-            RailItem::Location { name, icon, .. } => {
-                row_rects.push((i, Rect {
-                    x: inner_area.x,
-                    y: render_y,
-                    width: inner_area.width,
-                    height: 1,
-                }));
-                
-                let text_style = if is_selected {
-                    if is_rail_focused {
-                        Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::White).bg(Color::Rgb(50, 55, 70)).add_modifier(Modifier::BOLD)
-                    }
-                } else {
-                    Style::default().fg(Color::Rgb(200, 200, 200))
-                };
-                
-                let display = format!("  {}  {:<18}", icon, name);
-                f.render_widget(Paragraph::new(Span::styled(display, text_style)), Rect {
-                    x: inner_area.x,
-                    y: render_y,
-                    width: inner_area.width,
-                    height: 1,
-                });
-                render_y += 1;
-            }
-            RailItem::Drive { info, icon } => {
-                row_rects.push((i, Rect {
-                    x: inner_area.x,
-                    y: render_y,
-                    width: inner_area.width,
-                    height: 2,
-                }));
-                
-                let text_style = if is_selected {
-                    if is_rail_focused {
-                        Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::White).bg(Color::Rgb(50, 55, 70)).add_modifier(Modifier::BOLD)
-                    }
-                } else {
-                    Style::default().fg(Color::Rgb(200, 200, 200))
-                };
-                
-                let label = format!("  {}  {} ({})", icon, info.label, info.path.to_string_lossy().trim_end_matches('\\'));
-                f.render_widget(Paragraph::new(Span::styled(label, text_style)), Rect {
-                    x: inner_area.x,
-                    y: render_y,
-                    width: inner_area.width,
-                    height: 1,
-                });
-                
-                // Progress bar
-                let free_gb = info.free_bytes as f64 / 1_073_741_824.0;
-                let _total_gb = info.total_bytes as f64 / 1_073_741_824.0;
-                let pct = if info.total_bytes > 0 {
-                    (info.total_bytes - info.free_bytes) as f64 / info.total_bytes as f64
-                } else {
-                    0.0
-                };
-                
-                let bar_width = inner_area.width.saturating_sub(6) as usize;
-                let filled = (pct * bar_width as f64).round() as usize;
-                let bar = format!(
-                    "   [{}{}] {:.0} GB free",
-                    "█".repeat(filled),
-                    "░".repeat(bar_width.saturating_sub(filled)),
-                    free_gb
-                );
-                
-                f.render_widget(Paragraph::new(Span::styled(bar, Style::default().fg(Color::DarkGray))), Rect {
-                    x: inner_area.x,
-                    y: render_y + 1,
-                    width: inner_area.width,
-                    height: 1,
-                });
-                
-                render_y += 2;
-            }
+        spans.push(Span::styled(text, style));
+        x += w;
+        if !is_last {
+            spans.push(Span::styled("  ›  ", Style::default().fg(C_MUTED)));
+            x += 5;
         }
     }
-    
-    // Store row rects in layout geometry
-    {
-        let mut geo = app.layout_geometry.lock();
-        geo.nav_row_rects = row_rects;
+
+    let mode_badge = match app.mode {
+        AppMode::Rename => "  ✎ RENAME",
+        AppMode::ConfirmDelete | AppMode::ConfirmDeletePermanent => "  ✖ DELETE?",
+        AppMode::NewFolder => "  ▸ NEW FOLDER",
+        AppMode::ContextMenu => "  ☰ MENU",
+        AppMode::Properties => "  ℹ PROPERTIES",
+        _ => "",
+    };
+    if !mode_badge.is_empty() {
+        spans.push(Span::styled(mode_badge, Style::default().fg(C_WARN).add_modifier(Modifier::BOLD)));
     }
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Multi-pane layout
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn draw_panes(f: &mut Frame, app: &AppState, geo: &mut LayoutGeometry) {
+fn draw_panes(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeometry) {
     let num   = app.levels.len();
     let start = if num > 4 { num - 4 } else { 0 };
     let panes = &app.levels[start..];
+    let np    = panes.len();
 
-    // Draw directory panes
-    for (i, level) in panes.iter().enumerate() {
-        if i < geo.pane_rects.len() {
-            draw_dir_pane(f, level, (start + i) == app.current_level, geo.pane_rects[i], geo, i);
+    let has_preview = panes.last().map_or(false, |l| !l.files.is_empty());
+    let n_cols = if has_preview { np + 1 } else { np };
+
+    if n_cols == 0 { return; }
+
+    let start_idx = 5 - n_cols;
+    let mut sub_ratios = app.column_ratios[start_idx..].to_vec();
+    let sum: f32 = sub_ratios.iter().sum();
+    if sum > 0.0 {
+        for r in sub_ratios.iter_mut() { *r /= sum; }
+    }
+
+    let mut constraints: Vec<Constraint> = sub_ratios.iter().take(n_cols.saturating_sub(1)).map(|&r| {
+        Constraint::Percentage((r * 100.0) as u16)
+    }).collect();
+    constraints.push(Constraint::Min(0));
+
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(constraints)
+        .split(area);
+
+    // Divider hitboxes — kept narrow (1 cell) so they don't swallow clicks on
+    // filenames near a column edge, but still easy to grab precisely.
+    for i in 0..chunks.len().saturating_sub(1) {
+        let current_chunk = chunks[i];
+        if current_chunk.width > 0 {
+            let next_chunk = chunks[i + 1];
+            let divider_x = if current_chunk.x + current_chunk.width == next_chunk.x {
+                current_chunk.x + current_chunk.width - 1
+            } else {
+                next_chunk.x.saturating_sub(1)
+            };
+            geo.divider_rects.push(Rect { x: divider_x, y: current_chunk.y, width: 1, height: current_chunk.height });
         }
     }
 
-    // Draw preview pane
-    if geo.preview_outer_rect.width > 0 {
+    for (i, level) in panes.iter().enumerate() {
+        geo.pane_rects.push(chunks[i]);
+        draw_dir_pane(f, level, (start + i) == app.current_level, chunks[i], geo, (start + i) - start);
+    }
+
+    if has_preview {
         if let Some(current) = panes.last() {
-            draw_preview_pane(f, app, current, geo.preview_outer_rect, geo);
+            geo.preview_rect = Some(chunks[np]);
+            draw_preview_pane(f, app, current, chunks[np]);
         }
     }
 }
@@ -311,9 +591,9 @@ fn draw_dir_pane(f: &mut Frame, level: &DirLevel, is_current: bool, area: Rect, 
     };
 
     let border_style = if is_current {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(C_ACCENT)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(C_BORDER)
     };
 
     let visible_h    = area.height.saturating_sub(2) as usize;
@@ -328,6 +608,7 @@ fn draw_dir_pane(f: &mut Frame, level: &DirLevel, is_current: bool, area: Rect, 
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(2),
     };
+    let name_budget = (list_inner_area.width as usize).saturating_sub(4);
 
     let items: Vec<ListItem> = level.files
         .iter()
@@ -336,84 +617,100 @@ fn draw_dir_pane(f: &mut Frame, level: &DirLevel, is_current: bool, area: Rect, 
         .take(visible_h)
         .enumerate()
         .map(|(render_i, (file_i, p))| {
-            // Save row rect for hit testing
             row_rects_for_pane.push((file_i, Rect {
                 x: list_inner_area.x,
                 y: list_inner_area.y + render_i as u16,
                 width: list_inner_area.width,
                 height: 1,
             }));
-            
+
             let raw_name = p.path.file_name()
                 .unwrap_or_else(|| p.path.as_os_str())
                 .to_string_lossy()
                 .to_string();
+            let shown_name = truncate(&raw_name, name_budget.max(4));
 
-            let display = if p.is_dir {
-                format!("📂 {}", raw_name)
+            let (icon, icon_color) = if p.is_dir {
+                ("\u{25B8}", C_ACCENT2) // ▸ folder
             } else {
                 let ext = p.path.extension().and_then(|s| s.to_str()).unwrap_or("");
-                format!("{} {}", file_icon(ext), raw_name)
+                file_icon(ext)
             };
-
+            let is_marked = level.marked.contains(&p.path);
             let is_selected = file_i == level.selected;
+
             if is_selected {
-                let color = if is_current { Color::Cyan } else { Color::Rgb(88, 91, 112) };
-                let fg_color = if is_current { Color::Black } else { Color::White };
-                
-                let display_width = if p.is_dir {
-                    2 + 1 + raw_name.chars().count() // "📂" (2) + " " (1) + name
-                } else {
-                    let ext = p.path.extension().and_then(|s| s.to_str()).unwrap_or("");
-                    let icon = file_icon(ext);
-                    let icon_w = if icon.is_empty() { 0 } else { 2 };
-                    icon_w + 1 + raw_name.chars().count()
-                };
-
+                let bg = if is_current { C_SEL_BG } else { C_SEL_BG_INACTIVE };
+                let fg_color = if is_current { C_ACCENT } else { C_TEXT };
                 let inner_w = (area.width as usize).saturating_sub(2);
-                let pad_w = (inner_w.saturating_sub(3)).saturating_sub(display_width);
-                let padded_text = format!(" {}{}", display, " ".repeat(pad_w));
-
-                let spans = vec![
-                    Span::styled("", Style::default().fg(color)),
-                    Span::styled(padded_text, Style::default().fg(fg_color).bg(color).add_modifier(Modifier::BOLD)),
-                    Span::styled("", Style::default().fg(color)),
-                ];
-                ListItem::new(Line::from(spans))
+                let disp_w = 2 + shown_name.chars().count(); // icon + space + name
+                let pad_w = inner_w.saturating_sub(1).saturating_sub(disp_w);
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!(" {} ", icon), Style::default().fg(icon_color).bg(bg)),
+                    Span::styled(format!("{}{}", shown_name, " ".repeat(pad_w)), Style::default().fg(fg_color).bg(bg).add_modifier(Modifier::BOLD)),
+                ]))
+            } else if is_marked {
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!(" {} ", icon), Style::default().fg(icon_color)),
+                    Span::styled(shown_name, Style::default().fg(C_MARK).add_modifier(Modifier::BOLD)),
+                ]))
             } else {
-                let style = if is_current {
-                    Style::default().fg(Color::White)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                };
-                ListItem::new(format!("  {}", display)).style(style)
+                let style = if is_current { Style::default().fg(C_TEXT) } else { Style::default().fg(C_MUTED) };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!(" {} ", icon), Style::default().fg(icon_color)),
+                    Span::styled(shown_name, style),
+                ]))
             }
         })
         .collect();
 
     geo.row_rects.insert(pane_idx, row_rects_for_pane);
 
+    let marked_count = level.marked.len();
+    let title_text = if marked_count > 0 {
+        format!(" {} · {} marked ", if title.is_empty() { "/" } else { &title }, marked_count)
+    } else {
+        format!(" {} ", if title.is_empty() { "/" } else { &title })
+    };
+
     let list = List::new(items).block(
         Block::default()
-            .title(format!(" {} ", if title.is_empty() { "/" } else { &title }))
+            .title(title_text)
+            .title_style(if is_current { Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD) } else { Style::default().fg(C_MUTED) })
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(border_style),
     );
     f.render_widget(list, area);
+
+    // Simple scrollbar indicator for long directories.
+    if level.files.len() > visible_h && area.height > 4 {
+        let track_h = area.height.saturating_sub(2) as usize;
+        let ratio = visible_h as f64 / level.files.len() as f64;
+        let thumb_h = ((track_h as f64) * ratio).max(1.0) as usize;
+        let thumb_pos = if level.files.len() > visible_h {
+            ((track_h.saturating_sub(thumb_h)) as f64 * (scroll_start as f64 / (level.files.len() - visible_h) as f64)) as usize
+        } else { 0 };
+        for i in 0..track_h {
+            let on_thumb = i >= thumb_pos && i < thumb_pos + thumb_h;
+            let ch = if on_thumb { "█" } else { "│" };
+            let color = if on_thumb { C_ACCENT2 } else { C_BORDER };
+            let rect = Rect { x: area.x + area.width - 1, y: area.y + 1 + i as u16, width: 1, height: 1 };
+            f.render_widget(Paragraph::new(Span::styled(ch, Style::default().fg(color))), rect);
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Preview pane
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect, geo: &LayoutGeometry) {
+fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect) {
     if level.files.is_empty() {
         app.native_preview.hide();
         f.render_widget(
-            Paragraph::new("Empty")
-                .block(Block::default().title(" Preview ").borders(Borders::ALL).border_type(BorderType::Rounded))
-                .style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(Span::styled("Empty", Style::default().fg(C_MUTED)))
+                .block(Block::default().title(" PREVIEW ").borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(C_BORDER))),
             area,
         );
         return;
@@ -431,8 +728,7 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
             matches!(ext.as_str(), "jpg"|"jpeg"|"png"|"gif"|"bmp"|"webp"|"tiff"|"tif")
         }).count();
 
-        let dir_name = selected.path.file_name()
-            .unwrap_or_default().to_string_lossy().to_string();
+        let dir_name = selected.path.file_name().unwrap_or_default().to_string_lossy().to_string();
         let stats_title = if img_count > 0 {
             format!(" {} │ {} dirs  {} files  {} imgs ", dir_name, dir_count, file_count, img_count)
         } else {
@@ -440,22 +736,22 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
         };
 
         let visible_h = area.height.saturating_sub(2) as usize;
+        let name_budget = (area.width as usize).saturating_sub(6);
 
         let items: Vec<ListItem> = children.iter()
             .take(visible_h)
             .map(|p| {
-                let name = p.path.file_name()
-                    .unwrap_or_else(|| p.path.as_os_str())
-                    .to_string_lossy()
-                    .to_string();
-                let (icon, color) = if p.is_dir {
-                    ("📂 ", Color::White)
+                let name = truncate(&p.path.file_name().unwrap_or_else(|| p.path.as_os_str()).to_string_lossy(), name_budget.max(4));
+                let (icon, icon_color) = if p.is_dir {
+                    ("\u{25B8}", C_ACCENT2)
                 } else {
                     let ext = p.path.extension().and_then(|s| s.to_str()).unwrap_or("");
-                    (file_icon(ext), Color::Rgb(180, 185, 200))
+                    file_icon(ext)
                 };
-                ListItem::new(format!("  {}{}", icon, name))
-                    .style(Style::default().fg(color))
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("  {} ", icon), Style::default().fg(icon_color)),
+                    Span::styled(name, Style::default().fg(C_MUTED)),
+                ]))
             })
             .collect();
 
@@ -463,9 +759,10 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
             List::new(items).block(
                 Block::default()
                     .title(stats_title)
+                    .title_style(Style::default().fg(C_OK))
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Green)),
+                    .border_style(Style::default().fg(C_BORDER_LO)),
             ),
             area,
         );
@@ -474,315 +771,76 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
     }
 
     // ── File preview ──────────────────────────────────────────────────────────
-    let is_image = {
-        let ext = selected.path.extension()
-            .and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-        matches!(ext.as_str(), "jpg"|"jpeg"|"png"|"bmp"|"gif"|"webp"|"tiff"|"tif"|"ico")
-    };
-
-    let name = selected.path.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
+    let name = selected.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     let meta = std::fs::metadata(&selected.path);
-    let size_str = meta.as_ref()
-        .map(|m| preview::human_size(m.len()))
-        .unwrap_or_default();
+    let size_str = meta.as_ref().map(|m| preview::human_size(m.len())).unwrap_or_default();
     let ext = selected.path.extension().and_then(|s| s.to_str()).unwrap_or("").to_uppercase();
 
-    // 1. Draw outer pane box border with styled title bar (PREVIEW on left, shortcuts on right)
-    let shortcuts_str = "F1 Help  F2 Rename  F3 View  F5 Copy  F6 Move  Del Delete  Esc Menu";
-    let left_str = " PREVIEW ";
-    let mut title_spans = vec![
-        Span::styled(left_str, Style::default().fg(Color::Rgb(50, 180, 80)).add_modifier(Modifier::BOLD)),
-    ];
-    if area.width as usize > left_str.len() + shortcuts_str.len() + 4 {
-        let pad = (area.width as usize) - left_str.len() - shortcuts_str.len() - 4;
-        title_spans.push(Span::raw(" ".repeat(pad)));
-        
-        let shortcuts_parts = [
-            ("F1", " Help"),
-            ("F2", " Rename"),
-            ("F3", " View"),
-            ("F5", " Copy"),
-            ("F6", " Move"),
-            ("Del", " Delete"),
-            ("Esc", " Menu"),
-        ];
-        for &(k, v) in &shortcuts_parts {
-            title_spans.push(Span::styled(format!(" {}", k), Style::default().fg(Color::Rgb(100, 150, 240))));
-            title_spans.push(Span::styled(format!("{} ", v), Style::default().fg(Color::Rgb(200, 200, 200))));
-        }
-    }
-    let block = Block::default()
-        .title(Line::from(title_spans))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(if app.mode != AppMode::Normal {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::Rgb(50, 55, 70))
-        });
-    let _inner = block.inner(area);
-    f.render_widget(block, area);
-
-    // Fetch dynamic preview content to check image dimensions
-    let preview_content = preview::render(&selected.path, app.image_rotation, app.image_flip_h);
-    let image_dimensions = match &preview_content {
-        PreviewContent::ImageFallback(info) => info.dimensions,
-        _ => None,
+    let title = if app.mode != AppMode::Normal {
+        " PREVIEW │ mode active (Esc to cancel) ".to_string()
+    } else {
+        " PREVIEW ".to_string()
     };
 
-    // 2. Render Header inside geo.preview_header_rect
-    let header_rect = geo.preview_header_rect;
-    if header_rect.width > 0 && header_rect.height > 0 {
-        let name_span = Span::styled(&name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD));
-        let mut line1_spans = vec![name_span];
-        
-        let icons_str = "🖼️  ℹ️  </>  •••";
-        if header_rect.width as usize > name.len() + icons_str.len() + 4 {
-            let pad = (header_rect.width as usize) - name.len() - icons_str.len() - 4;
-            line1_spans.push(Span::raw(" ".repeat(pad)));
-            line1_spans.push(Span::styled("🖼️  ", Style::default().fg(Color::Rgb(100, 150, 240))));
-            line1_spans.push(Span::styled("ℹ️  ", Style::default().fg(Color::DarkGray)));
-            line1_spans.push(Span::styled("</>  ", Style::default().fg(Color::DarkGray)));
-            line1_spans.push(Span::styled("•••", Style::default().fg(Color::DarkGray)));
-        }
-        
-        f.render_widget(Paragraph::new(Line::from(line1_spans)), Rect {
-            x: header_rect.x,
-            y: header_rect.y,
-            width: header_rect.width,
-            height: 1,
-        });
-        
-        let badge_style = Style::default().bg(Color::Rgb(40, 50, 70)).fg(Color::Rgb(100, 150, 240)).add_modifier(Modifier::BOLD);
-        let ext_label = if is_image {
-            format!(" {} Image ", ext)
-        } else {
-            format!(" {} File ", ext)
-        };
-        let mut line2_spans = vec![
-            Span::styled(ext_label, badge_style),
-            Span::raw("   "),
-            Span::styled(&size_str, Style::default().fg(Color::Rgb(180, 180, 180))),
-        ];
-        if let Some((w, h)) = image_dimensions {
-            line2_spans.push(Span::raw("   •   "));
-            line2_spans.push(Span::styled(format!("{} × {}", w, h), Style::default().fg(Color::Rgb(180, 180, 180))));
-        }
-        f.render_widget(Paragraph::new(Line::from(line2_spans)), Rect {
-            x: header_rect.x,
-            y: header_rect.y + 1,
-            width: header_rect.width,
-            height: 1,
-        });
-    }
+    let block = Block::default()
+        .title(title)
+        .title_style(if app.mode != AppMode::Normal { Style::default().fg(C_WARN) } else { Style::default().fg(C_MUTED) })
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(if app.mode != AppMode::Normal { Style::default().fg(C_WARN) } else { Style::default().fg(C_BORDER_LO) });
 
-    // 3. Render Image Viewport or Text Content inside geo.preview_viewport_rect
-    let viewport_rect = geo.preview_viewport_rect;
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
     let scroll = app.preview_scroll as u16;
-    match preview_content {
+
+    match preview::render(&selected.path, app.image_rotation, app.image_flip_h) {
         PreviewContent::Text(txt) => {
             app.native_preview.hide();
-            let para = Paragraph::new(txt)
-                .wrap(Wrap { trim: false })
-                .scroll((scroll, 0));
-            f.render_widget(para, viewport_rect);
+            let para = Paragraph::new(txt).wrap(Wrap { trim: false }).scroll((scroll, 0));
+            f.render_widget(para, inner);
         }
         PreviewContent::Highlighted(lines) => {
             app.native_preview.hide();
             let text = Text::from(lines);
-            let para = Paragraph::new(text)
-                .wrap(Wrap { trim: false })
-                .scroll((scroll, 0));
-            f.render_widget(para, viewport_rect);
+            let para = Paragraph::new(text).wrap(Wrap { trim: false }).scroll((scroll, 0));
+            f.render_widget(para, inner);
         }
         PreviewContent::ImageFallback(info) => {
+            let mut top_margin = 0;
             if let Some(img) = &info.img {
                 let (cols, rows) = crossterm::terminal::size().unwrap_or((0, 0));
+                let mut img_rect = inner;
+                if img_rect.height > 6 {
+                    img_rect.y += 4;
+                    img_rect.height -= 4;
+                }
                 if app.mode == AppMode::Normal {
-                    app.native_preview.show(std::sync::Arc::clone(img), viewport_rect, cols, rows);
+                    app.native_preview.show(std::sync::Arc::clone(img), info.path.clone(), app.image_rotation, app.image_flip_h, img_rect, cols, rows);
                 } else {
                     app.native_preview.hide();
                 }
+                top_margin = img_rect.y - inner.y;
             } else {
                 app.native_preview.hide();
-                if is_image {
-                    let loading_para = Paragraph::new("⏳ Loading image...")
-                        .style(Style::default().fg(Color::Rgb(100, 150, 240)))
-                        .alignment(ratatui::layout::Alignment::Center);
-                    let mut loading_rect = viewport_rect;
-                    if loading_rect.height > 2 {
-                        loading_rect.y += loading_rect.height / 2;
-                        loading_rect.height = 1;
-                    }
-                    f.render_widget(loading_para, loading_rect);
-                }
-            }
-        }
-    }
-
-    // 4. Render Zoom Controls inside geo.preview_controls_rect
-    let controls_rect = geo.preview_controls_rect;
-    if is_image && controls_rect.width > 0 && controls_rect.height > 0 {
-        let sep_str = "─".repeat(controls_rect.width as usize);
-        f.render_widget(Paragraph::new(Span::styled(sep_str, Style::default().fg(Color::Rgb(30, 35, 45)))), Rect {
-            x: controls_rect.x,
-            y: controls_rect.y,
-            width: controls_rect.width,
-            height: 1,
-        });
-
-        let zoom_pct = (app.image_zoom * 100.0) as i32;
-        let slider_filled = ((app.image_zoom.clamp(0.1, 3.0) - 0.1) / 2.9 * 8.0) as usize;
-        let slider_str = format!(
-            "━━{}●{}",
-            "━".repeat(slider_filled),
-            "━".repeat(8 - slider_filled)
-        );
-
-        let mut ctrl_spans = Vec::new();
-        ctrl_spans.push(Span::styled("  🔍  ", Style::default().fg(Color::Rgb(150, 150, 150))));
-        ctrl_spans.push(Span::styled("- ", Style::default().fg(Color::Rgb(100, 150, 240))));
-        ctrl_spans.push(Span::styled(slider_str, Style::default().fg(Color::Rgb(60, 70, 90))));
-        ctrl_spans.push(Span::styled(format!("  {}%  ", zoom_pct), Style::default().fg(Color::White)));
-        ctrl_spans.push(Span::styled("+   ", Style::default().fg(Color::Rgb(100, 150, 240))));
-
-        ctrl_spans.push(Span::styled("   Fit   ", Style::default().bg(Color::Rgb(30, 35, 45)).fg(Color::White)));
-        ctrl_spans.push(Span::styled("   Rotate ↻   ", Style::default().bg(Color::Rgb(30, 35, 45)).fg(Color::White)));
-        ctrl_spans.push(Span::styled("   Fullscreen ⛶   ", Style::default().bg(Color::Rgb(30, 35, 45)).fg(Color::White)));
-
-        f.render_widget(Paragraph::new(Line::from(ctrl_spans)), Rect {
-            x: controls_rect.x,
-            y: controls_rect.y + 1,
-            width: controls_rect.width,
-            height: 1,
-        });
-    }
-
-    // 5. Render Detailed Metadata Panel inside geo.preview_metadata_rect
-    let meta_rect = geo.preview_metadata_rect;
-    if meta_rect.width > 0 && meta_rect.height > 0 {
-        let sep_str = "─".repeat(meta_rect.width as usize);
-        f.render_widget(Paragraph::new(Span::styled(sep_str, Style::default().fg(Color::Rgb(30, 35, 45)))), Rect {
-            x: meta_rect.x,
-            y: meta_rect.y,
-            width: meta_rect.width,
-            height: 1,
-        });
-
-        let path_str = selected.path.to_string_lossy().to_string();
-        let bytes_size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-        let size_detailed = format!("{} ({} bytes)", size_str, bytes_size);
-
-        let mod_str = meta.as_ref().ok()
-            .and_then(|m| m.modified().ok())
-            .map(|t| {
-                let dt: chrono::DateTime<chrono::Local> = t.into();
-                dt.format("%A, %B %d, %Y %I:%M:%S %p").to_string()
-            })
-            .unwrap_or_else(|| "Unknown".to_string());
-
-        let cre_str = meta.as_ref().ok()
-            .and_then(|m| m.created().ok())
-            .map(|t| {
-                let dt: chrono::DateTime<chrono::Local> = t.into();
-                dt.format("%A, %B %d, %Y %I:%M:%S %p").to_string()
-            })
-            .unwrap_or_else(|| "Unknown".to_string());
-
-        let dim_str = if let Some((w, h)) = image_dimensions {
-            format!("{} × {}", w, h)
-        } else {
-            "Unknown".to_string()
-        };
-
-        let is_quran = path_str.contains("Quran 3-8");
-        let camera_val = if is_quran { "NIKON D850" } else { "None" };
-        let aperture_val = if is_quran { "f/4.5" } else { "None" };
-        let iso_val = if is_quran { "64" } else { "None" };
-        let focal_val = if is_quran { "24.0 mm" } else { "None" };
-        let exposure_val = if is_quran { "1/125 sec" } else { "None" };
-        let color_profile = if is_quran { "sRGB IEC61966-2.1" } else { "sRGB" };
-        let orientation_val = if image_dimensions.map_or(true, |(w, h)| w >= h) { "Landscape" } else { "Portrait" };
-        let bit_depth = "8";
-        let jfif_version = "1.02";
-
-        let col1_items = if is_image {
-            vec![
-                ("Path:", path_str.as_str()),
-                ("Type:", "JPEG Image"),
-                ("Size:", size_detailed.as_str()),
-                ("Dimensions:", dim_str.as_str()),
-                ("Modified:", mod_str.as_str()),
-                ("Created:", cre_str.as_str()),
-                ("Camera:", camera_val),
-                ("Aperture:", aperture_val),
-            ]
-        } else {
-            vec![
-                ("Path:", path_str.as_str()),
-                ("Type:", "File"),
-                ("Size:", size_detailed.as_str()),
-                ("Modified:", mod_str.as_str()),
-                ("Created:", cre_str.as_str()),
-            ]
-        };
-
-        let col2_items = [
-            ("ISO:", iso_val),
-            ("Focal Length:", focal_val),
-            ("Exposure:", exposure_val),
-            ("Color Profile:", color_profile),
-            ("Orientation:", orientation_val),
-            ("Bit Depth:", bit_depth),
-            ("JFIF Version:", jfif_version),
-        ];
-
-        let col_w = meta_rect.width / 2;
-        let col1_x = meta_rect.x;
-        let col2_x = meta_rect.x + col_w;
-
-        let limit = if is_image { 8 } else { 5 };
-        for i in 0..limit {
-            let row_y = meta_rect.y + 1 + i as u16;
-            if row_y >= meta_rect.y + meta_rect.height {
-                break;
             }
 
-            if i < col1_items.len() {
-                let (key, val) = col1_items[i];
-                let mut line_spans = vec![
-                    Span::styled(format!("{:<13}", key), Style::default().fg(Color::Rgb(100, 150, 240))),
-                    Span::styled(val, Style::default().fg(Color::White)),
-                ];
-                let limit_w = if is_image { col_w } else { meta_rect.width };
-                if key == "Path:" && val.len() > (limit_w as usize).saturating_sub(15) {
-                    let max_l = (limit_w as usize).saturating_sub(18);
-                    let truncated = format!("...{}", &val[val.len().saturating_sub(max_l)..]);
-                    line_spans[1] = Span::styled(truncated, Style::default().fg(Color::White));
-                }
-                f.render_widget(Paragraph::new(Line::from(line_spans)), Rect {
-                    x: col1_x,
-                    y: row_y,
-                    width: if is_image { col_w } else { meta_rect.width },
-                    height: 1,
-                });
+            let mut text = vec![
+                Line::from(vec![Span::styled(&name, Style::default().fg(C_TEXT).add_modifier(Modifier::BOLD))]),
+            ];
+            let mut meta_str = format!("{} Image  •  {}", ext, size_str);
+            if let Some((w, h)) = info.dimensions {
+                meta_str.push_str(&format!("  •  {} × {}", w, h));
+            }
+            text.push(Line::from(vec![Span::styled(meta_str, Style::default().fg(C_MUTED))]));
+            text.push(Line::from(vec![Span::styled("─".repeat(inner.width as usize), Style::default().fg(C_BORDER_LO))]));
+
+            for _ in 0..top_margin.saturating_sub(text.len() as u16) {
+                text.push(Line::from(""));
             }
 
-            if is_image && i < col2_items.len() {
-                let (key, val) = col2_items[i];
-                let line_spans = vec![
-                    Span::styled(format!("{:<15}", key), Style::default().fg(Color::Rgb(100, 150, 240))),
-                    Span::styled(val, Style::default().fg(Color::White)),
-                ];
-                f.render_widget(Paragraph::new(Line::from(line_spans)), Rect {
-                    x: col2_x,
-                    y: row_y,
-                    width: col_w,
-                    height: 1,
-                });
-            }
+            let para = Paragraph::new(Text::from(text)).wrap(Wrap { trim: false }).scroll((scroll, 0));
+            f.render_widget(para, inner);
         }
     }
 }
@@ -791,118 +849,83 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
 // File icons
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn file_icon(ext: &str) -> &'static str {
+/// Returns a single-width glyph + color for a file extension. Deliberately a
+/// small, curated set (not one emoji per extension) — multi-codepoint color
+/// emoji render at inconsistent widths across terminal fonts, which is what
+/// was causing icons to look misaligned/"off". These are plain BMP symbols
+/// that stay one cell wide in any monospace font.
+fn file_icon(ext: &str) -> (&'static str, Color) {
+    const CODE:    Color = Color::Rgb(137, 180, 250); // blue
+    const MARKUP:  Color = Color::Rgb(148, 226, 213); // teal
+    const DOC:     Color = Color::Rgb(203, 166, 247); // lavender
+    const SHEET:   Color = Color::Rgb(166, 227, 161); // green
+    const IMAGE:   Color = Color::Rgb(245, 194, 231); // pink
+    const MEDIA:   Color = Color::Rgb(250, 179, 135); // peach
+    const ARCHIVE: Color = Color::Rgb(249, 226, 175); // yellow
+    const BIN:     Color = Color::Rgb(243, 139, 168); // red
+    const PLAIN:   Color = C_MUTED;
+
     match ext.to_lowercase().as_str() {
-        "rs"                                              => "🦀",
-        "py"                                              => "🐍",
-        "js"|"mjs"|"cjs"                                  => "📜",
-        "ts"|"tsx"|"jsx"                                  => "📘",
-        "html"|"htm"                                      => "🌐",
-        "css"|"scss"|"sass"|"less"                        => "🎨",
-        "json"|"toml"|"yaml"|"yml"                        => "⚙️ ",
-        "sh"|"bash"|"zsh"|"ps1"|"bat"|"cmd"               => "⚡",
-        "c"|"cpp"|"h"|"hpp"|"cc"                          => "🔧",
-        "java"|"kt"|"kts"                                 => "☕",
-        "go"                                              => "🐹",
-        "rb"                                              => "💎",
-        "php"                                             => "🐘",
-        "swift"                                           => "🕊️ ",
-        "cs"                                              => "🔷",
-        "lua"                                             => "🌙",
-        "sql"                                             => "🗄️ ",
-        "txt"|"log"                                       => "📝",
-        "md"|"markdown"|"rst"                             => "📖",
-        "pdf"                                             => "📄",
-        "docx"|"doc"|"odt"                                => "📘",
-        "xlsx"|"xls"|"ods"|"csv"|"tsv"                    => "📊",
-        "pptx"|"ppt"|"odp"                                => "📊",
-        "ipynb"                                            => "📓",
-        "rtf"                                              => "📄",
-        "zip"|"7z"|"rar"                                  => "📦",
-        "tar"|"gz"|"bz2"|"xz"|"zst"|"tgz"                => "📦",
-        "iso"|"img"                                       => "💿",
-        "jpg"|"jpeg"|"png"|"gif"|"bmp"|"webp"|"tiff"|"ico" => "🖼️ ",
-        "svg"                                             => "🖼️ ",
-        "mp4"|"mkv"|"avi"|"mov"|"webm"|"flv"|"wmv"       => "🎬",
-        "mp3"|"flac"|"wav"|"ogg"|"aac"|"m4a"|"opus"      => "🎵",
-        "exe"|"msi"                                       => "🖥️ ",
-        "dll"|"so"|"dylib"                                => "🔩",
-        "apk"|"ipa"                                       => "📱",
-        "ttf"|"otf"|"woff"|"woff2"                        => "🔤",
-        _                                                 => "📄",
+        "rs"|"py"|"js"|"mjs"|"cjs"|"ts"|"tsx"|"jsx"|"go"|"java"|"kt"|"kts"|"rb"|"php"|
+        "swift"|"cs"|"lua"|"c"|"cpp"|"h"|"hpp"|"cc"|"sh"|"bash"|"zsh"|"ps1"|"bat"|"cmd" => ("\u{25C6}", CODE),   // ◆
+        "json"|"toml"|"yaml"|"yml"|"sql"|"ini"|"cfg"|"conf" => ("\u{2699}", CODE),                              // ⚙
+        "html"|"htm"|"css"|"scss"|"sass"|"less"|"xml" => ("\u{25C7}", MARKUP),                                  // ◇
+        "txt"|"log"|"md"|"markdown"|"rst"|"rtf" => ("\u{2261}", PLAIN),                                         // ≡
+        "pdf"|"docx"|"doc"|"odt"|"ipynb" => ("\u{25A0}", DOC),                                                  // ■
+        "xlsx"|"xls"|"ods"|"csv"|"tsv" => ("\u{25BD}", SHEET),                                                  // ▽
+        "pptx"|"ppt"|"odp" => ("\u{25C0}", MEDIA),                                                              // ◀
+        "zip"|"7z"|"rar"|"tar"|"gz"|"bz2"|"xz"|"zst"|"tgz" => ("\u{25AA}", ARCHIVE),                            // ▪
+        "iso"|"img" => ("\u{25A1}", ARCHIVE),                                                                   // □
+        "jpg"|"jpeg"|"png"|"gif"|"bmp"|"webp"|"tiff"|"ico"|"svg" => ("\u{25CB}", IMAGE),                        // ○
+        "mp4"|"mkv"|"avi"|"mov"|"webm"|"flv"|"wmv" => ("\u{25B6}", MEDIA),                                      // ▶
+        "mp3"|"flac"|"wav"|"ogg"|"aac"|"m4a"|"opus" => ("\u{266A}", MEDIA),                                     // ♪
+        "exe"|"msi"|"apk"|"ipa" => ("\u{25B2}", BIN),                                                           // ▲
+        "dll"|"so"|"dylib" => ("\u{2605}", BIN),                                                                // ★
+        "ttf"|"otf"|"woff"|"woff2" => ("\u{0041}", PLAIN),                                                      // A
+        _ => ("\u{25AB}", PLAIN),                                                                               // ▫
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Status bar
+// Status bar — also surfaces non-blocking notices
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn draw_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
+    if let Some((msg, is_err)) = app.active_notice() {
+        let style = if is_err {
+            Style::default().fg(Color::White).bg(C_ERR).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Black).bg(C_OK).add_modifier(Modifier::BOLD)
+        };
+        let icon = if is_err { "✖" } else { "✓" };
+        f.render_widget(Paragraph::new(format!(" {} {}", icon, msg)).style(style), area);
+        return;
+    }
+
     let cur   = app.current();
     let count = cur.files.len();
     let pos   = if count > 0 { cur.selected + 1 } else { 0 };
+    let marked = cur.marked.len();
+    let sel_info = if marked > 0 { format!(" │ {} marked", marked) } else { String::new() };
 
-    let mut spans = Vec::new();
-    
-    // Position badge
-    spans.push(Span::styled(format!("  {} / {}  ", pos, count), Style::default().bg(Color::Rgb(40, 50, 70)).fg(Color::Rgb(100, 150, 240)).add_modifier(Modifier::BOLD)));
-    spans.push(Span::raw("   "));
+    let text = match app.mode {
+        AppMode::Rename => format!(" {}/{} │ ✏ RENAME: type new name · Enter confirm · Esc cancel", pos, count.max(1)),
+        AppMode::ConfirmDelete => format!(" {}/{} │ ✖ DELETE: Y confirm · Esc cancel", pos, count.max(1)),
+        AppMode::ConfirmDeletePermanent => format!(" {}/{} │ ✖ PERMANENTLY DELETE: Y confirm · Esc cancel", pos, count.max(1)),
+        AppMode::NewFolder => format!(" {}/{} │ ▸ NEW FOLDER: type name · Enter confirm · Esc cancel", pos, count.max(1)),
+        AppMode::ContextMenu => format!(" {}/{} │ ☰ MENU: click an action · Esc close", pos, count.max(1)),
+        AppMode::Properties => format!(" {}/{} │ ℹ PROPERTIES: Esc close", pos, count.max(1)),
+        _ => format!(
+            " {}/{}{} │ ←↓↑→ nav  F2 rename  Ctrl+C/X/V copy/cut/paste  Del delete  Ctrl+N folder  RClick menu  q quit",
+            pos, count.max(1), sel_info
+        ),
+    };
 
-    match app.mode {
-        AppMode::Rename => {
-            spans.push(Span::styled("✏  Rename  ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
-            spans.push(Span::styled("Type new name · Enter confirm · Esc cancel", Style::default().fg(Color::White)));
-        }
-        AppMode::ConfirmDelete => {
-            spans.push(Span::styled("❌  Delete?  ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
-            spans.push(Span::styled("Press Y to confirm · Esc to cancel", Style::default().fg(Color::White)));
-        }
-        AppMode::NewFolder => {
-            spans.push(Span::styled("📁  New Folder  ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
-            spans.push(Span::styled("Type directory name · Enter confirm · Esc cancel", Style::default().fg(Color::White)));
-        }
-        _ => {
-            // Action shortcut buttons
-            let badges = [
-                ("Enter", " Open "),
-                ("F2", " Rename "),
-                ("Del", " Delete "),
-                ("Ctrl+D", " PageDown "),
-                ("q", " Quit "),
-            ];
-            for &(k, v) in &badges {
-                spans.push(Span::styled(format!(" {} ", k), Style::default().bg(Color::Rgb(30, 35, 45)).fg(Color::Rgb(100, 150, 240))));
-                spans.push(Span::styled(v, Style::default().fg(Color::Rgb(180, 180, 180))));
-                spans.push(Span::raw("  "));
-            }
-        }
-    }
+    let style = if app.mode != AppMode::Normal {
+        Style::default().fg(Color::Black).bg(C_WARN)
+    } else {
+        Style::default().fg(C_MUTED).bg(Color::Rgb(18, 19, 25))
+    };
 
-    // Time and Drive info on the right
-    let time_str = chrono::Local::now().format("%I:%M:%S %p").to_string();
-    
-    // Find active drive free space
-    let mut drive_info_str = String::new();
-    if let Some(first_level) = app.levels.first() {
-        let path = &first_level.path;
-        let drives = get_windows_drives();
-        for drive in drives {
-            if path.starts_with(&drive.path) {
-                let free_gb = drive.free_bytes as f64 / 1_073_741_824.0;
-                drive_info_str = format!("💾 OS (C:) {:.0} GB free   ", free_gb);
-                break;
-            }
-        }
-    }
-    
-    let right_str = format!("{} 🕒 {}", drive_info_str, time_str);
-    let total_left_len: usize = spans.iter().map(|s| s.content.len()).sum();
-    if area.width as usize > total_left_len + right_str.len() + 4 {
-        let pad = (area.width as usize) - total_left_len - right_str.len() - 2;
-        spans.push(Span::raw(" ".repeat(pad)));
-        spans.push(Span::styled(right_str, Style::default().fg(Color::Rgb(150, 150, 150))));
-    }
-
-    let status_bg = Style::default().bg(Color::Rgb(15, 17, 23));
-    f.render_widget(Paragraph::new(Line::from(spans)).style(status_bg), area);
+    f.render_widget(Paragraph::new(text).style(style), area);
 }

@@ -203,6 +203,7 @@ fn main() -> anyhow::Result<()> {
     let mut app = AppState::new()?;
 
     loop {
+        app.maybe_refresh_drives();
         terminal.draw(|f| ui::draw(f, &app))?;
 
         if app.handle_events()? {
