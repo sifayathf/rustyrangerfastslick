@@ -12,7 +12,7 @@ use crate::preview::{self, PreviewContent};
 // ── Theme ────────────────────────────────────────────────────────────────────
 const C_ACCENT:   Color = Color::Rgb(97, 214, 214);   // cyan focus accent
 const C_ACCENT2:  Color = Color::Rgb(137, 180, 250);  // soft blue
-const C_BG_PANEL: Color = Color::Rgb(24, 26, 34);
+
 const C_BORDER:   Color = Color::Rgb(58, 62, 78);
 const C_BORDER_LO:Color = Color::Rgb(40, 43, 54);
 const C_TEXT:     Color = Color::Rgb(214, 218, 230);
@@ -32,8 +32,8 @@ pub fn draw(f: &mut Frame, app: &AppState) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(0),    // sidebar + content
-            Constraint::Length(1), // status bar (hints live here — no more duplicate top bar)
+            Constraint::Min(0),    // content + sidebar
+            Constraint::Length(1), // status bar
         ])
         .split(f.size());
 
@@ -105,18 +105,13 @@ fn draw_vertical_divider(f: &mut Frame, area: Rect) {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Left sidebar: Quick Access + Drives (click to navigate)
-// ─────────────────────────────────────────────────────────────────────────────
-
 fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeometry) {
     let block = Block::default()
         .title(" DRIVES & LOCATIONS ")
         .title_style(Style::default().fg(C_MUTED).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(C_BORDER_LO))
-        .style(Style::default().bg(C_BG_PANEL));
+        .border_style(Style::default().fg(C_BORDER_LO));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -128,19 +123,14 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
         Line::from(Span::styled(" QUICK ACCESS", Style::default().fg(C_MUTED).add_modifier(Modifier::BOLD))), None);
     for (label, path) in app.quick_access.iter() {
         let is_active = *path == *cur_path;
-        let (bullet_style, text_style) = if is_active {
-            (Style::default().fg(Color::Black).bg(C_ACCENT), Style::default().fg(Color::Black).bg(C_ACCENT).add_modifier(Modifier::BOLD))
+        let text_style = if is_active {
+            Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD)
         } else {
-            (Style::default().fg(C_ACCENT2), Style::default().fg(C_TEXT))
+            Style::default().fg(C_TEXT)
         };
-        // Strip the old emoji prefix baked into quick_access labels (e.g. "🏠 Home") —
-        // we now draw a single consistent glyph instead, so alignment stays stable
-        // across whatever font the terminal is using.
-        let clean_label = label.splitn(2, ' ').nth(1).unwrap_or(label);
         push_line(f, geo, inner, &mut y, max_y,
             Line::from(vec![
-                Span::styled(" \u{25B8} ", bullet_style),
-                Span::styled(clean_label.to_string(), text_style),
+                Span::styled(format!("  {}", label), text_style),
             ]),
             Some(path.clone()));
     }
@@ -150,56 +140,42 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
         Line::from(Span::styled(" DRIVES", Style::default().fg(C_MUTED).add_modifier(Modifier::BOLD))), None);
 
     for d in app.drives.iter() {
-        if y + 2 >= max_y { break; }
+        if y + 1 >= max_y { break; }
         let is_active = d.path == *cur_path;
         let name_style = if is_active {
             Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(C_TEXT)
         };
-        let dot_color = match d.kind.as_str() {
-            "Removable" => C_WARN,
-            "Network"   => C_OK,
-            "CD-ROM"    => C_MUTED,
-            _           => C_ACCENT2,
+        let icon = match d.kind.as_str() {
+            "Removable" => "🔌",
+            "CD-ROM"    => "💿",
+            "Network"   => "🌐",
+            _           => "💾",
         };
         let letter = d.path.to_string_lossy().trim_end_matches('\\').to_string();
+        
+        let label_text = truncate(&d.label, inner.width.saturating_sub(10) as usize);
         push_line(f, geo, inner, &mut y, max_y,
             Line::from(vec![
-                Span::styled(" \u{25CF} ", Style::default().fg(dot_color)),
-                Span::styled(format!("{}  ", letter), name_style),
-                Span::styled(truncate(&d.label, inner.width.saturating_sub(8) as usize), Style::default().fg(C_MUTED)),
+                Span::styled(format!("  {} {} ", icon, letter), name_style),
+                Span::styled(label_text, Style::default().fg(C_MUTED)),
             ]),
             Some(d.path.clone()));
 
         if d.total > 0 {
             let used = d.total.saturating_sub(d.free);
             let frac = (used as f64 / d.total as f64).clamp(0.0, 1.0);
-            let bar_w = inner.width.saturating_sub(2) as usize;
-            let filled = ((bar_w as f64) * frac).round() as usize;
-            let bar_color = if frac > 0.9 { C_ERR } else if frac > 0.75 { C_WARN } else { C_ACCENT2 };
-            let mut bar = String::new();
-            bar.push_str(&"█".repeat(filled.min(bar_w)));
-            bar.push_str(&"░".repeat(bar_w.saturating_sub(filled)));
-            let free_gb = d.free as f64 / 1_073_741_824.0;
             let total_gb = d.total as f64 / 1_073_741_824.0;
             push_line(f, geo, inner, &mut y, max_y,
                 Line::from(vec![
-                    Span::styled(format!(" {}", bar), Style::default().fg(bar_color)),
+                    Span::styled(format!("     {:.0}% of {:.0}GB free", (1.0 - frac) * 100.0, total_gb), Style::default().fg(C_MUTED)),
                 ]),
-                None);
-            push_line(f, geo, inner, &mut y, max_y,
-                Line::from(vec![Span::styled(
-                    format!(" {:.0} GB free of {:.0} GB", free_gb, total_gb),
-                    Style::default().fg(C_MUTED),
-                )]),
                 None);
         }
     }
 }
 
-/// Renders one sidebar row at the current `y` cursor, advances it, and
-/// (optionally) registers a click-navigation hitbox for it.
 fn push_line(
     f: &mut Frame,
     geo: &mut LayoutGeometry,
@@ -217,6 +193,9 @@ fn push_line(
     }
     *y += 1;
 }
+
+
+
 
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max { return s.to_string(); }
@@ -630,8 +609,8 @@ fn draw_dir_pane(f: &mut Frame, level: &DirLevel, is_current: bool, area: Rect, 
                 .to_string();
             let shown_name = truncate(&raw_name, name_budget.max(4));
 
-            let (icon, icon_color) = if p.is_dir {
-                ("\u{25B8}", C_ACCENT2) // ▸ folder
+            let icon = if p.is_dir {
+                "📂"
             } else {
                 let ext = p.path.extension().and_then(|s| s.to_str()).unwrap_or("");
                 file_icon(ext)
@@ -646,18 +625,18 @@ fn draw_dir_pane(f: &mut Frame, level: &DirLevel, is_current: bool, area: Rect, 
                 let disp_w = 2 + shown_name.chars().count(); // icon + space + name
                 let pad_w = inner_w.saturating_sub(1).saturating_sub(disp_w);
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!(" {} ", icon), Style::default().fg(icon_color).bg(bg)),
+                    Span::styled(format!(" {} ", icon), Style::default().bg(bg)),
                     Span::styled(format!("{}{}", shown_name, " ".repeat(pad_w)), Style::default().fg(fg_color).bg(bg).add_modifier(Modifier::BOLD)),
                 ]))
             } else if is_marked {
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!(" {} ", icon), Style::default().fg(icon_color)),
+                    Span::styled(format!(" {} ", icon), Style::default()),
                     Span::styled(shown_name, Style::default().fg(C_MARK).add_modifier(Modifier::BOLD)),
                 ]))
             } else {
                 let style = if is_current { Style::default().fg(C_TEXT) } else { Style::default().fg(C_MUTED) };
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!(" {} ", icon), Style::default().fg(icon_color)),
+                    Span::styled(format!(" {} ", icon), Style::default()),
                     Span::styled(shown_name, style),
                 ]))
             }
@@ -742,14 +721,14 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
             .take(visible_h)
             .map(|p| {
                 let name = truncate(&p.path.file_name().unwrap_or_else(|| p.path.as_os_str()).to_string_lossy(), name_budget.max(4));
-                let (icon, icon_color) = if p.is_dir {
-                    ("\u{25B8}", C_ACCENT2)
+                let icon = if p.is_dir {
+                    "📂"
                 } else {
                     let ext = p.path.extension().and_then(|s| s.to_str()).unwrap_or("");
                     file_icon(ext)
                 };
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("  {} ", icon), Style::default().fg(icon_color)),
+                    Span::styled(format!("  {} ", icon), Style::default()),
                     Span::styled(name, Style::default().fg(C_MUTED)),
                 ]))
             })
@@ -849,40 +828,45 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
 // File icons
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Returns a single-width glyph + color for a file extension. Deliberately a
-/// small, curated set (not one emoji per extension) — multi-codepoint color
-/// emoji render at inconsistent widths across terminal fonts, which is what
-/// was causing icons to look misaligned/"off". These are plain BMP symbols
-/// that stay one cell wide in any monospace font.
-fn file_icon(ext: &str) -> (&'static str, Color) {
-    const CODE:    Color = Color::Rgb(137, 180, 250); // blue
-    const MARKUP:  Color = Color::Rgb(148, 226, 213); // teal
-    const DOC:     Color = Color::Rgb(203, 166, 247); // lavender
-    const SHEET:   Color = Color::Rgb(166, 227, 161); // green
-    const IMAGE:   Color = Color::Rgb(245, 194, 231); // pink
-    const MEDIA:   Color = Color::Rgb(250, 179, 135); // peach
-    const ARCHIVE: Color = Color::Rgb(249, 226, 175); // yellow
-    const BIN:     Color = Color::Rgb(243, 139, 168); // red
-    const PLAIN:   Color = C_MUTED;
-
+fn file_icon(ext: &str) -> &'static str {
     match ext.to_lowercase().as_str() {
-        "rs"|"py"|"js"|"mjs"|"cjs"|"ts"|"tsx"|"jsx"|"go"|"java"|"kt"|"kts"|"rb"|"php"|
-        "swift"|"cs"|"lua"|"c"|"cpp"|"h"|"hpp"|"cc"|"sh"|"bash"|"zsh"|"ps1"|"bat"|"cmd" => ("\u{25C6}", CODE),   // ◆
-        "json"|"toml"|"yaml"|"yml"|"sql"|"ini"|"cfg"|"conf" => ("\u{2699}", CODE),                              // ⚙
-        "html"|"htm"|"css"|"scss"|"sass"|"less"|"xml" => ("\u{25C7}", MARKUP),                                  // ◇
-        "txt"|"log"|"md"|"markdown"|"rst"|"rtf" => ("\u{2261}", PLAIN),                                         // ≡
-        "pdf"|"docx"|"doc"|"odt"|"ipynb" => ("\u{25A0}", DOC),                                                  // ■
-        "xlsx"|"xls"|"ods"|"csv"|"tsv" => ("\u{25BD}", SHEET),                                                  // ▽
-        "pptx"|"ppt"|"odp" => ("\u{25C0}", MEDIA),                                                              // ◀
-        "zip"|"7z"|"rar"|"tar"|"gz"|"bz2"|"xz"|"zst"|"tgz" => ("\u{25AA}", ARCHIVE),                            // ▪
-        "iso"|"img" => ("\u{25A1}", ARCHIVE),                                                                   // □
-        "jpg"|"jpeg"|"png"|"gif"|"bmp"|"webp"|"tiff"|"ico"|"svg" => ("\u{25CB}", IMAGE),                        // ○
-        "mp4"|"mkv"|"avi"|"mov"|"webm"|"flv"|"wmv" => ("\u{25B6}", MEDIA),                                      // ▶
-        "mp3"|"flac"|"wav"|"ogg"|"aac"|"m4a"|"opus" => ("\u{266A}", MEDIA),                                     // ♪
-        "exe"|"msi"|"apk"|"ipa" => ("\u{25B2}", BIN),                                                           // ▲
-        "dll"|"so"|"dylib" => ("\u{2605}", BIN),                                                                // ★
-        "ttf"|"otf"|"woff"|"woff2" => ("\u{0041}", PLAIN),                                                      // A
-        _ => ("\u{25AB}", PLAIN),                                                                               // ▫
+        "rs"                                              => "🦀",
+        "py"                                              => "🐍",
+        "js"|"mjs"|"cjs"                                  => "📜",
+        "ts"|"tsx"|"jsx"                                  => "📘",
+        "html"|"htm"                                      => "🌐",
+        "css"|"scss"|"sass"|"less"                        => "🎨",
+        "json"|"toml"|"yaml"|"yml"                        => "⚙️ ",
+        "sh"|"bash"|"zsh"|"ps1"|"bat"|"cmd"               => "⚡",
+        "c"|"cpp"|"h"|"hpp"|"cc"                          => "🔧",
+        "java"|"kt"|"kts"                                 => "☕",
+        "go"                                              => "🐹",
+        "rb"                                              => "💎",
+        "php"                                             => "🐘",
+        "swift"                                           => "🕊️ ",
+        "cs"                                              => "🔷",
+        "lua"                                             => "🌙",
+        "sql"                                             => "🗄️ ",
+        "txt"|"log"                                       => "📝",
+        "md"|"markdown"|"rst"                             => "📖",
+        "pdf"                                             => "📄",
+        "docx"|"doc"|"odt"                                => "📘",
+        "xlsx"|"xls"|"ods"|"csv"|"tsv"                    => "📊",
+        "pptx"|"ppt"|"odp"                                => "📊",
+        "ipynb"                                            => "📓",
+        "rtf"                                              => "📄",
+        "zip"|"7z"|"rar"                                  => "📦",
+        "tar"|"gz"|"bz2"|"xz"|"zst"|"tgz"                => "📦",
+        "iso"|"img"                                       => "💿",
+        "jpg"|"jpeg"|"png"|"gif"|"bmp"|"webp"|"tiff"|"ico" => "🖼️ ",
+        "svg"                                             => "🖼️ ",
+        "mp4"|"mkv"|"avi"|"mov"|"webm"|"flv"|"wmv"       => "🎬",
+        "mp3"|"flac"|"wav"|"ogg"|"aac"|"m4a"|"opus"      => "🎵",
+        "exe"|"msi"                                       => "🖥️ ",
+        "dll"|"so"|"dylib"                                => "🔩",
+        "apk"|"ipa"                                       => "📱",
+        "ttf"|"otf"|"woff"|"woff2"                        => "🔤",
+        _                                                 => "📄",
     }
 }
 
