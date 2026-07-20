@@ -140,18 +140,28 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
         } else {
             Style::default().fg(C_TEXT)
         };
-        let icon = match *label {
-            "🏠 Home" => set.home,
-            "🖥 Desktop" => set.desktop,
-            "📄 Documents" => set.documents,
-            "⬇ Downloads" => set.downloads,
-            "🖼 Pictures" => set.pictures,
-            _ => " ",
+        let label_lower = label.to_lowercase();
+        let icon = if label_lower.contains("home") {
+            set.home
+        } else if label_lower.contains("desktop") {
+            set.desktop
+        } else if label_lower.contains("document") {
+            set.documents
+        } else if label_lower.contains("download") {
+            set.downloads
+        } else if label_lower.contains("picture") {
+            set.pictures
+        } else {
+            " "
         };
-        let clean_label = label.splitn(2, ' ').nth(1).unwrap_or(label);
+        let clean_label_str = label.chars()
+            .skip_while(|c| !c.is_alphabetic())
+            .collect::<String>();
+        let clean_label = if clean_label_str.is_empty() { *label } else { &clean_label_str };
         
         let icon_span = Span::styled(icon, if is_active { text_style } else { Style::default().fg(C_ACCENT2) });
-        let text_span = Span::styled(format!("  {}", clean_label), text_style);
+        let gap_w = 4_usize.saturating_sub(icon_span.width());
+        let text_span = Span::styled(format!("{}{}", " ".repeat(gap_w), clean_label), text_style);
         
         push_line(f, geo, inner, &mut y, max_y,
             Line::from(vec![

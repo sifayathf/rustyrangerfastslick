@@ -696,34 +696,83 @@ fn render_audio(p: &PathBuf) -> PreviewContent {
 
 // ── PDF ───────────────────────────────────────────────────────────────────────
 
+#[cfg(windows)]
+fn run_silenced<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    use windows_sys::Win32::System::Console::{GetStdHandle, SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
+    use std::fs::File;
+    use std::os::windows::io::AsRawHandle;
+
+    unsafe {
+        let stdout_h = GetStdHandle(STD_OUTPUT_HANDLE);
+        let stderr_h = GetStdHandle(STD_ERROR_HANDLE);
+
+        if let Ok(null_file) = File::create("NUL") {
+            let null_raw = null_file.as_raw_handle() as *mut std::ffi::c_void;
+            SetStdHandle(STD_OUTPUT_HANDLE, null_raw);
+            SetStdHandle(STD_ERROR_HANDLE, null_raw);
+            let res = f();
+            SetStdHandle(STD_OUTPUT_HANDLE, stdout_h);
+            SetStdHandle(STD_ERROR_HANDLE, stderr_h);
+            res
+        } else {
+            f()
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn run_silenced<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    f()
+}
+
 fn render_pdf(p: &PathBuf) -> PreviewContent {
     let mut lines = meta_header(p);
     match fs::read(p) {
-        Ok(bytes) => match safe_parse(move || pdf_extract::extract_text_from_mem(&bytes)) {
-            Some(Ok(text)) => {
-                lines.push(Line::from(Span::styled("📄  PDF Document", Style::default().fg(SH_FN))));
+        Ok(bytes) => {
+            // Pre-check if PDF is encrypted/password-protected
+            let is_encrypted = bytes.windows(8).any(|window| window == b"/Encrypt");
+            if is_encrypted {
+                lines.push(Line::from(Span::styled("📄  PDF Document (Encrypted)", Style::default().fg(SH_FN))));
                 lines.push(Line::from(Span::styled("─".repeat(50), Style::default().fg(SH_CMT))));
-                if text.trim().is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        "  No extractable text (may be scanned/image-based)",
-                        Style::default().fg(SH_CMT)
-                    )));
-                } else {
-                    for l in text.lines().filter(|l| !l.trim().is_empty()).take(300) {
-                        lines.push(highlight_document_line(l));
-                    }
-                }
-            }
-            Some(Err(e)) => {
-                lines.push(Line::from(Span::styled(format!("⚠  PDF error: {}", e), Style::default().fg(Color::Red))));
-            }
-            None => {
                 lines.push(Line::from(Span::styled(
-                    "⚠  Couldn't read this PDF (it may be password-protected or corrupted)",
+                    "⚠  This PDF is password-protected or encrypted. Preview not available.",
                     Style::default().fg(Color::Red)
                 )));
+                return PreviewContent::Highlighted(lines);
             }
-        },
+
+            match safe_parse(move || run_silenced(|| pdf_extract::extract_text_from_mem(&bytes))) {
+                Some(Ok(text)) => {
+                    lines.push(Line::from(Span::styled("📄  PDF Document", Style::default().fg(SH_FN))));
+                    lines.push(Line::from(Span::styled("─".repeat(50), Style::default().fg(SH_CMT))));
+                    if text.trim().is_empty() {
+                        lines.push(Line::from(Span::styled(
+                            "  No extractable text (may be scanned/image-based)",
+                            Style::default().fg(SH_CMT)
+                        )));
+                    } else {
+                        for l in text.lines().filter(|l| !l.trim().is_empty()).take(300) {
+                            lines.push(highlight_document_line(l));
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    lines.push(Line::from(Span::styled(format!("⚠  PDF error: {}", e), Style::default().fg(Color::Red))));
+                }
+                None => {
+                    lines.push(Line::from(Span::styled(
+                        "⚠  Couldn't read this PDF (it may be password-protected or corrupted)",
+                        Style::default().fg(Color::Red)
+                    )));
+                }
+            }
+        }
         Err(e) => {
             lines.push(Line::from(Span::styled(format!("⚠  Cannot read: {}", e), Style::default().fg(Color::Red))));
         }
