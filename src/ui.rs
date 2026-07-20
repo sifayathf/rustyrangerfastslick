@@ -126,6 +126,8 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
 
     push_line(f, geo, inner, &mut y, max_y,
         Line::from(Span::styled(" QUICK ACCESS", Style::default().fg(C_MUTED).add_modifier(Modifier::BOLD))), None);
+    
+    let set = get_icon_set();
     for (label, path) in app.quick_access.iter() {
         let is_active = *path == *cur_path;
         let text_style = if is_active {
@@ -133,10 +135,24 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
         } else {
             Style::default().fg(C_TEXT)
         };
+        let icon = match *label {
+            "🏠 Home" => set.home,
+            "🖥 Desktop" => set.desktop,
+            "📄 Documents" => set.documents,
+            "⬇ Downloads" => set.downloads,
+            "🖼 Pictures" => set.pictures,
+            _ => " ",
+        };
         let clean_label = label.splitn(2, ' ').nth(1).unwrap_or(label);
+        
+        let icon_span = Span::styled(icon, if is_active { text_style } else { Style::default().fg(C_ACCENT2) });
+        let text_span = Span::styled(format!(" {}", clean_label), text_style);
+        
         push_line(f, geo, inner, &mut y, max_y,
             Line::from(vec![
-                Span::styled(format!(" {}", clean_label), text_style),
+                Span::styled(" ", text_style),
+                icon_span,
+                text_span,
             ]),
             Some(path.clone()));
     }
@@ -156,10 +172,16 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
         };
         let letter_color = if is_active { C_ACCENT } else { dot_color };
         let letter = d.path.to_string_lossy().trim_end_matches('\\').to_string();
+        
+        let icon_span = Span::styled(set.drive, Style::default().fg(letter_color));
+        let text_span = Span::styled(format!(" {}  ", letter), Style::default().fg(letter_color).add_modifier(Modifier::BOLD));
+        
         push_line(f, geo, inner, &mut y, max_y,
             Line::from(vec![
-                Span::styled(format!(" {}  ", letter), Style::default().fg(letter_color).add_modifier(Modifier::BOLD)),
-                Span::styled(truncate(&d.label, inner.width.saturating_sub(8) as usize), Style::default().fg(C_MUTED)),
+                Span::styled(" ", Style::default()),
+                icon_span,
+                text_span,
+                Span::styled(truncate(&d.label, inner.width.saturating_sub(11) as usize), Style::default().fg(C_MUTED)),
             ]),
             Some(d.path.clone()));
 
@@ -653,13 +675,13 @@ fn draw_dir_pane(f: &mut Frame, level: &DirLevel, is_current: bool, area: Rect, 
                 let icon_selected_span = Span::styled(icon, Style::default().fg(icon_color).bg(bg));
                 let name_selected_span = Span::styled(shown_name.clone(), Style::default().fg(fg_color).bg(bg).add_modifier(Modifier::BOLD));
                 
-                let disp_w = 1 + icon_selected_span.width() + 2 + name_selected_span.width();
+                let disp_w = 1 + icon_selected_span.width() + 1 + name_selected_span.width();
                 let pad_w = inner_w.saturating_sub(disp_w);
                 
                 ListItem::new(Line::from(vec![
                     Span::styled(" ", Style::default().bg(bg)),
                     icon_selected_span,
-                    Span::styled("  ", Style::default().bg(bg)),
+                    Span::styled(" ", Style::default().bg(bg)),
                     name_selected_span,
                     Span::styled(" ".repeat(pad_w), Style::default().bg(bg)),
                 ]))
@@ -667,7 +689,7 @@ fn draw_dir_pane(f: &mut Frame, level: &DirLevel, is_current: bool, area: Rect, 
                 ListItem::new(Line::from(vec![
                     Span::styled(" ", Style::default()),
                     icon_span,
-                    Span::styled("  ", Style::default()),
+                    Span::styled(" ", Style::default()),
                     Span::styled(shown_name.clone(), Style::default().fg(C_MARK).add_modifier(Modifier::BOLD)),
                 ]))
             } else {
@@ -675,7 +697,7 @@ fn draw_dir_pane(f: &mut Frame, level: &DirLevel, is_current: bool, area: Rect, 
                 ListItem::new(Line::from(vec![
                     Span::styled(" ", Style::default()),
                     icon_span,
-                    Span::styled("  ", Style::default()),
+                    Span::styled(" ", Style::default()),
                     Span::styled(shown_name.clone(), style),
                 ]))
             }
@@ -772,7 +794,8 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
                 ListItem::new(Line::from(vec![
                     Span::styled(" ", Style::default()),
                     Span::styled(icon, Style::default().fg(icon_color)),
-                    Span::styled(format!("  {}", name), Style::default().fg(C_TEXT)),
+                    Span::styled(" ", Style::default()),
+                    Span::styled(name, Style::default().fg(C_TEXT)),
                 ]))
             })
             .collect();
@@ -895,6 +918,12 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
 /// plain ASCII text, just tinted.
 struct IconSet {
     pub folder: &'static str,
+    pub home: &'static str,
+    pub desktop: &'static str,
+    pub documents: &'static str,
+    pub downloads: &'static str,
+    pub pictures: &'static str,
+    pub drive: &'static str,
     pub rs: &'static str,
     pub py: &'static str,
     pub js: &'static str,
@@ -928,6 +957,12 @@ struct IconSet {
 
 const EMOJI_ICONS: IconSet = IconSet {
     folder: "📂",
+    home: "🏠",
+    desktop: "🖥",
+    documents: "📁",
+    downloads: "📥",
+    pictures: "🖼",
+    drive: "💾",
     rs: "🦀",
     py: "🐍",
     js: "📜",
@@ -961,6 +996,12 @@ const EMOJI_ICONS: IconSet = IconSet {
 
 const NERD_ICONS: IconSet = IconSet {
     folder: "",
+    home: "",
+    desktop: "",
+    documents: "",
+    downloads: "",
+    pictures: "",
+    drive: "",
     rs: "",
     py: "",
     js: "",
@@ -994,6 +1035,12 @@ const NERD_ICONS: IconSet = IconSet {
 
 const ASCII_ICONS: IconSet = IconSet {
     folder: "d",
+    home: "~",
+    desktop: "D",
+    documents: "d",
+    downloads: "v",
+    pictures: "p",
+    drive: "c",
     rs: "R",
     py: "P",
     js: "J",
