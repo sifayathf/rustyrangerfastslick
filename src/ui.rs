@@ -48,6 +48,12 @@ pub fn draw(f: &mut Frame, app: &AppState) {
     geo.context_menu_item_rects.clear();
     geo.context_menu_rect = None;
 
+    geo.zoom_out_rect = Rect::default();
+    geo.zoom_in_rect = Rect::default();
+    geo.zoom_fit_rect = Rect::default();
+    geo.rotate_rect = Rect::default();
+    geo.flip_rect = Rect::default();
+
     // Responsive: hide the sidebar on very narrow terminals so panes stay usable.
     let show_sidebar = root[0].width >= 60;
     let sidebar_w = if show_sidebar { app.sidebar_width.min(root[0].width.saturating_sub(30)) } else { 0 };
@@ -394,6 +400,10 @@ fn format_epoch(secs: u64) -> String {
 // Right-click context menu
 // ─────────────────────────────────────────────────────────────────────────────
 
+fn point_in(col: u16, row: u16, r: &Rect) -> bool {
+    col >= r.x && col < r.x.saturating_add(r.width) && row >= r.y && row < r.y.saturating_add(r.height)
+}
+
 fn draw_context_menu(f: &mut Frame, app: &AppState, geo: &mut LayoutGeometry) {
     let items = &app.context_menu_items;
     if items.is_empty() { return; }
@@ -421,12 +431,26 @@ fn draw_context_menu(f: &mut Frame, app: &AppState, geo: &mut LayoutGeometry) {
     for (i, action) in items.iter().enumerate() {
         if i as u16 >= inner.height { break; }
         let rect = Rect { x: inner.x, y: inner.y + i as u16, width: inner.width, height: 1 };
-        let label = if matches!(action, ContextAction::Delete) {
-            Span::styled(format!(" {}", action.label()), Style::default().fg(C_ERR))
+        let is_hovered = point_in(app.mouse_pos.0, app.mouse_pos.1, &rect);
+        let style = if is_hovered {
+            Style::default().fg(Color::Black).bg(C_ACCENT)
+        } else if matches!(action, ContextAction::Delete) {
+            Style::default().fg(C_ERR)
         } else {
-            Span::styled(format!(" {}", action.label()), Style::default().fg(C_TEXT))
+            Style::default().fg(C_TEXT)
         };
-        f.render_widget(Paragraph::new(Line::from(label)), rect);
+        let widget_style = if is_hovered {
+            Style::default().bg(C_ACCENT)
+        } else {
+            Style::default()
+        };
+        let label = Span::styled(format!("  {}", action.label()), style);
+        let padding_w = (inner.width as usize).saturating_sub(action.label().len() + 3);
+        let line = Line::from(vec![
+            label,
+            Span::styled(" ".repeat(padding_w), widget_style),
+        ]);
+        f.render_widget(Paragraph::new(line), rect);
         geo.context_menu_item_rects.push((rect, *action));
     }
     geo.context_menu_rect = Some(area);
@@ -550,7 +574,7 @@ fn draw_panes(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeometr
     if has_preview {
         if let Some(current) = panes.last() {
             geo.preview_rect = Some(chunks[np]);
-            draw_preview_pane(f, app, current, chunks[np]);
+            draw_preview_pane(f, app, current, chunks[np], geo);
         }
     }
 }
@@ -684,7 +708,7 @@ fn draw_dir_pane(f: &mut Frame, level: &DirLevel, is_current: bool, area: Rect, 
 // Preview pane
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect) {
+fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect, geo: &mut LayoutGeometry) {
     if level.files.is_empty() {
         app.native_preview.hide();
         f.render_widget(
@@ -786,10 +810,100 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
             f.render_widget(para, inner);
         }
         PreviewContent::ImageFallback(info) => {
+            let has_img = info.img.is_some();
+            let show_toolbar = inner.height > 6 && has_img;
+            
+            let (image_rect, toolbar_rect) = if show_toolbar {
+                (
+                    Rect { x: inner.x, y: inner.y, width: inner.width, height: inner.height.saturating_sub(2) },
+                    Rect { x: inner.x, y: inner.y + inner.height.saturating_sub(1), width: inner.width, height: 1 },
+                )
+            } else {
+                (inner, Rect::default())
+            };
+
+            if show_toolbar {
+                let line_y = inner.y + inner.height.saturating_sub(2);
+                let line_rect = Rect { x: inner.x, y: line_y, width: inner.width, height: 1 };
+                f.render_widget(Paragraph::new(Span::styled("─".repeat(inner.width as usize), Style::default().fg(C_BORDER_LO))), line_rect);
+
+                let mut x_offset = toolbar_rect.x;
+                let mut spans = Vec::new();
+                let zoom_pct = format!("{}%", (app.image_zoom * 100.0).round() as i32);
+                
+                spans.push(Span::styled(" 🔍 Zoom: ", Style::default().fg(C_MUTED)));
+                x_offset += 10;
+                
+                let btn_minus_rect = Rect { x: x_offset, y: toolbar_rect.y, width: 3, height: 1 };
+                let btn_minus_style = if point_in(app.mouse_pos.0, app.mouse_pos.1, &btn_minus_rect) {
+                    Style::default().fg(Color::Black).bg(C_ACCENT2)
+                } else {
+                    Style::default().fg(Color::Black).bg(C_ACCENT)
+                };
+                spans.push(Span::styled(" - ", btn_minus_style));
+                geo.zoom_out_rect = btn_minus_rect;
+                x_offset += 3;
+                
+                let val_str = format!(" [{}] ", zoom_pct);
+                let val_len = val_str.chars().count() as u16;
+                spans.push(Span::styled(val_str, Style::default().fg(C_TEXT)));
+                x_offset += val_len;
+                
+                let btn_plus_rect = Rect { x: x_offset, y: toolbar_rect.y, width: 3, height: 1 };
+                let btn_plus_style = if point_in(app.mouse_pos.0, app.mouse_pos.1, &btn_plus_rect) {
+                    Style::default().fg(Color::Black).bg(C_ACCENT2)
+                } else {
+                    Style::default().fg(Color::Black).bg(C_ACCENT)
+                };
+                spans.push(Span::styled(" + ", btn_plus_style));
+                geo.zoom_in_rect = btn_plus_rect;
+                x_offset += 3;
+                
+                spans.push(Span::styled(" │ ", Style::default().fg(C_BORDER_LO)));
+                x_offset += 3;
+                
+                let btn_fit_rect = Rect { x: x_offset, y: toolbar_rect.y, width: 9, height: 1 };
+                let btn_fit_style = if point_in(app.mouse_pos.0, app.mouse_pos.1, &btn_fit_rect) {
+                    Style::default().fg(Color::Black).bg(C_ACCENT2)
+                } else {
+                    Style::default().fg(Color::Black).bg(C_ACCENT)
+                };
+                spans.push(Span::styled(" Fit (0) ", btn_fit_style));
+                geo.zoom_fit_rect = btn_fit_rect;
+                x_offset += 9;
+                
+                spans.push(Span::styled(" │ ", Style::default().fg(C_BORDER_LO)));
+                x_offset += 3;
+                
+                let btn_rotate_rect = Rect { x: x_offset, y: toolbar_rect.y, width: 16, height: 1 };
+                let btn_rotate_style = if point_in(app.mouse_pos.0, app.mouse_pos.1, &btn_rotate_rect) {
+                    Style::default().fg(Color::Black).bg(C_ACCENT2)
+                } else {
+                    Style::default().fg(Color::Black).bg(C_ACCENT)
+                };
+                spans.push(Span::styled(" Rotate 🔄 (R) ", btn_rotate_style));
+                geo.rotate_rect = btn_rotate_rect;
+                x_offset += 16;
+                
+                spans.push(Span::styled(" │ ", Style::default().fg(C_BORDER_LO)));
+                x_offset += 3;
+                
+                let btn_flip_rect = Rect { x: x_offset, y: toolbar_rect.y, width: 13, height: 1 };
+                let btn_flip_style = if point_in(app.mouse_pos.0, app.mouse_pos.1, &btn_flip_rect) {
+                    Style::default().fg(Color::Black).bg(C_ACCENT2)
+                } else {
+                    Style::default().fg(Color::Black).bg(C_ACCENT)
+                };
+                spans.push(Span::styled(" Flip ↔ (F) ", btn_flip_style));
+                geo.flip_rect = btn_flip_rect;
+                
+                f.render_widget(Paragraph::new(Line::from(spans)), toolbar_rect);
+            }
+
             let mut top_margin = 0;
             if let Some(img) = &info.img {
                 let (cols, rows) = crossterm::terminal::size().unwrap_or((0, 0));
-                let mut img_rect = inner;
+                let mut img_rect = image_rect;
                 if img_rect.height > 6 {
                     img_rect.y += 4;
                     img_rect.height -= 4;
@@ -819,7 +933,7 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
             }
 
             let para = Paragraph::new(Text::from(text)).wrap(Wrap { trim: false }).scroll((scroll, 0));
-            f.render_widget(para, inner);
+            f.render_widget(para, image_rect);
         }
     }
 }

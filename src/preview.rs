@@ -679,7 +679,7 @@ fn render_pdf(p: &PathBuf) -> PreviewContent {
 
 // ── EXACT OFFICE RENDERING ────────────────────────────────────────────────────
 
-fn get_office_cache_path(p: &PathBuf) -> PathBuf {
+fn _get_office_cache_path(p: &PathBuf) -> PathBuf {
     use sha2::{Sha256, Digest};
     let mut hasher = Sha256::new();
     hasher.update(p.to_string_lossy().as_bytes());
@@ -694,76 +694,8 @@ fn get_office_cache_path(p: &PathBuf) -> PathBuf {
     std::env::temp_dir().join(format!("rr_office_{}.png", hash))
 }
 
-fn try_render_office_exact(p: &PathBuf, rotation: u32, flip_h: bool) -> Option<PreviewContent> {
-    let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-    let cache_path = get_office_cache_path(p);
-
-    if cache_path.exists() {
-        return Some(render_image(&cache_path, rotation, flip_h));
-    }
-
-    let mut generated = false;
-
-    if ext == "ppt" || ext == "pptx" {
-        // Use PowerPoint COM to export the first slide to PNG
-        let script = format!(
-            "$ppt = New-Object -ComObject PowerPoint.Application\n\
-             $ppt.Visible = [Microsoft.Office.Core.MsoTriState]::msoFalse\n\
-             $pres = $ppt.Presentations.Open('{}', [Microsoft.Office.Core.MsoTriState]::msoTrue, [Microsoft.Office.Core.MsoTriState]::msoFalse, [Microsoft.Office.Core.MsoTriState]::msoFalse)\n\
-             $pres.Slides.Item(1).Export('{}', 'PNG')\n\
-             $pres.Close()\n\
-             $ppt.Quit()\n",
-            p.to_string_lossy().replace("'", "''"),
-            cache_path.to_string_lossy().replace("'", "''")
-        );
-        let ps_path = std::env::temp_dir().join("rr_ppt_export.ps1");
-        if fs::write(&ps_path, script).is_ok() {
-            let status = Command::new("powershell")
-                .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps_path.to_str().unwrap()])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            if status.map_or(false, |s| s.success()) && cache_path.exists() {
-                generated = true;
-            }
-            let _ = fs::remove_file(ps_path);
-        }
-    }
-
-    if !generated && (ext == "doc" || ext == "docx" || ext == "xls" || ext == "xlsx" || ext == "ppt" || ext == "pptx") {
-        // Try LibreOffice headless
-        let soffice_paths = [
-            "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
-            "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
-            "soffice",
-        ];
-        
-        let temp_dir = std::env::temp_dir();
-        for soffice in soffice_paths {
-            let status = Command::new(soffice)
-                .args(["--headless", "--convert-to", "png", "--outdir", temp_dir.to_str().unwrap(), p.to_str().unwrap()])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-                
-            if status.map_or(false, |s| s.success()) {
-                // LibreOffice outputs to <temp_dir>/<filename>.png
-                let base_name = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
-                let lo_out = temp_dir.join(format!("{}.png", base_name));
-                if lo_out.exists() {
-                    let _ = fs::rename(&lo_out, &cache_path);
-                    generated = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    if generated && cache_path.exists() {
-        Some(render_image(&cache_path, rotation, flip_h))
-    } else {
-        None
-    }
+fn try_render_office_exact(_p: &PathBuf, _rotation: u32, _flip_h: bool) -> Option<PreviewContent> {
+    None
 }
 
 // ── DOCX ──────────────────────────────────────────────────────────────────────

@@ -130,6 +130,13 @@ pub struct LayoutGeometry {
     // Right-click context menu
     pub context_menu_rect: Option<Rect>,
     pub context_menu_item_rects: Vec<(Rect, ContextAction)>,
+
+    // Image preview toolbar buttons
+    pub zoom_out_rect: Rect,
+    pub zoom_in_rect: Rect,
+    pub zoom_fit_rect: Rect,
+    pub rotate_rect: Rect,
+    pub flip_rect: Rect,
 }
 
 pub struct AppState {
@@ -173,6 +180,7 @@ pub struct AppState {
 
     // Windows Native preview overlay manager
     pub native_preview: crate::native::NativePreviewManager,
+    pub mouse_pos:      (u16, u16),
 }
 
 impl AppState {
@@ -221,6 +229,7 @@ impl AppState {
             pending_menu_pos: (0, 0),
             notice: None,
             native_preview: crate::native::NativePreviewManager::new(),
+            mouse_pos: (0, 0),
         })
     }
 
@@ -523,6 +532,7 @@ impl AppState {
             }
             Event::Mouse(mouse) => {
                 self.last_event_time = Instant::now();
+                self.mouse_pos = (mouse.column, mouse.row);
                 match mouse.kind {
                     MouseEventKind::ScrollDown => {
                         let geo = self.layout_geometry.lock().clone();
@@ -534,6 +544,28 @@ impl AppState {
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
                         let geo = self.layout_geometry.lock().clone();
+
+                        // ── Image Preview Toolbar Clicks ──
+                        if point_in(mouse.column, mouse.row, &geo.zoom_out_rect) {
+                            self.image_zoom = (self.image_zoom / 1.25).max(0.1);
+                            return Ok(false);
+                        }
+                        if point_in(mouse.column, mouse.row, &geo.zoom_in_rect) {
+                            self.image_zoom = (self.image_zoom * 1.25).min(8.0);
+                            return Ok(false);
+                        }
+                        if point_in(mouse.column, mouse.row, &geo.zoom_fit_rect) {
+                            self.image_zoom = 1.0;
+                            return Ok(false);
+                        }
+                        if point_in(mouse.column, mouse.row, &geo.rotate_rect) {
+                            self.image_rotation = (self.image_rotation + 90) % 360;
+                            return Ok(false);
+                        }
+                        if point_in(mouse.column, mouse.row, &geo.flip_rect) {
+                            self.image_flip_h = !self.image_flip_h;
+                            return Ok(false);
+                        }
 
                         // ── Context menu open: any click either selects an item or closes it ──
                         if self.mode == AppMode::ContextMenu {

@@ -1,4 +1,3 @@
-// ================= src/main.rs =================
 use std::io;
 use crossterm::{
     execute,
