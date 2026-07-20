@@ -10,19 +10,21 @@ use crate::state::{AppState, AppMode, DirLevel, LayoutGeometry, ContextAction};
 use crate::preview::{self, PreviewContent};
 
 // ── Theme ────────────────────────────────────────────────────────────────────
-const C_ACCENT:   Color = Color::Rgb(97, 214, 214);   // cyan focus accent
+const C_ACCENT:   Color = Color::Rgb(65, 166, 166);   // calm, softer cyan focus accent
 const C_ACCENT2:  Color = Color::Rgb(137, 180, 250);  // soft blue
 const C_BG_PANEL: Color = Color::Rgb(24, 26, 34);
-const C_BORDER:   Color = Color::Rgb(58, 62, 78);
-const C_BORDER_LO:Color = Color::Rgb(40, 43, 54);
+const C_BORDER:   Color = Color::Rgb(38, 40, 50);    // subtle border
+const C_BORDER_LO:Color = Color::Rgb(28, 30, 37);    // blends into panel bg
 const C_TEXT:     Color = Color::Rgb(214, 218, 230);
+const C_TEXT_SOFT:Color = Color::Rgb(160, 166, 185);  // softer grey for preview body text
 const C_MUTED:    Color = Color::Rgb(120, 126, 145);
 const C_WARN:     Color = Color::Rgb(240, 198, 116);
 const C_OK:       Color = Color::Rgb(137, 220, 165);
 const C_ERR:      Color = Color::Rgb(240, 120, 120);
-const C_SEL_BG:   Color = Color::Rgb(45, 90, 92);
-const C_SEL_BG_INACTIVE: Color = Color::Rgb(52, 55, 68);
+const C_SEL_BG:   Color = Color::Rgb(32, 64, 66);    // soft background selection highlight
+const C_SEL_BG_INACTIVE: Color = Color::Rgb(40, 42, 52);
 const C_MARK:     Color = Color::Rgb(210, 160, 90);
+const C_FOLDER:   Color = Color::Rgb(229, 192, 123);  // VS Code yellow/gold folder
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Top-level draw
@@ -124,8 +126,11 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
     let mut y = inner.y;
     let max_y = inner.y + inner.height;
 
+    // Top padding
+    y += 1;
+
     push_line(f, geo, inner, &mut y, max_y,
-        Line::from(Span::styled(" QUICK ACCESS", Style::default().fg(C_MUTED).add_modifier(Modifier::BOLD))), None);
+        Line::from(Span::styled("  QUICK ACCESS", Style::default().fg(C_MUTED).add_modifier(Modifier::BOLD))), None);
     
     let set = get_icon_set();
     for (label, path) in app.quick_access.iter() {
@@ -146,20 +151,21 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
         let clean_label = label.splitn(2, ' ').nth(1).unwrap_or(label);
         
         let icon_span = Span::styled(icon, if is_active { text_style } else { Style::default().fg(C_ACCENT2) });
-        let text_span = Span::styled(format!(" {}", clean_label), text_style);
+        let text_span = Span::styled(format!("  {}", clean_label), text_style);
         
         push_line(f, geo, inner, &mut y, max_y,
             Line::from(vec![
-                Span::styled(" ", text_style),
+                Span::styled("  ", text_style),
                 icon_span,
                 text_span,
             ]),
             Some(path.clone()));
     }
 
-    y += 1;
+    // Increased spacing between sections
+    y += 2;
     push_line(f, geo, inner, &mut y, max_y,
-        Line::from(Span::styled(" DRIVES", Style::default().fg(C_MUTED).add_modifier(Modifier::BOLD))), None);
+        Line::from(Span::styled("  DRIVES", Style::default().fg(C_MUTED).add_modifier(Modifier::BOLD))), None);
 
     for d in app.drives.iter() {
         if y + 2 >= max_y { break; }
@@ -174,21 +180,21 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
         let letter = d.path.to_string_lossy().trim_end_matches('\\').to_string();
         
         let icon_span = Span::styled(set.drive, Style::default().fg(letter_color));
-        let text_span = Span::styled(format!(" {}  ", letter), Style::default().fg(letter_color).add_modifier(Modifier::BOLD));
+        let text_span = Span::styled(format!("  {}  ", letter), Style::default().fg(letter_color).add_modifier(Modifier::BOLD));
         
         push_line(f, geo, inner, &mut y, max_y,
             Line::from(vec![
-                Span::styled(" ", Style::default()),
+                Span::styled("  ", Style::default()),
                 icon_span,
                 text_span,
-                Span::styled(truncate(&d.label, inner.width.saturating_sub(11) as usize), Style::default().fg(C_MUTED)),
+                Span::styled(truncate(&d.label, inner.width.saturating_sub(13) as usize), Style::default().fg(C_MUTED)),
             ]),
             Some(d.path.clone()));
 
         if d.total > 0 {
             let used = d.total.saturating_sub(d.free);
             let frac = (used as f64 / d.total as f64).clamp(0.0, 1.0);
-            let bar_w = inner.width.saturating_sub(2) as usize;
+            let bar_w = inner.width.saturating_sub(4) as usize;
             let filled = ((bar_w as f64) * frac).round() as usize;
             let bar_color = if frac > 0.9 { C_ERR } else if frac > 0.75 { C_WARN } else { C_ACCENT2 };
             let mut bar = String::new();
@@ -198,14 +204,15 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
             let total_gb = d.total as f64 / 1_073_741_824.0;
             push_line(f, geo, inner, &mut y, max_y,
                 Line::from(vec![
-                    Span::styled(format!(" {}", bar), Style::default().fg(bar_color)),
+                    Span::styled("  ", Style::default()),
+                    Span::styled(format!("{}", bar), Style::default().fg(bar_color)),
                 ]),
                 None);
             push_line(f, geo, inner, &mut y, max_y,
-                Line::from(vec![Span::styled(
-                    format!(" {:.0} GB free of {:.0} GB", free_gb, total_gb),
-                    Style::default().fg(C_MUTED),
-                )]),
+                Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(format!("{:.0} GB free of {:.0} GB", free_gb, total_gb), Style::default().fg(C_MUTED)),
+                ]),
                 None);
         }
     }
@@ -520,8 +527,8 @@ fn draw_breadcrumb(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGe
         spans.push(Span::styled(text, style));
         x += w;
         if !is_last {
-            spans.push(Span::styled("  >  ", Style::default().fg(C_MUTED)));
-            x += 5;
+            spans.push(Span::styled("    >    ", Style::default().fg(C_MUTED)));
+            x += 9;
         }
     }
 
@@ -652,12 +659,11 @@ fn draw_dir_pane(f: &mut Frame, level: &DirLevel, is_current: bool, area: Rect, 
                 .unwrap_or_else(|| p.path.as_os_str())
                 .to_string_lossy()
                 .to_string();
-            let shown_name_base = truncate(&raw_name, name_budget.max(4).saturating_sub(if p.is_dir { 1 } else { 0 }));
-            let shown_name = if p.is_dir { format!("{}/", shown_name_base) } else { shown_name_base };
+            let shown_name = truncate(&raw_name, name_budget.max(4));
 
             let folder_icon = get_icon_set().folder;
             let (icon, icon_color) = if p.is_dir {
-                (folder_icon, C_ACCENT2)
+                (folder_icon, C_FOLDER)
             } else {
                 let ext = p.path.extension().and_then(|s| s.to_str()).unwrap_or("");
                 file_icon(ext)
@@ -675,11 +681,10 @@ fn draw_dir_pane(f: &mut Frame, level: &DirLevel, is_current: bool, area: Rect, 
                 let icon_selected_span = Span::styled(icon, Style::default().fg(icon_color).bg(bg));
                 let name_selected_span = Span::styled(shown_name.clone(), Style::default().fg(fg_color).bg(bg).add_modifier(Modifier::BOLD));
                 
-                let disp_w = 1 + icon_selected_span.width() + 1 + name_selected_span.width();
+                let disp_w = icon_selected_span.width() + 1 + name_selected_span.width();
                 let pad_w = inner_w.saturating_sub(disp_w);
                 
                 ListItem::new(Line::from(vec![
-                    Span::styled(" ", Style::default().bg(bg)),
                     icon_selected_span,
                     Span::styled(" ", Style::default().bg(bg)),
                     name_selected_span,
@@ -687,7 +692,6 @@ fn draw_dir_pane(f: &mut Frame, level: &DirLevel, is_current: bool, area: Rect, 
                 ]))
             } else if is_marked {
                 ListItem::new(Line::from(vec![
-                    Span::styled(" ", Style::default()),
                     icon_span,
                     Span::styled(" ", Style::default()),
                     Span::styled(shown_name.clone(), Style::default().fg(C_MARK).add_modifier(Modifier::BOLD)),
@@ -695,7 +699,6 @@ fn draw_dir_pane(f: &mut Frame, level: &DirLevel, is_current: bool, area: Rect, 
             } else {
                 let style = if is_current { Style::default().fg(C_TEXT) } else { Style::default().fg(C_MUTED) };
                 ListItem::new(Line::from(vec![
-                    Span::styled(" ", Style::default()),
                     icon_span,
                     Span::styled(" ", Style::default()),
                     Span::styled(shown_name.clone(), style),
@@ -782,20 +785,18 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
             .take(visible_h)
             .map(|p| {
                 let raw = p.path.file_name().unwrap_or_else(|| p.path.as_os_str()).to_string_lossy();
-                let base = truncate(&raw, name_budget.max(4).saturating_sub(if p.is_dir { 1 } else { 0 }));
-                let name = if p.is_dir { format!("{}/", base) } else { base };
+                let name = truncate(&raw, name_budget.max(4));
                 let folder_icon = get_icon_set().folder;
                 let (icon, icon_color) = if p.is_dir {
-                    (folder_icon, C_ACCENT2)
+                    (folder_icon, C_FOLDER)
                 } else {
                     let ext = p.path.extension().and_then(|s| s.to_str()).unwrap_or("");
                     file_icon(ext)
                 };
                 ListItem::new(Line::from(vec![
-                    Span::styled(" ", Style::default()),
                     Span::styled(icon, Style::default().fg(icon_color)),
                     Span::styled(" ", Style::default()),
-                    Span::styled(name, Style::default().fg(C_TEXT)),
+                    Span::styled(name, Style::default().fg(C_TEXT_SOFT)),
                 ]))
             })
             .collect();
@@ -842,24 +843,36 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
     match preview::render(&selected.path, app.image_rotation, app.image_flip_h) {
         PreviewContent::Text(txt) => {
             app.native_preview.hide();
-            let para = Paragraph::new(txt).wrap(Wrap { trim: false }).scroll((scroll, 0));
+            let padded: Vec<String> = txt.lines().map(|line| format!("  {}", line)).collect();
+            let para = Paragraph::new(padded.join("\n"))
+                .style(Style::default().fg(C_TEXT_SOFT))
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0));
             f.render_widget(para, inner);
         }
         PreviewContent::Highlighted(lines) => {
             app.native_preview.hide();
-            let text = Text::from(lines);
-            let para = Paragraph::new(text).wrap(Wrap { trim: false }).scroll((scroll, 0));
+            let mut padded_lines = Vec::new();
+            for line in lines {
+                let mut spans = line.spans;
+                spans.insert(0, Span::raw("  "));
+                padded_lines.push(Line::from(spans));
+            }
+            let para = Paragraph::new(Text::from(padded_lines))
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0));
             f.render_widget(para, inner);
         }
         PreviewContent::Code(lines) => {
             app.native_preview.hide();
-            // Deliberately NOT wrapped: each line carries a baked-in line-number
-            // gutter ("  42 │ code..."), and word-wrap has no concept of that
-            // gutter — a wrapped continuation line starts back at column 0,
-            // which reads as numbers and code text overlapping/interleaving in
-            // narrow panes. Clipping (no wrap) keeps one source line per row.
-            let text = Text::from(lines);
-            let para = Paragraph::new(text).scroll((scroll, 0));
+            let mut padded_lines = Vec::new();
+            for line in lines {
+                let mut spans = line.spans;
+                spans.insert(0, Span::raw("  "));
+                padded_lines.push(Line::from(spans));
+            }
+            let para = Paragraph::new(Text::from(padded_lines))
+                .scroll((scroll, 0));
             f.render_widget(para, inner);
         }
         PreviewContent::ImageFallback(info) => {
@@ -882,14 +895,23 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
             }
 
             let mut text = vec![
-                Line::from(vec![Span::styled(&name, Style::default().fg(C_TEXT).add_modifier(Modifier::BOLD))]),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(&name, Style::default().fg(C_TEXT).add_modifier(Modifier::BOLD))
+                ]),
             ];
             let mut meta_str = format!("{} Image  |  {}", ext, size_str);
             if let Some((w, h)) = info.dimensions {
                 meta_str.push_str(&format!("  |  {} x {}", w, h));
             }
-            text.push(Line::from(vec![Span::styled(meta_str, Style::default().fg(C_MUTED))]));
-            text.push(Line::from(vec![Span::styled("─".repeat(inner.width as usize), Style::default().fg(C_BORDER_LO))]));
+            text.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(meta_str, Style::default().fg(C_MUTED))
+            ]));
+            text.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("─".repeat((inner.width as usize).saturating_sub(4)), Style::default().fg(C_BORDER_LO))
+            ]));
 
             for _ in 0..top_margin.saturating_sub(text.len() as u16) {
                 text.push(Line::from(""));
@@ -1159,7 +1181,7 @@ fn draw_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
             Style::default().fg(Color::Black).bg(C_OK).add_modifier(Modifier::BOLD)
         };
         let icon = if is_err { "[X]" } else { "[OK]" };
-        f.render_widget(Paragraph::new(format!(" {} {}", icon, msg)).style(style), area);
+        f.render_widget(Paragraph::new(format!("  {} {}", icon, msg)).style(style), area);
         return;
     }
 
@@ -1169,24 +1191,51 @@ fn draw_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
     let marked = cur.marked.len();
     let sel_info = if marked > 0 { format!(" │ {} marked", marked) } else { String::new() };
 
-    let text = match app.mode {
-        AppMode::Rename => format!(" {}/{} │ RENAME: type new name · Enter confirm · Esc cancel", pos, count.max(1)),
-        AppMode::ConfirmDelete => format!(" {}/{} │ DELETE: Y confirm · Esc cancel", pos, count.max(1)),
-        AppMode::ConfirmDeletePermanent => format!(" {}/{} │ PERMANENTLY DELETE: Y confirm · Esc cancel", pos, count.max(1)),
-        AppMode::NewFolder => format!(" {}/{} │ NEW FOLDER: type name · Enter confirm · Esc cancel", pos, count.max(1)),
-        AppMode::ContextMenu => format!(" {}/{} │ MENU: click an action · Esc close", pos, count.max(1)),
-        AppMode::Properties => format!(" {}/{} │ PROPERTIES: Esc close", pos, count.max(1)),
-        _ => format!(
-            " {}/{}{} │ arrows nav  Shift+up/down or wheel scroll preview  F2 rename  Ctrl+C/X/V copy/cut/paste  Del delete  RClick menu  q quit",
-            pos, count.max(1), sel_info
-        ),
-    };
+    let bg = Color::Rgb(18, 19, 25);
+    if app.mode != AppMode::Normal {
+        let text = match app.mode {
+            AppMode::Rename => format!(" {}/{} │ RENAME: type new name · Enter confirm · Esc cancel", pos, count.max(1)),
+            AppMode::ConfirmDelete => format!(" {}/{} │ DELETE: Y confirm · Esc cancel", pos, count.max(1)),
+            AppMode::ConfirmDeletePermanent => format!(" {}/{} │ PERMANENTLY DELETE: Y confirm · Esc cancel", pos, count.max(1)),
+            AppMode::NewFolder => format!(" {}/{} │ NEW FOLDER: type name · Enter confirm · Esc cancel", pos, count.max(1)),
+            AppMode::ContextMenu => format!(" {}/{} │ MENU: click an action · Esc close", pos, count.max(1)),
+            AppMode::Properties => format!(" {}/{} │ PROPERTIES: Esc close", pos, count.max(1)),
+            _ => String::new(),
+        };
+        let style = Style::default().fg(Color::Black).bg(C_WARN);
+        f.render_widget(Paragraph::new(format!("  {}", text)).style(style), area);
+        return;
+    }
 
-    let style = if app.mode != AppMode::Normal {
-        Style::default().fg(Color::Black).bg(C_WARN)
-    } else {
-        Style::default().fg(C_MUTED).bg(Color::Rgb(18, 19, 25))
-    };
+    let mut spans = vec![
+        Span::styled(format!("  {}/{}{}  │  ", pos, count.max(1), sel_info), Style::default().fg(C_MUTED).bg(bg)),
+    ];
+    
+    let key_style = Style::default().fg(C_TEXT).bg(bg).add_modifier(Modifier::BOLD);
+    let label_style = Style::default().fg(C_MUTED).bg(bg);
+    
+    spans.push(Span::styled("arrows", key_style));
+    spans.push(Span::styled(" nav    ", label_style));
+    
+    spans.push(Span::styled("Shift+up/down", key_style));
+    spans.push(Span::styled(" or ", label_style));
+    spans.push(Span::styled("wheel", key_style));
+    spans.push(Span::styled(" scroll preview    ", label_style));
+    
+    spans.push(Span::styled("F2", key_style));
+    spans.push(Span::styled(" rename    ", label_style));
+    
+    spans.push(Span::styled("Ctrl+C/X/V", key_style));
+    spans.push(Span::styled(" copy/cut/paste    ", label_style));
+    
+    spans.push(Span::styled("Del", key_style));
+    spans.push(Span::styled(" delete    ", label_style));
+    
+    spans.push(Span::styled("RClick", key_style));
+    spans.push(Span::styled(" menu    ", label_style));
+    
+    spans.push(Span::styled("q", key_style));
+    spans.push(Span::styled(" quit", label_style));
 
-    f.render_widget(Paragraph::new(text).style(style), area);
+    f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(bg)), area);
 }
