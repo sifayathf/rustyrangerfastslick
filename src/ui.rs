@@ -12,7 +12,7 @@ use crate::preview::{self, PreviewContent};
 // ── Theme ────────────────────────────────────────────────────────────────────
 const C_ACCENT:   Color = Color::Rgb(97, 214, 214);   // cyan focus accent
 const C_ACCENT2:  Color = Color::Rgb(137, 180, 250);  // soft blue
-
+const C_BG_PANEL: Color = Color::Rgb(24, 26, 34);
 const C_BORDER:   Color = Color::Rgb(58, 62, 78);
 const C_BORDER_LO:Color = Color::Rgb(40, 43, 54);
 const C_TEXT:     Color = Color::Rgb(214, 218, 230);
@@ -32,8 +32,8 @@ pub fn draw(f: &mut Frame, app: &AppState) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(0),    // content + sidebar
-            Constraint::Length(1), // status bar
+            Constraint::Min(0),    // sidebar + content
+            Constraint::Length(1), // status bar (hints live here — no more duplicate top bar)
         ])
         .split(f.size());
 
@@ -47,12 +47,6 @@ pub fn draw(f: &mut Frame, app: &AppState) {
     geo.breadcrumb_segment_rects.clear();
     geo.context_menu_item_rects.clear();
     geo.context_menu_rect = None;
-
-    geo.zoom_out_rect = Rect::default();
-    geo.zoom_in_rect = Rect::default();
-    geo.zoom_fit_rect = Rect::default();
-    geo.rotate_rect = Rect::default();
-    geo.flip_rect = Rect::default();
 
     // Responsive: hide the sidebar on very narrow terminals so panes stay usable.
     let show_sidebar = root[0].width >= 60;
@@ -111,13 +105,18 @@ fn draw_vertical_divider(f: &mut Frame, area: Rect) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Left sidebar: Quick Access + Drives (click to navigate)
+// ─────────────────────────────────────────────────────────────────────────────
+
 fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeometry) {
     let block = Block::default()
         .title(" DRIVES & LOCATIONS ")
         .title_style(Style::default().fg(C_MUTED).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(C_BORDER_LO));
+        .border_style(Style::default().fg(C_BORDER_LO))
+        .style(Style::default().bg(C_BG_PANEL));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -130,13 +129,14 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
     for (label, path) in app.quick_access.iter() {
         let is_active = *path == *cur_path;
         let text_style = if is_active {
-            Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD)
+            Style::default().fg(Color::Black).bg(C_ACCENT).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(C_TEXT)
         };
+        let clean_label = label.splitn(2, ' ').nth(1).unwrap_or(label);
         push_line(f, geo, inner, &mut y, max_y,
             Line::from(vec![
-                Span::styled(format!("  {}", label), text_style),
+                Span::styled(format!(" {}", clean_label), text_style),
             ]),
             Some(path.clone()));
     }
@@ -146,42 +146,51 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
         Line::from(Span::styled(" DRIVES", Style::default().fg(C_MUTED).add_modifier(Modifier::BOLD))), None);
 
     for d in app.drives.iter() {
-        if y + 1 >= max_y { break; }
+        if y + 2 >= max_y { break; }
         let is_active = d.path == *cur_path;
-        let name_style = if is_active {
-            Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(C_TEXT)
+        let dot_color = match d.kind.as_str() {
+            "Removable" => C_WARN,
+            "Network"   => C_OK,
+            "CD-ROM"    => C_MUTED,
+            _           => C_ACCENT2,
         };
-        let icon = match d.kind.as_str() {
-            "Removable" => "🔌",
-            "CD-ROM"    => "💿",
-            "Network"   => "🌐",
-            _           => "💾",
-        };
+        let letter_color = if is_active { C_ACCENT } else { dot_color };
         let letter = d.path.to_string_lossy().trim_end_matches('\\').to_string();
-        
-        let label_text = truncate(&d.label, inner.width.saturating_sub(10) as usize);
         push_line(f, geo, inner, &mut y, max_y,
             Line::from(vec![
-                Span::styled(format!("  {} {} ", icon, letter), name_style),
-                Span::styled(label_text, Style::default().fg(C_MUTED)),
+                Span::styled(format!(" {}  ", letter), Style::default().fg(letter_color).add_modifier(Modifier::BOLD)),
+                Span::styled(truncate(&d.label, inner.width.saturating_sub(8) as usize), Style::default().fg(C_MUTED)),
             ]),
             Some(d.path.clone()));
 
         if d.total > 0 {
             let used = d.total.saturating_sub(d.free);
             let frac = (used as f64 / d.total as f64).clamp(0.0, 1.0);
+            let bar_w = inner.width.saturating_sub(2) as usize;
+            let filled = ((bar_w as f64) * frac).round() as usize;
+            let bar_color = if frac > 0.9 { C_ERR } else if frac > 0.75 { C_WARN } else { C_ACCENT2 };
+            let mut bar = String::new();
+            bar.push_str(&"█".repeat(filled.min(bar_w)));
+            bar.push_str(&"░".repeat(bar_w.saturating_sub(filled)));
+            let free_gb = d.free as f64 / 1_073_741_824.0;
             let total_gb = d.total as f64 / 1_073_741_824.0;
             push_line(f, geo, inner, &mut y, max_y,
                 Line::from(vec![
-                    Span::styled(format!("     {:.0}% of {:.0}GB free", (1.0 - frac) * 100.0, total_gb), Style::default().fg(C_MUTED)),
+                    Span::styled(format!(" {}", bar), Style::default().fg(bar_color)),
                 ]),
+                None);
+            push_line(f, geo, inner, &mut y, max_y,
+                Line::from(vec![Span::styled(
+                    format!(" {:.0} GB free of {:.0} GB", free_gb, total_gb),
+                    Style::default().fg(C_MUTED),
+                )]),
                 None);
         }
     }
 }
 
+/// Renders one sidebar row at the current `y` cursor, advances it, and
+/// (optionally) registers a click-navigation hitbox for it.
 fn push_line(
     f: &mut Frame,
     geo: &mut LayoutGeometry,
@@ -200,14 +209,11 @@ fn push_line(
     *y += 1;
 }
 
-
-
-
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max { return s.to_string(); }
-    if max <= 1 { return "…".to_string(); }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
+    if max <= 3 { return ".".repeat(max.max(1)); }
+    let mut out: String = s.chars().take(max.saturating_sub(3)).collect();
+    out.push_str("...");
     out
 }
 
@@ -400,10 +406,6 @@ fn format_epoch(secs: u64) -> String {
 // Right-click context menu
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn point_in(col: u16, row: u16, r: &Rect) -> bool {
-    col >= r.x && col < r.x.saturating_add(r.width) && row >= r.y && row < r.y.saturating_add(r.height)
-}
-
 fn draw_context_menu(f: &mut Frame, app: &AppState, geo: &mut LayoutGeometry) {
     let items = &app.context_menu_items;
     if items.is_empty() { return; }
@@ -431,26 +433,23 @@ fn draw_context_menu(f: &mut Frame, app: &AppState, geo: &mut LayoutGeometry) {
     for (i, action) in items.iter().enumerate() {
         if i as u16 >= inner.height { break; }
         let rect = Rect { x: inner.x, y: inner.y + i as u16, width: inner.width, height: 1 };
-        let is_hovered = point_in(app.mouse_pos.0, app.mouse_pos.1, &rect);
+        let is_hovered = app.context_menu_hover == Some(i);
+
+        let base_fg = if matches!(action, ContextAction::Delete) { C_ERR } else { C_TEXT };
+        let (fg, bg) = if is_hovered {
+            (Color::Black, C_ACCENT)
+        } else {
+            (base_fg, Color::Rgb(30, 32, 40))
+        };
+
+        let label_text = format!(" {}", action.label());
+        let pad = " ".repeat((inner.width as usize).saturating_sub(label_text.chars().count()));
         let style = if is_hovered {
-            Style::default().fg(Color::Black).bg(C_ACCENT)
-        } else if matches!(action, ContextAction::Delete) {
-            Style::default().fg(C_ERR)
+            Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(C_TEXT)
+            Style::default().fg(fg).bg(bg)
         };
-        let widget_style = if is_hovered {
-            Style::default().bg(C_ACCENT)
-        } else {
-            Style::default()
-        };
-        let label = Span::styled(format!("  {}", action.label()), style);
-        let padding_w = (inner.width as usize).saturating_sub(action.label().len() + 3);
-        let line = Line::from(vec![
-            label,
-            Span::styled(" ".repeat(padding_w), widget_style),
-        ]);
-        f.render_widget(Paragraph::new(line), rect);
+        f.render_widget(Paragraph::new(Line::from(Span::styled(format!("{}{}", label_text, pad), style))), rect);
         geo.context_menu_item_rects.push((rect, *action));
     }
     geo.context_menu_rect = Some(area);
@@ -466,14 +465,14 @@ fn draw_breadcrumb(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGe
 
     if path_str == "\\\\drives" {
         f.render_widget(
-            Paragraph::new(Span::styled(" ◉  This PC — Drives", Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD))),
+            Paragraph::new(Span::styled(" This PC — Drives", Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD))),
             area,
         );
         return;
     }
 
     // Build clickable segments: C:\ > Users > sifay > Pictures
-    let mut spans = vec![Span::styled(" ▸  ", Style::default().fg(C_MUTED))];
+    let mut spans = vec![Span::styled("  ", Style::default().fg(C_MUTED))];
     let mut segments: Vec<(String, std::path::PathBuf)> = Vec::new();
     let mut acc = std::path::PathBuf::new();
     for comp in path.components() {
@@ -482,7 +481,7 @@ fn draw_breadcrumb(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGe
         segments.push((label, acc.clone()));
     }
 
-    let mut x = area.x + 5;
+    let mut x = area.x + 2;
     for (i, (label, seg_path)) in segments.iter().enumerate() {
         let is_last = i == segments.len() - 1;
         let style = if is_last {
@@ -499,17 +498,17 @@ fn draw_breadcrumb(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGe
         spans.push(Span::styled(text, style));
         x += w;
         if !is_last {
-            spans.push(Span::styled("  ›  ", Style::default().fg(C_MUTED)));
+            spans.push(Span::styled("  >  ", Style::default().fg(C_MUTED)));
             x += 5;
         }
     }
 
     let mode_badge = match app.mode {
-        AppMode::Rename => "  ✎ RENAME",
-        AppMode::ConfirmDelete | AppMode::ConfirmDeletePermanent => "  ✖ DELETE?",
-        AppMode::NewFolder => "  ▸ NEW FOLDER",
-        AppMode::ContextMenu => "  ☰ MENU",
-        AppMode::Properties => "  ℹ PROPERTIES",
+        AppMode::Rename => "  [RENAME]",
+        AppMode::ConfirmDelete | AppMode::ConfirmDeletePermanent => "  [DELETE?]",
+        AppMode::NewFolder => "  [NEW FOLDER]",
+        AppMode::ContextMenu => "  [MENU]",
+        AppMode::Properties => "  [PROPERTIES]",
         _ => "",
     };
     if !mode_badge.is_empty() {
@@ -574,7 +573,7 @@ fn draw_panes(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeometr
     if has_preview {
         if let Some(current) = panes.last() {
             geo.preview_rect = Some(chunks[np]);
-            draw_preview_pane(f, app, current, chunks[np], geo);
+            draw_preview_pane(f, app, current, chunks[np]);
         }
     }
 }
@@ -631,10 +630,12 @@ fn draw_dir_pane(f: &mut Frame, level: &DirLevel, is_current: bool, area: Rect, 
                 .unwrap_or_else(|| p.path.as_os_str())
                 .to_string_lossy()
                 .to_string();
-            let shown_name = truncate(&raw_name, name_budget.max(4));
+            let shown_name_base = truncate(&raw_name, name_budget.max(4).saturating_sub(if p.is_dir { 1 } else { 0 }));
+            let shown_name = if p.is_dir { format!("{}/", shown_name_base) } else { shown_name_base };
 
-            let icon = if p.is_dir {
-                "📂"
+            let folder_icon = get_icon_set().folder;
+            let (icon, icon_color) = if p.is_dir {
+                (folder_icon, C_ACCENT2)
             } else {
                 let ext = p.path.extension().and_then(|s| s.to_str()).unwrap_or("");
                 file_icon(ext)
@@ -642,26 +643,40 @@ fn draw_dir_pane(f: &mut Frame, level: &DirLevel, is_current: bool, area: Rect, 
             let is_marked = level.marked.contains(&p.path);
             let is_selected = file_i == level.selected;
 
+            let icon_span = Span::styled(icon, Style::default().fg(icon_color));
+
             if is_selected {
                 let bg = if is_current { C_SEL_BG } else { C_SEL_BG_INACTIVE };
                 let fg_color = if is_current { C_ACCENT } else { C_TEXT };
-                let inner_w = (area.width as usize).saturating_sub(2);
-                let disp_w = 2 + shown_name.chars().count(); // icon + space + name
-                let pad_w = inner_w.saturating_sub(1).saturating_sub(disp_w);
+                let inner_w = list_inner_area.width as usize;
+                
+                let icon_selected_span = Span::styled(icon, Style::default().fg(icon_color).bg(bg));
+                let name_selected_span = Span::styled(shown_name.clone(), Style::default().fg(fg_color).bg(bg).add_modifier(Modifier::BOLD));
+                
+                let disp_w = 1 + icon_selected_span.width() + 2 + name_selected_span.width();
+                let pad_w = inner_w.saturating_sub(disp_w);
+                
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!(" {} ", icon), Style::default().bg(bg)),
-                    Span::styled(format!("{}{}", shown_name, " ".repeat(pad_w)), Style::default().fg(fg_color).bg(bg).add_modifier(Modifier::BOLD)),
+                    Span::styled(" ", Style::default().bg(bg)),
+                    icon_selected_span,
+                    Span::styled("  ", Style::default().bg(bg)),
+                    name_selected_span,
+                    Span::styled(" ".repeat(pad_w), Style::default().bg(bg)),
                 ]))
             } else if is_marked {
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!(" {} ", icon), Style::default()),
-                    Span::styled(shown_name, Style::default().fg(C_MARK).add_modifier(Modifier::BOLD)),
+                    Span::styled(" ", Style::default()),
+                    icon_span,
+                    Span::styled("  ", Style::default()),
+                    Span::styled(shown_name.clone(), Style::default().fg(C_MARK).add_modifier(Modifier::BOLD)),
                 ]))
             } else {
                 let style = if is_current { Style::default().fg(C_TEXT) } else { Style::default().fg(C_MUTED) };
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!(" {} ", icon), Style::default()),
-                    Span::styled(shown_name, style),
+                    Span::styled(" ", Style::default()),
+                    icon_span,
+                    Span::styled("  ", Style::default()),
+                    Span::styled(shown_name.clone(), style),
                 ]))
             }
         })
@@ -708,7 +723,7 @@ fn draw_dir_pane(f: &mut Frame, level: &DirLevel, is_current: bool, area: Rect, 
 // Preview pane
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect, geo: &mut LayoutGeometry) {
+fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect) {
     if level.files.is_empty() {
         app.native_preview.hide();
         f.render_widget(
@@ -744,16 +759,20 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
         let items: Vec<ListItem> = children.iter()
             .take(visible_h)
             .map(|p| {
-                let name = truncate(&p.path.file_name().unwrap_or_else(|| p.path.as_os_str()).to_string_lossy(), name_budget.max(4));
-                let icon = if p.is_dir {
-                    "📂"
+                let raw = p.path.file_name().unwrap_or_else(|| p.path.as_os_str()).to_string_lossy();
+                let base = truncate(&raw, name_budget.max(4).saturating_sub(if p.is_dir { 1 } else { 0 }));
+                let name = if p.is_dir { format!("{}/", base) } else { base };
+                let folder_icon = get_icon_set().folder;
+                let (icon, icon_color) = if p.is_dir {
+                    (folder_icon, C_ACCENT2)
                 } else {
                     let ext = p.path.extension().and_then(|s| s.to_str()).unwrap_or("");
                     file_icon(ext)
                 };
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("  {} ", icon), Style::default()),
-                    Span::styled(name, Style::default().fg(C_MUTED)),
+                    Span::styled(" ", Style::default()),
+                    Span::styled(icon, Style::default().fg(icon_color)),
+                    Span::styled(format!("  {}", name), Style::default().fg(C_TEXT)),
                 ]))
             })
             .collect();
@@ -809,101 +828,22 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
             let para = Paragraph::new(text).wrap(Wrap { trim: false }).scroll((scroll, 0));
             f.render_widget(para, inner);
         }
+        PreviewContent::Code(lines) => {
+            app.native_preview.hide();
+            // Deliberately NOT wrapped: each line carries a baked-in line-number
+            // gutter ("  42 │ code..."), and word-wrap has no concept of that
+            // gutter — a wrapped continuation line starts back at column 0,
+            // which reads as numbers and code text overlapping/interleaving in
+            // narrow panes. Clipping (no wrap) keeps one source line per row.
+            let text = Text::from(lines);
+            let para = Paragraph::new(text).scroll((scroll, 0));
+            f.render_widget(para, inner);
+        }
         PreviewContent::ImageFallback(info) => {
-            let has_img = info.img.is_some();
-            let show_toolbar = inner.height > 6 && has_img;
-            
-            let (image_rect, toolbar_rect) = if show_toolbar {
-                (
-                    Rect { x: inner.x, y: inner.y, width: inner.width, height: inner.height.saturating_sub(2) },
-                    Rect { x: inner.x, y: inner.y + inner.height.saturating_sub(1), width: inner.width, height: 1 },
-                )
-            } else {
-                (inner, Rect::default())
-            };
-
-            if show_toolbar {
-                let line_y = inner.y + inner.height.saturating_sub(2);
-                let line_rect = Rect { x: inner.x, y: line_y, width: inner.width, height: 1 };
-                f.render_widget(Paragraph::new(Span::styled("─".repeat(inner.width as usize), Style::default().fg(C_BORDER_LO))), line_rect);
-
-                let mut x_offset = toolbar_rect.x;
-                let mut spans = Vec::new();
-                let zoom_pct = format!("{}%", (app.image_zoom * 100.0).round() as i32);
-                
-                spans.push(Span::styled(" 🔍 Zoom: ", Style::default().fg(C_MUTED)));
-                x_offset += 10;
-                
-                let btn_minus_rect = Rect { x: x_offset, y: toolbar_rect.y, width: 3, height: 1 };
-                let btn_minus_style = if point_in(app.mouse_pos.0, app.mouse_pos.1, &btn_minus_rect) {
-                    Style::default().fg(Color::Black).bg(C_ACCENT2)
-                } else {
-                    Style::default().fg(Color::Black).bg(C_ACCENT)
-                };
-                spans.push(Span::styled(" - ", btn_minus_style));
-                geo.zoom_out_rect = btn_minus_rect;
-                x_offset += 3;
-                
-                let val_str = format!(" [{}] ", zoom_pct);
-                let val_len = val_str.chars().count() as u16;
-                spans.push(Span::styled(val_str, Style::default().fg(C_TEXT)));
-                x_offset += val_len;
-                
-                let btn_plus_rect = Rect { x: x_offset, y: toolbar_rect.y, width: 3, height: 1 };
-                let btn_plus_style = if point_in(app.mouse_pos.0, app.mouse_pos.1, &btn_plus_rect) {
-                    Style::default().fg(Color::Black).bg(C_ACCENT2)
-                } else {
-                    Style::default().fg(Color::Black).bg(C_ACCENT)
-                };
-                spans.push(Span::styled(" + ", btn_plus_style));
-                geo.zoom_in_rect = btn_plus_rect;
-                x_offset += 3;
-                
-                spans.push(Span::styled(" │ ", Style::default().fg(C_BORDER_LO)));
-                x_offset += 3;
-                
-                let btn_fit_rect = Rect { x: x_offset, y: toolbar_rect.y, width: 9, height: 1 };
-                let btn_fit_style = if point_in(app.mouse_pos.0, app.mouse_pos.1, &btn_fit_rect) {
-                    Style::default().fg(Color::Black).bg(C_ACCENT2)
-                } else {
-                    Style::default().fg(Color::Black).bg(C_ACCENT)
-                };
-                spans.push(Span::styled(" Fit (0) ", btn_fit_style));
-                geo.zoom_fit_rect = btn_fit_rect;
-                x_offset += 9;
-                
-                spans.push(Span::styled(" │ ", Style::default().fg(C_BORDER_LO)));
-                x_offset += 3;
-                
-                let btn_rotate_rect = Rect { x: x_offset, y: toolbar_rect.y, width: 16, height: 1 };
-                let btn_rotate_style = if point_in(app.mouse_pos.0, app.mouse_pos.1, &btn_rotate_rect) {
-                    Style::default().fg(Color::Black).bg(C_ACCENT2)
-                } else {
-                    Style::default().fg(Color::Black).bg(C_ACCENT)
-                };
-                spans.push(Span::styled(" Rotate 🔄 (R) ", btn_rotate_style));
-                geo.rotate_rect = btn_rotate_rect;
-                x_offset += 16;
-                
-                spans.push(Span::styled(" │ ", Style::default().fg(C_BORDER_LO)));
-                x_offset += 3;
-                
-                let btn_flip_rect = Rect { x: x_offset, y: toolbar_rect.y, width: 13, height: 1 };
-                let btn_flip_style = if point_in(app.mouse_pos.0, app.mouse_pos.1, &btn_flip_rect) {
-                    Style::default().fg(Color::Black).bg(C_ACCENT2)
-                } else {
-                    Style::default().fg(Color::Black).bg(C_ACCENT)
-                };
-                spans.push(Span::styled(" Flip ↔ (F) ", btn_flip_style));
-                geo.flip_rect = btn_flip_rect;
-                
-                f.render_widget(Paragraph::new(Line::from(spans)), toolbar_rect);
-            }
-
             let mut top_margin = 0;
             if let Some(img) = &info.img {
                 let (cols, rows) = crossterm::terminal::size().unwrap_or((0, 0));
-                let mut img_rect = image_rect;
+                let mut img_rect = inner;
                 if img_rect.height > 6 {
                     img_rect.y += 4;
                     img_rect.height -= 4;
@@ -921,9 +861,9 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
             let mut text = vec![
                 Line::from(vec![Span::styled(&name, Style::default().fg(C_TEXT).add_modifier(Modifier::BOLD))]),
             ];
-            let mut meta_str = format!("{} Image  •  {}", ext, size_str);
+            let mut meta_str = format!("{} Image  |  {}", ext, size_str);
             if let Some((w, h)) = info.dimensions {
-                meta_str.push_str(&format!("  •  {} × {}", w, h));
+                meta_str.push_str(&format!("  |  {} x {}", w, h));
             }
             text.push(Line::from(vec![Span::styled(meta_str, Style::default().fg(C_MUTED))]));
             text.push(Line::from(vec![Span::styled("─".repeat(inner.width as usize), Style::default().fg(C_BORDER_LO))]));
@@ -933,7 +873,7 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
             }
 
             let para = Paragraph::new(Text::from(text)).wrap(Wrap { trim: false }).scroll((scroll, 0));
-            f.render_widget(para, image_rect);
+            f.render_widget(para, inner);
         }
     }
 }
@@ -942,45 +882,221 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
 // File icons
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn file_icon(ext: &str) -> &'static str {
+/// Returns a single-width glyph + color for a file extension. Deliberately a
+/// small, curated set (not one emoji per extension) — multi-codepoint color
+/// emoji render at inconsistent widths across terminal fonts, which is what
+/// was causing icons to look misaligned/"off". These are plain BMP symbols
+/// that stay one cell wide in any monospace font.
+/// Color only — no icon glyph. After three rounds of "icon disappeared"
+/// reports that traced back to the app running in legacy conhost.exe
+/// (whose glyph coverage varies by font/mode in ways we can't fully control
+/// from here), color-coding by category is the one visual differentiator
+/// that is guaranteed to render identically everywhere: it only ever uses
+/// plain ASCII text, just tinted.
+struct IconSet {
+    pub folder: &'static str,
+    pub rs: &'static str,
+    pub py: &'static str,
+    pub js: &'static str,
+    pub ts: &'static str,
+    pub html: &'static str,
+    pub css: &'static str,
+    pub config: &'static str,
+    pub shell: &'static str,
+    pub c: &'static str,
+    pub java: &'static str,
+    pub go: &'static str,
+    pub ruby: &'static str,
+    pub php: &'static str,
+    pub swift: &'static str,
+    pub csharp: &'static str,
+    pub lua: &'static str,
+    pub sql: &'static str,
+    pub text: &'static str,
+    pub md: &'static str,
+    pub pdf: &'static str,
+    pub word: &'static str,
+    pub excel: &'static str,
+    pub ppt: &'static str,
+    pub archive: &'static str,
+    pub image: &'static str,
+    pub video: &'static str,
+    pub audio: &'static str,
+    pub bin: &'static str,
+    pub default: &'static str,
+}
+
+const EMOJI_ICONS: IconSet = IconSet {
+    folder: "📂",
+    rs: "🦀",
+    py: "🐍",
+    js: "📜",
+    ts: "📘",
+    html: "🌐",
+    css: "🎨",
+    config: "⚙️",
+    shell: "⚡",
+    c: "🔧",
+    java: "☕",
+    go: "🐹",
+    ruby: "💎",
+    php: "🐘",
+    swift: "🕊️",
+    csharp: "🔷",
+    lua: "🌙",
+    sql: "🗄️",
+    text: "📝",
+    md: "📖",
+    pdf: "📕",
+    word: "📘",
+    excel: "📊",
+    ppt: "📊",
+    archive: "📦",
+    image: "🖼️",
+    video: "🎬",
+    audio: "🎵",
+    bin: "🖥️",
+    default: "📄",
+};
+
+const NERD_ICONS: IconSet = IconSet {
+    folder: "",
+    rs: "",
+    py: "",
+    js: "",
+    ts: "",
+    html: "",
+    css: "",
+    config: "",
+    shell: "⚡",
+    c: "",
+    java: "",
+    go: "",
+    ruby: "",
+    php: "",
+    swift: "",
+    csharp: "",
+    lua: "",
+    sql: "",
+    text: "",
+    md: "",
+    pdf: "",
+    word: "",
+    excel: "",
+    ppt: "",
+    archive: "",
+    image: "",
+    video: "",
+    audio: "",
+    bin: "",
+    default: "",
+};
+
+const ASCII_ICONS: IconSet = IconSet {
+    folder: "d",
+    rs: "R",
+    py: "P",
+    js: "J",
+    ts: "T",
+    html: "H",
+    css: "C",
+    config: "c",
+    shell: ">",
+    c: "c",
+    java: "J",
+    go: "G",
+    ruby: "R",
+    php: "p",
+    swift: "S",
+    csharp: "#",
+    lua: "L",
+    sql: "s",
+    text: "t",
+    md: "m",
+    pdf: "F",
+    word: "W",
+    excel: "X",
+    ppt: "P",
+    archive: "a",
+    image: "i",
+    video: "v",
+    audio: "a",
+    bin: "x",
+    default: "-",
+};
+
+fn get_icon_set() -> &'static IconSet {
+    static SET: once_cell::sync::Lazy<IconSet> = once_cell::sync::Lazy::new(|| {
+        let val = std::env::var("RUSTY_RANGER_ICONS").unwrap_or_default().to_lowercase();
+        if val == "nerd" || std::env::var("NERD_FONT").is_ok() {
+            NERD_ICONS
+        } else if val == "ascii" {
+            ASCII_ICONS
+        } else {
+            EMOJI_ICONS
+        }
+    });
+    &SET
+}
+
+fn file_icon(ext: &str) -> (&'static str, Color) {
+    const CODE:    Color = Color::Rgb(137, 180, 250); // blue
+    const MARKUP:  Color = Color::Rgb(148, 226, 213); // teal
+    const DOC:     Color = Color::Rgb(203, 166, 247); // lavender
+    const SHEET:   Color = Color::Rgb(166, 227, 161); // green
+    const IMAGE:   Color = Color::Rgb(245, 194, 231); // pink
+    const MEDIA:   Color = Color::Rgb(250, 179, 135); // peach
+    const ARCHIVE: Color = Color::Rgb(249, 226, 175); // yellow
+    const BIN:     Color = Color::Rgb(243, 139, 168); // red
+    const PLAIN:   Color = C_MUTED;
+
+    let set = get_icon_set();
     match ext.to_lowercase().as_str() {
-        "rs"                                              => "🦀",
-        "py"                                              => "🐍",
-        "js"|"mjs"|"cjs"                                  => "📜",
-        "ts"|"tsx"|"jsx"                                  => "📘",
-        "html"|"htm"                                      => "🌐",
-        "css"|"scss"|"sass"|"less"                        => "🎨",
-        "json"|"toml"|"yaml"|"yml"                        => "⚙️ ",
-        "sh"|"bash"|"zsh"|"ps1"|"bat"|"cmd"               => "⚡",
-        "c"|"cpp"|"h"|"hpp"|"cc"                          => "🔧",
-        "java"|"kt"|"kts"                                 => "☕",
-        "go"                                              => "🐹",
-        "rb"                                              => "💎",
-        "php"                                             => "🐘",
-        "swift"                                           => "🕊️ ",
-        "cs"                                              => "🔷",
-        "lua"                                             => "🌙",
-        "sql"                                             => "🗄️ ",
-        "txt"|"log"                                       => "📝",
-        "md"|"markdown"|"rst"                             => "📖",
-        "pdf"                                             => "📄",
-        "docx"|"doc"|"odt"                                => "📘",
-        "xlsx"|"xls"|"ods"|"csv"|"tsv"                    => "📊",
-        "pptx"|"ppt"|"odp"                                => "📊",
-        "ipynb"                                            => "📓",
-        "rtf"                                              => "📄",
-        "zip"|"7z"|"rar"                                  => "📦",
-        "tar"|"gz"|"bz2"|"xz"|"zst"|"tgz"                => "📦",
-        "iso"|"img"                                       => "💿",
-        "jpg"|"jpeg"|"png"|"gif"|"bmp"|"webp"|"tiff"|"ico" => "🖼️ ",
-        "svg"                                             => "🖼️ ",
-        "mp4"|"mkv"|"avi"|"mov"|"webm"|"flv"|"wmv"       => "🎬",
-        "mp3"|"flac"|"wav"|"ogg"|"aac"|"m4a"|"opus"      => "🎵",
-        "exe"|"msi"                                       => "🖥️ ",
-        "dll"|"so"|"dylib"                                => "🔩",
-        "apk"|"ipa"                                       => "📱",
-        "ttf"|"otf"|"woff"|"woff2"                        => "🔤",
-        _                                                 => "📄",
+        // Specific languages with their iconic brand colors
+        "rs" => (set.rs, Color::Rgb(224, 112, 16)), // orange
+        "py" => (set.py, Color::Rgb(255, 224, 64)), // yellow
+        "js"|"mjs"|"cjs" => (set.js, Color::Rgb(240, 219, 79)), // yellow
+        "ts"|"tsx"|"jsx" => (set.ts, Color::Rgb(0, 122, 204)), // blue
+        "html"|"htm" => (set.html, Color::Rgb(227, 76, 38)), // HTML red
+        "css"|"scss"|"sass"|"less" => (set.css, Color::Rgb(86, 61, 124)), // CSS purple
+        "go" => (set.go, Color::Rgb(0, 162, 232)), // blue
+        "c"|"cpp"|"h"|"hpp"|"cc" => (set.c, Color::Rgb(63, 81, 181)), // blue
+        "java"|"kt"|"kts" => (set.java, Color::Rgb(244, 67, 54)), // red
+        "rb" => (set.ruby, Color::Rgb(204, 0, 0)), // red
+        "php" => (set.php, Color::Rgb(119, 123, 179)), // blue
+        "swift" => (set.swift, Color::Rgb(255, 102, 0)), // orange
+        "cs" => (set.csharp, Color::Rgb(23, 150, 18)), // green
+        "lua" => (set.lua, Color::Rgb(0, 0, 128)), // blue
+        "sql" => (set.sql, Color::Rgb(0, 150, 136)), // teal
+
+        // Config / Markup / Text
+        "json"|"toml"|"yaml"|"yml"|"ini"|"cfg"|"conf" => (set.config, CODE),
+        "sh"|"bash"|"zsh"|"ps1"|"bat"|"cmd" => (set.shell, Color::Rgb(255, 235, 59)), // yellow
+        "txt"|"log" => (set.text, PLAIN),
+        "md"|"markdown"|"rst"|"rtf" => (set.md, MARKUP),
+
+        // Office & PDFs
+        "pdf" => (set.pdf, BIN), // red
+        "docx"|"doc"|"odt" => (set.word, CODE), // blue
+        "xlsx"|"xls"|"ods"|"csv"|"tsv" => (set.excel, SHEET), // green
+        "pptx"|"ppt"|"odp" => (set.ppt, MEDIA), // peach
+        "ipynb" => (set.default, DOC), // notepad
+
+        // Archives & Disks
+        "zip"|"7z"|"rar"|"tar"|"gz"|"bz2"|"xz"|"zst"|"tgz" => (set.archive, ARCHIVE),
+        "iso"|"img" => (set.default, ARCHIVE),
+
+        // Media
+        "jpg"|"jpeg"|"png"|"gif"|"bmp"|"webp"|"tiff"|"ico"|"svg" => (set.image, IMAGE),
+        "mp4"|"mkv"|"avi"|"mov"|"webm"|"flv"|"wmv" => (set.video, MEDIA),
+        "mp3"|"flac"|"wav"|"ogg"|"aac"|"m4a"|"opus" => (set.audio, MEDIA),
+
+        // Binaries / Executables
+        "exe"|"msi"|"apk"|"ipa" => (set.bin, BIN),
+        "dll"|"so"|"dylib" => (set.bin, BIN),
+        "ttf"|"otf"|"woff"|"woff2" => (set.default, PLAIN),
+
+        _ => (set.default, PLAIN),
     }
 }
 
@@ -995,7 +1111,7 @@ fn draw_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
         } else {
             Style::default().fg(Color::Black).bg(C_OK).add_modifier(Modifier::BOLD)
         };
-        let icon = if is_err { "✖" } else { "✓" };
+        let icon = if is_err { "[X]" } else { "[OK]" };
         f.render_widget(Paragraph::new(format!(" {} {}", icon, msg)).style(style), area);
         return;
     }
@@ -1007,14 +1123,14 @@ fn draw_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
     let sel_info = if marked > 0 { format!(" │ {} marked", marked) } else { String::new() };
 
     let text = match app.mode {
-        AppMode::Rename => format!(" {}/{} │ ✏ RENAME: type new name · Enter confirm · Esc cancel", pos, count.max(1)),
-        AppMode::ConfirmDelete => format!(" {}/{} │ ✖ DELETE: Y confirm · Esc cancel", pos, count.max(1)),
-        AppMode::ConfirmDeletePermanent => format!(" {}/{} │ ✖ PERMANENTLY DELETE: Y confirm · Esc cancel", pos, count.max(1)),
-        AppMode::NewFolder => format!(" {}/{} │ ▸ NEW FOLDER: type name · Enter confirm · Esc cancel", pos, count.max(1)),
-        AppMode::ContextMenu => format!(" {}/{} │ ☰ MENU: click an action · Esc close", pos, count.max(1)),
-        AppMode::Properties => format!(" {}/{} │ ℹ PROPERTIES: Esc close", pos, count.max(1)),
+        AppMode::Rename => format!(" {}/{} │ RENAME: type new name · Enter confirm · Esc cancel", pos, count.max(1)),
+        AppMode::ConfirmDelete => format!(" {}/{} │ DELETE: Y confirm · Esc cancel", pos, count.max(1)),
+        AppMode::ConfirmDeletePermanent => format!(" {}/{} │ PERMANENTLY DELETE: Y confirm · Esc cancel", pos, count.max(1)),
+        AppMode::NewFolder => format!(" {}/{} │ NEW FOLDER: type name · Enter confirm · Esc cancel", pos, count.max(1)),
+        AppMode::ContextMenu => format!(" {}/{} │ MENU: click an action · Esc close", pos, count.max(1)),
+        AppMode::Properties => format!(" {}/{} │ PROPERTIES: Esc close", pos, count.max(1)),
         _ => format!(
-            " {}/{}{} │ ←↓↑→ nav  F2 rename  Ctrl+C/X/V copy/cut/paste  Del delete  Ctrl+N folder  RClick menu  q quit",
+            " {}/{}{} │ arrows nav  Shift+up/down or wheel scroll preview  F2 rename  Ctrl+C/X/V copy/cut/paste  Del delete  RClick menu  q quit",
             pos, count.max(1), sel_info
         ),
     };

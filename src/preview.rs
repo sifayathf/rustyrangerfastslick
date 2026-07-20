@@ -31,6 +31,10 @@ pub struct ImageFallbackInfo {
 pub enum PreviewContent {
     Text(String),
     Highlighted(Vec<Line<'static>>),
+    /// Same as `Highlighted`, but each line has a line-number gutter baked
+    /// in — rendering this with word-wrap on breaks the gutter alignment,
+    /// so the UI must render it unwrapped (clip instead of wrap).
+    Code(Vec<Line<'static>>),
     ImageFallback(ImageFallbackInfo),
 }
 
@@ -137,6 +141,33 @@ pub fn meta_header(_p: &PathBuf) -> Vec<Line<'static>> {
     Vec::new()
 }
 
+/// Truncate to at most `max_chars` **characters** at a valid UTF-8 boundary.
+/// Byte-length-based slicing (`&s[..s.len().min(N)]`) panics the moment the
+/// string contains any multi-byte character within the first N bytes — this
+/// doesn't.
+fn safe_truncate(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
+    }
+}
+
+/// Runs a third-party parser call and converts an internal panic into `None`
+/// instead of taking down the whole app. Binary-format parsers (PDF, XLSX,
+/// ZIP, audio tags) are routinely handed malformed or password-protected
+/// files, and libraries like `pdf-extract` are known to panic internally
+/// (not return `Err`) on some of them — normal `Result` handling can't catch
+/// that. We also swap in a silent panic hook for the duration of the call so
+/// the default handler doesn't dump a backtrace to stderr, which corrupts
+/// the alternate-screen TUI display even when we recover from it.
+fn safe_parse<T>(f: impl FnOnce() -> T + std::panic::UnwindSafe) -> Option<T> {
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(f);
+    std::panic::set_hook(prev_hook);
+    result.ok()
+}
+
 pub fn human_size(n: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
     let mut v = n as f64;
@@ -177,11 +208,21 @@ fn highlight_document_line(line: &str) -> Line<'static> {
        (trimmed.chars().next().map_or(false, |c| c.is_numeric()) && trimmed.contains(". ")) {
         // Find the index of the bullet/number separator
         let sep_idx = if trimmed.starts_with('•') || trimmed.starts_with('-') || trimmed.starts_with('*') {
-            1
+            trimmed.chars().next().map(|c| c.len_utf8()).unwrap_or(1)
         } else {
-            trimmed.find(". ").unwrap() + 2
+            trimmed.find(". ").map(|i| i + 2).unwrap_or(0)
         };
-        
+
+        // Guard against sep_idx landing outside the string or mid-character
+        // (defensive — the branches above should already produce a valid
+        // boundary, but a panic here would take down the whole app).
+        if sep_idx == 0 || sep_idx > trimmed.len() || !trimmed.is_char_boundary(sep_idx) {
+            return Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(Color::Rgb(205, 214, 244))
+            ));
+        }
+
         let bullet = &trimmed[..sep_idx];
         let content = &trimmed[sep_idx..];
         
@@ -582,8 +623,8 @@ fn render_audio(p: &PathBuf) -> PreviewContent {
     let mut lines = meta_header(p);
     let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
 
-    match Probe::open(p).and_then(|pr| pr.read()) {
-        Ok(tagged_file) => {
+    match safe_parse(move || Probe::open(p).and_then(|pr| pr.read())) {
+        Some(Ok(tagged_file)) => {
             let props = tagged_file.properties();
             let duration = props.duration();
             let mins = duration.as_secs() / 60;
@@ -637,9 +678,16 @@ fn render_audio(p: &PathBuf) -> PreviewContent {
             lines.push(Line::from(Span::styled("─".repeat(44), sep)));
             lines.push(Line::from(Span::styled("  🎧 Open with your audio player", Style::default().fg(SH_CMT))));
         }
-        Err(e) => {
+        Some(Err(e)) => {
             lines.push(Line::from(Span::styled("🎵  Audio file", Style::default().fg(SH_FN))));
             lines.push(Line::from(Span::styled(format!("⚠  Could not read tags: {}", e), Style::default().fg(Color::Red))));
+        }
+        None => {
+            lines.push(Line::from(Span::styled("🎵  Audio file", Style::default().fg(SH_FN))));
+            lines.push(Line::from(Span::styled(
+                "⚠  Couldn't read this file's tags (it may be corrupted)",
+                Style::default().fg(Color::Red)
+            )));
         }
     }
 
@@ -651,8 +699,8 @@ fn render_audio(p: &PathBuf) -> PreviewContent {
 fn render_pdf(p: &PathBuf) -> PreviewContent {
     let mut lines = meta_header(p);
     match fs::read(p) {
-        Ok(bytes) => match pdf_extract::extract_text_from_mem(&bytes) {
-            Ok(text) => {
+        Ok(bytes) => match safe_parse(move || pdf_extract::extract_text_from_mem(&bytes)) {
+            Some(Ok(text)) => {
                 lines.push(Line::from(Span::styled("📄  PDF Document", Style::default().fg(SH_FN))));
                 lines.push(Line::from(Span::styled("─".repeat(50), Style::default().fg(SH_CMT))));
                 if text.trim().is_empty() {
@@ -666,8 +714,14 @@ fn render_pdf(p: &PathBuf) -> PreviewContent {
                     }
                 }
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 lines.push(Line::from(Span::styled(format!("⚠  PDF error: {}", e), Style::default().fg(Color::Red))));
+            }
+            None => {
+                lines.push(Line::from(Span::styled(
+                    "⚠  Couldn't read this PDF (it may be password-protected or corrupted)",
+                    Style::default().fg(Color::Red)
+                )));
             }
         },
         Err(e) => {
@@ -679,7 +733,7 @@ fn render_pdf(p: &PathBuf) -> PreviewContent {
 
 // ── EXACT OFFICE RENDERING ────────────────────────────────────────────────────
 
-fn _get_office_cache_path(p: &PathBuf) -> PathBuf {
+fn get_office_cache_path(p: &PathBuf) -> PathBuf {
     use sha2::{Sha256, Digest};
     let mut hasher = Sha256::new();
     hasher.update(p.to_string_lossy().as_bytes());
@@ -694,8 +748,76 @@ fn _get_office_cache_path(p: &PathBuf) -> PathBuf {
     std::env::temp_dir().join(format!("rr_office_{}.png", hash))
 }
 
-fn try_render_office_exact(_p: &PathBuf, _rotation: u32, _flip_h: bool) -> Option<PreviewContent> {
-    None
+fn try_render_office_exact(p: &PathBuf, rotation: u32, flip_h: bool) -> Option<PreviewContent> {
+    let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+    let cache_path = get_office_cache_path(p);
+
+    if cache_path.exists() {
+        return Some(render_image(&cache_path, rotation, flip_h));
+    }
+
+    let mut generated = false;
+
+    if ext == "ppt" || ext == "pptx" {
+        // Use PowerPoint COM to export the first slide to PNG
+        let script = format!(
+            "$ppt = New-Object -ComObject PowerPoint.Application\n\
+             $ppt.Visible = [Microsoft.Office.Core.MsoTriState]::msoFalse\n\
+             $pres = $ppt.Presentations.Open('{}', [Microsoft.Office.Core.MsoTriState]::msoTrue, [Microsoft.Office.Core.MsoTriState]::msoFalse, [Microsoft.Office.Core.MsoTriState]::msoFalse)\n\
+             $pres.Slides.Item(1).Export('{}', 'PNG')\n\
+             $pres.Close()\n\
+             $ppt.Quit()\n",
+            p.to_string_lossy().replace("'", "''"),
+            cache_path.to_string_lossy().replace("'", "''")
+        );
+        let ps_path = std::env::temp_dir().join("rr_ppt_export.ps1");
+        if fs::write(&ps_path, script).is_ok() {
+            let status = Command::new("powershell")
+                .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps_path.to_str().unwrap()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            if status.map_or(false, |s| s.success()) && cache_path.exists() {
+                generated = true;
+            }
+            let _ = fs::remove_file(ps_path);
+        }
+    }
+
+    if !generated && (ext == "doc" || ext == "docx" || ext == "xls" || ext == "xlsx" || ext == "ppt" || ext == "pptx") {
+        // Try LibreOffice headless
+        let soffice_paths = [
+            "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
+            "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
+            "soffice",
+        ];
+        
+        let temp_dir = std::env::temp_dir();
+        for soffice in soffice_paths {
+            let status = Command::new(soffice)
+                .args(["--headless", "--convert-to", "png", "--outdir", temp_dir.to_str().unwrap(), p.to_str().unwrap()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+                
+            if status.map_or(false, |s| s.success()) {
+                // LibreOffice outputs to <temp_dir>/<filename>.png
+                let base_name = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                let lo_out = temp_dir.join(format!("{}.png", base_name));
+                if lo_out.exists() {
+                    let _ = fs::rename(&lo_out, &cache_path);
+                    generated = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if generated && cache_path.exists() {
+        Some(render_image(&cache_path, rotation, flip_h))
+    } else {
+        None
+    }
 }
 
 // ── DOCX ──────────────────────────────────────────────────────────────────────
@@ -713,23 +835,34 @@ fn render_docx(p: &PathBuf, rotation: u32, flip_h: bool) -> PreviewContent {
             return PreviewContent::Highlighted(lines);
         }
     };
-    let mut archive = match zip::ZipArchive::new(file) {
-        Ok(a)  => a,
-        Err(e) => {
+    let extracted: Option<Result<String, String>> = safe_parse(move || {
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+        let mut xml = String::new();
+        for i in 0..archive.len() {
+            if let Ok(mut entry) = archive.by_index(i) {
+                if entry.name() == "word/document.xml" {
+                    let _ = entry.read_to_string(&mut xml);
+                    break;
+                }
+            }
+        }
+        Ok(xml)
+    });
+
+    let xml = match extracted {
+        Some(Ok(xml)) => xml,
+        Some(Err(e)) => {
             lines.push(Line::from(Span::styled(format!("⚠ Not a valid DOCX: {}", e), Style::default().fg(Color::Red))));
             return PreviewContent::Highlighted(lines);
         }
-    };
-
-    let mut xml = String::new();
-    for i in 0..archive.len() {
-        if let Ok(mut entry) = archive.by_index(i) {
-            if entry.name() == "word/document.xml" {
-                let _ = entry.read_to_string(&mut xml);
-                break;
-            }
+        None => {
+            lines.push(Line::from(Span::styled(
+                "⚠  Couldn't read this document (it may be password-protected or corrupted)",
+                Style::default().fg(Color::Red)
+            )));
+            return PreviewContent::Highlighted(lines);
         }
-    }
+    };
 
     lines.push(Line::from(Span::styled("📘  Word Document (Text Fallback)", Style::default().fg(SH_FN))));
     lines.push(Line::from(Span::styled("─".repeat(50), Style::default().fg(SH_CMT))));
@@ -764,26 +897,39 @@ fn render_pptx(p: &PathBuf, rotation: u32, flip_h: bool) -> PreviewContent {
             return PreviewContent::Highlighted(lines);
         }
     };
-    let mut archive = match zip::ZipArchive::new(file) {
-        Ok(a)  => a,
-        Err(e) => {
-            lines.push(Line::from(Span::styled(format!("⚠ Not a valid PPTX: {}", e), Style::default().fg(Color::Red))));
-            return PreviewContent::Highlighted(lines);
-        }
-    };
 
     lines.push(Line::from(Span::styled("📊  PowerPoint (Text Fallback)", Style::default().fg(SH_FN))));
     lines.push(Line::from(Span::styled("─".repeat(50), Style::default().fg(SH_CMT))));
 
-    for slide_n in 1..=50u32 {
-        let name = format!("ppt/slides/slide{}.xml", slide_n);
-        let mut xml = String::new();
-        let found = (0..archive.len()).any(|i| {
-            archive.by_index(i).ok().map_or(false, |mut e| {
-                if e.name() == name { let _ = e.read_to_string(&mut xml); true } else { false }
-            })
-        });
-        if !found { break; }
+    let slides: Option<Vec<(u32, String)>> = safe_parse(move || {
+        let mut archive = match zip::ZipArchive::new(file) {
+            Ok(a) => a,
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for slide_n in 1..=50u32 {
+            let name = format!("ppt/slides/slide{}.xml", slide_n);
+            let mut xml = String::new();
+            let found = (0..archive.len()).any(|i| {
+                archive.by_index(i).ok().map_or(false, |mut e| {
+                    if e.name() == name { let _ = e.read_to_string(&mut xml); true } else { false }
+                })
+            });
+            if !found { break; }
+            out.push((slide_n, xml));
+        }
+        out
+    });
+
+    let Some(slides) = slides else {
+        lines.push(Line::from(Span::styled(
+            "⚠  Couldn't read this presentation (it may be password-protected or corrupted)",
+            Style::default().fg(Color::Red)
+        )));
+        return PreviewContent::Highlighted(lines);
+    };
+
+    for (slide_n, xml) in slides {
         lines.push(Line::from(Span::styled(
             format!("── Slide {} ", slide_n), Style::default().fg(SH_TYPE)
         )));
@@ -805,36 +951,48 @@ fn render_excel(p: &PathBuf, rotation: u32, flip_h: bool) -> PreviewContent {
 
     use calamine::{Reader, open_workbook_auto};
     let mut lines = meta_header(p);
-    match open_workbook_auto(p) {
-        Ok(mut wb) => {
-            let sheets = wb.sheet_names().to_vec();
-            lines.push(Line::from(vec![
-                Span::styled("📊  Sheets: ", Style::default().fg(SH_FN)),
-                Span::styled(sheets.join(", "), Style::default().fg(SH_STR)),
-            ]));
-            lines.push(Line::from(Span::styled("─".repeat(80), Style::default().fg(SH_CMT))));
+    let outcome: Option<Vec<Line<'static>>> = safe_parse(move || {
+        let mut out: Vec<Line<'static>> = Vec::new();
+        match open_workbook_auto(p) {
+            Ok(mut wb) => {
+                let sheets = wb.sheet_names().to_vec();
+                out.push(Line::from(vec![
+                    Span::styled("📊  Sheets: ", Style::default().fg(SH_FN)),
+                    Span::styled(sheets.join(", "), Style::default().fg(SH_STR)),
+                ]));
+                out.push(Line::from(Span::styled("─".repeat(80), Style::default().fg(SH_CMT))));
 
-            if let Some(first) = sheets.first() {
-                if let Ok(range) = wb.worksheet_range(first) {
-                    for (ri, row) in range.rows().enumerate().take(40) {
-                        let formatted: String = row.iter()
-                            .map(|c| { let s = c.to_string(); format!(" {:<16} ", &s[..s.len().min(15)]) })
-                            .collect::<Vec<_>>()
-                            .join("│");
-                        if ri == 0 {
-                            lines.push(Line::from(Span::styled(formatted.clone(), Style::default().fg(SH_TYPE).add_modifier(Modifier::BOLD))));
-                            lines.push(Line::from(Span::styled("─".repeat(formatted.len()), Style::default().fg(SH_CMT))));
-                        } else {
-                            let color = if ri % 2 == 0 { SH_FG } else { Color::Rgb(170, 175, 196) };
-                            lines.push(Line::from(Span::styled(formatted, Style::default().fg(color))));
+                if let Some(first) = sheets.first() {
+                    if let Ok(range) = wb.worksheet_range(first) {
+                        for (ri, row) in range.rows().enumerate().take(40) {
+                            let formatted: String = row.iter()
+                                .map(|c| { let s = c.to_string(); format!(" {:<16} ", safe_truncate(&s, 15)) })
+                                .collect::<Vec<_>>()
+                                .join("│");
+                            if ri == 0 {
+                                out.push(Line::from(Span::styled(formatted.clone(), Style::default().fg(SH_TYPE).add_modifier(Modifier::BOLD))));
+                                out.push(Line::from(Span::styled("─".repeat(formatted.len()), Style::default().fg(SH_CMT))));
+                            } else {
+                                let color = if ri % 2 == 0 { SH_FG } else { Color::Rgb(170, 175, 196) };
+                                out.push(Line::from(Span::styled(formatted, Style::default().fg(color))));
+                            }
                         }
                     }
                 }
             }
+            Err(e) => {
+                out.push(Line::from(Span::styled(format!("⚠ Cannot read spreadsheet: {}", e), Style::default().fg(Color::Red))));
+            }
         }
-        Err(e) => {
-            lines.push(Line::from(Span::styled(format!("⚠ Cannot read spreadsheet: {}", e), Style::default().fg(Color::Red))));
-        }
+        out
+    });
+
+    match outcome {
+        Some(out) => lines.extend(out),
+        None => lines.push(Line::from(Span::styled(
+            "⚠  Couldn't read this spreadsheet (it may be password-protected or corrupted)",
+            Style::default().fg(Color::Red)
+        ))),
     }
     PreviewContent::Highlighted(lines)
 }
@@ -891,7 +1049,7 @@ fn render_csv(p: &PathBuf) -> PreviewContent {
         let cells: Vec<Span<'static>> = (0..ncols).flat_map(|ci| {
             let cell = row.get(ci).map(|s| s.as_str()).unwrap_or("");
             let w = col_widths[ci].max(1);
-            let s = format!(" {:<width$} ", &cell[..cell.len().min(18)], width = w);
+            let s = format!(" {:<width$} ", safe_truncate(cell, 18), width = w);
             let style = if ri == 0 {
                 Style::default().fg(SH_TYPE).add_modifier(Modifier::BOLD)
             } else if ci % 2 == 0 {
@@ -1055,14 +1213,15 @@ fn render_archive(p: &PathBuf) -> PreviewContent {
     let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
 
     if ext == "zip" {
-        match fs::File::open(p).map(zip::ZipArchive::new) {
-            Ok(Ok(mut a)) => {
+        let listing: Option<Vec<Line<'static>>> = safe_parse(move || {
+            let mut out = Vec::new();
+            if let Ok(Ok(mut a)) = fs::File::open(p).map(zip::ZipArchive::new) {
                 let total = a.len();
-                lines.push(Line::from(vec![
+                out.push(Line::from(vec![
                     Span::styled("📦  ZIP  ", Style::default().fg(SH_FN)),
                     Span::styled(format!("{} entries", total), Style::default().fg(SH_CMT)),
                 ]));
-                lines.push(Line::from(Span::styled("─".repeat(44), Style::default().fg(SH_CMT))));
+                out.push(Line::from(Span::styled("─".repeat(44), Style::default().fg(SH_CMT))));
                 for i in 0..total.min(150) {
                     if let Ok(f) = a.by_index(i) {
                         let is_dir  = f.is_dir();
@@ -1070,10 +1229,10 @@ fn render_archive(p: &PathBuf) -> PreviewContent {
                         let name    = f.name().to_string();
                         let orig    = human_size(f.size());
                         let comp    = human_size(f.compressed_size());
-                        lines.push(Line::from(vec![
+                        out.push(Line::from(vec![
                             Span::styled(format!("  {} ", icon), Style::default().fg(SH_FG)),
                             Span::styled(
-                                format!("{:<50}", &name[..name.len().min(50)]),
+                                format!("{:<50}", safe_truncate(&name, 50)),
                                 Style::default().fg(if is_dir { SH_TYPE } else { SH_FG })
                             ),
                             Span::styled(format!(" {:>8} → {}", comp, orig), Style::default().fg(SH_CMT)),
@@ -1081,14 +1240,19 @@ fn render_archive(p: &PathBuf) -> PreviewContent {
                     }
                 }
                 if total > 150 {
-                    lines.push(Line::from(Span::styled(
+                    out.push(Line::from(Span::styled(
                         format!("  … {} more entries", total - 150),
                         Style::default().fg(SH_CMT)
                     )));
                 }
+            }
+            out
+        });
+        if let Some(out) = listing {
+            if !out.is_empty() {
+                lines.extend(out);
                 return PreviewContent::Highlighted(lines);
             }
-            _ => {}
         }
     }
 
@@ -1150,7 +1314,7 @@ fn text_preview(p: &PathBuf) -> PreviewContent {
                 Style::default().fg(SH_CMT)
             )));
         }
-        return PreviewContent::Highlighted(lines);
+        return PreviewContent::Code(lines);
     }
 
     // Plain text
