@@ -452,12 +452,24 @@ fn draw_breadcrumb(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGe
     let mut spans = vec![Span::styled(" ▸  ", Style::default().fg(C_MUTED))];
     let mut segments: Vec<(String, std::path::PathBuf)> = Vec::new();
     let mut acc = std::path::PathBuf::new();
-    for comp in path.components() {
-        acc.push(comp.as_os_str());
-        let label = comp.as_os_str().to_string_lossy().to_string();
-        segments.push((label, acc.clone()));
-    }
+    // for comp in path.components() {
+    //     acc.push(comp.as_os_str());
+    //     let label = comp.as_os_str().to_string_lossy().to_string();
+    //     segments.push((label, acc.clone()));
+    // }
 
+    use std::path::Component;
+
+    for comp in path.components() {
+        match comp {
+            Component::RootDir => continue,
+            _ => {
+                acc.push(comp.as_os_str());
+                let label = comp.as_os_str().to_string_lossy().to_string();
+                segments.push((label, acc.clone()));
+            }
+        }
+    }
     let mut x = area.x + 5;
     for (i, (label, seg_path)) in segments.iter().enumerate() {
         let is_last = i == segments.len() - 1;
