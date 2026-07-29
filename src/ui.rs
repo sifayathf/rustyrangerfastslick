@@ -149,33 +149,49 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
         } else {
             Style::default().fg(C_TEXT)
         };
-        // Fixed one-cell navigation markers are deliberately independent of
-        // the selected file-icon theme. Terminal emoji widths are not
-        // portable and made labels/highlights drift by one cell.
+        // Render the icon and label into independent rectangles. This keeps
+        // the label at a fixed column even when a terminal displays an emoji
+        // using a different fallback-font width.
         let icon = if *label == "Home" {
-            "H"
+            set.home
         } else if *label == "Desktop" {
-            "D"
+            set.desktop
         } else if *label == "Documents" {
-            "F"
+            set.documents
         } else if *label == "Downloads" {
-            "V"
+            set.downloads
         } else if *label == "Pictures" {
-            "P"
+            set.pictures
         } else {
-            "-"
+            " "
         };
-        
-        let icon_span = Span::styled(icon, if is_active { text_style } else { Style::default().fg(C_ACCENT2) });
-        let text_span = Span::styled(format!("  {}", label), text_style);
-        
-        push_line(f, geo, inner, &mut y, max_y,
-            Line::from(vec![
-                Span::styled("  ", text_style),
-                icon_span,
-                text_span,
-            ]),
-            Some(path.clone()));
+        if y >= max_y {
+            break;
+        }
+        let row_rect = Rect { x: inner.x, y, width: inner.width, height: 1 };
+        f.render_widget(Paragraph::new("").style(text_style), row_rect);
+        let icon_rect = Rect {
+            x: inner.x.saturating_add(2),
+            y,
+            width: 2.min(inner.width.saturating_sub(2)),
+            height: 1,
+        };
+        let label_rect = Rect {
+            x: inner.x.saturating_add(5),
+            y,
+            width: inner.width.saturating_sub(5),
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                icon,
+                if is_active { text_style } else { Style::default().fg(C_ACCENT2) },
+            )),
+            icon_rect,
+        );
+        f.render_widget(Paragraph::new(Span::styled(*label, text_style)), label_rect);
+        geo.sidebar_item_rects.push((row_rect, path.clone()));
+        y += 1;
     }
 
     // Spacing between sections
@@ -272,12 +288,12 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
             *y += 1;
         };
 
-        draw_toggle(f, geo, &mut y, "T", "Theme", "Dark", "Light", app.theme_mode == crate::state::ThemeMode::Light, crate::state::ToggleAction::Theme);
-        draw_toggle(f, geo, &mut y, "O", "Office", "Text", "Full", app.office_mode == crate::state::OfficeRenderMode::Full, crate::state::ToggleAction::OfficeMode);
-        draw_toggle(f, geo, &mut y, "P", "PDF", "Text", "Visual", app.pdf_mode == crate::state::PdfRenderMode::Visual, crate::state::ToggleAction::PdfMode);
+        draw_toggle(f, geo, &mut y, "🎨", "Theme", "Dark", "Light", app.theme_mode == crate::state::ThemeMode::Light, crate::state::ToggleAction::Theme);
+        draw_toggle(f, geo, &mut y, "📊", "Office", "Text", "Full", app.office_mode == crate::state::OfficeRenderMode::Full, crate::state::ToggleAction::OfficeMode);
+        draw_toggle(f, geo, &mut y, "📄", "PDF", "Text", "Visual", app.pdf_mode == crate::state::PdfRenderMode::Visual, crate::state::ToggleAction::PdfMode);
         if y < max_y {
             let rect = Rect { x: inner.x, y, width: inner.width, height: 1 };
-            let prefix = Span::styled("S Sort ", Style::default().fg(C_TEXT));
+            let prefix = Span::styled("↕ Sort ", Style::default().fg(C_TEXT));
             let mut click_x = rect.x + prefix.width() as u16;
             let mut spans = vec![prefix];
             for (label, mode, action) in [
@@ -304,12 +320,12 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
             f.render_widget(Paragraph::new(Line::from(spans)), rect);
             y += 1;
         }
-        draw_toggle(f, geo, &mut y, "O", "Order", "Asc", "Desc", app.sort_descending, crate::state::ToggleAction::SortOrder);
-        draw_toggle(f, geo, &mut y, "I", "Details", "Off", "On", app.show_file_details, crate::state::ToggleAction::Details);
-        draw_toggle(f, geo, &mut y, "S", "Select", "Flat", "Pill", app.rounded_selection, crate::state::ToggleAction::SelectionStyle);
-        draw_toggle(f, geo, &mut y, "H", "Hover", "Off", "On", app.hover_enabled, crate::state::ToggleAction::Hover);
-        draw_toggle(f, geo, &mut y, "E", "Edit", "Off", "On", app.edit_preview_mode, crate::state::ToggleAction::EditMode);
-        draw_toggle(f, geo, &mut y, "D", "DirClick", "Off", "On", app.dir_preview_clickable, crate::state::ToggleAction::DirPreviewClick);
+        draw_toggle(f, geo, &mut y, "↕", "Order", "Asc", "Desc", app.sort_descending, crate::state::ToggleAction::SortOrder);
+        draw_toggle(f, geo, &mut y, "🕒", "Details", "Off", "On", app.show_file_details, crate::state::ToggleAction::Details);
+        draw_toggle(f, geo, &mut y, "◖", "Select", "Flat", "Pill", app.rounded_selection, crate::state::ToggleAction::SelectionStyle);
+        draw_toggle(f, geo, &mut y, "◉", "Hover", "Off", "On", app.hover_enabled, crate::state::ToggleAction::Hover);
+        draw_toggle(f, geo, &mut y, "✏️", "Edit", "Off", "On", app.edit_preview_mode, crate::state::ToggleAction::EditMode);
+        draw_toggle(f, geo, &mut y, "📂", "DirClick", "Off", "On", app.dir_preview_clickable, crate::state::ToggleAction::DirPreviewClick);
     }
 }
 
@@ -1724,12 +1740,12 @@ fn get_icon_set() -> &'static IconSet {
         let val = std::env::var("RUSTY_RANGER_ICONS").unwrap_or_default().to_lowercase();
         if val == "nerd" || std::env::var("NERD_FONT").is_ok() {
             NERD_ICONS
-        } else if val == "emoji" {
-            EMOJI_ICONS
-        } else {
-            // Portable default. Emoji presentation and fallback-font width
-            // differ between Windows builds, so rich icons are opt-in.
+        } else if val == "ascii" {
             ASCII_ICONS
+        } else {
+            // Rich icons are the default. Layout code reserves fixed icon
+            // slots so fallback-font width cannot move adjacent labels.
+            EMOJI_ICONS
         }
     });
     &SET
