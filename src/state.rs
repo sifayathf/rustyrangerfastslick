@@ -190,6 +190,7 @@ pub enum ToggleAction {
     SortOrder,
     Details,
     SelectionStyle,
+    FontWeight,
     Hover,
 }
 
@@ -306,6 +307,7 @@ pub struct AppState {
     pub sort_descending:       bool,
     pub show_file_details:     bool,
     pub rounded_selection:     bool,
+    pub bold_ui:               bool,
     pub hover_enabled:         bool,
     pub search_active:         bool,
     pub search_query:          String,
@@ -401,6 +403,7 @@ impl AppState {
             sort_descending:       false,
             show_file_details:     false,
             rounded_selection:     false,
+            bold_ui:               false,
             hover_enabled:         true,
             search_active:         false,
             search_query:          String::new(),
@@ -2225,7 +2228,14 @@ impl AppState {
             ToggleAction::SelectionStyle => {
                 self.rounded_selection = !self.rounded_selection;
                 self.set_notice(
-                    format!("Selection style: {}", if self.rounded_selection { "Pill" } else { "Flat" }),
+                    format!("Global control shape: {}", if self.rounded_selection { "Pill" } else { "Flat" }),
+                    false,
+                );
+            }
+            ToggleAction::FontWeight => {
+                self.bold_ui = !self.bold_ui;
+                self.set_notice(
+                    format!("Global font weight: {}", if self.bold_ui { "Bold" } else { "Regular" }),
                     false,
                 );
             }

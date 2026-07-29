@@ -1014,7 +1014,6 @@ fn get_office_cache_path(p: &PathBuf, page_idx: usize) -> PathBuf {
     std::env::temp_dir().join(format!("rr_office_{}.png", hash))
 }
 
-#[cfg(test)]
 fn try_render_embedded_office_thumbnail(
     p: &PathBuf,
     rotation: u32,
@@ -1355,19 +1354,17 @@ fn render_pptx(
     slide_idx: usize,
 ) -> PreviewContent {
     if office_mode == crate::state::OfficeRenderMode::Full {
+        if slide_idx == 0 {
+            if let Some(content) = try_render_embedded_office_thumbnail(p, rotation, flip_h) {
+                return content;
+            }
+        }
         if let Some(content) = try_render_office_exact(p, rotation, flip_h, slide_idx) {
             return content;
         }
     }
 
     let mut lines = meta_header(p);
-    if office_mode == crate::state::OfficeRenderMode::Full {
-        lines.push(Line::from(Span::styled(
-            "⚠ Full slide renderer unavailable; showing slide text fallback",
-            Style::default().fg(SH_TYPE),
-        )));
-        lines.push(Line::from(""));
-    }
     let file = match fs::File::open(p) {
         Ok(f)  => f,
         Err(e) => {
@@ -1375,16 +1372,6 @@ fn render_pptx(
             return PreviewContent::Highlighted(lines);
         }
     };
-
-    lines.push(Line::from(Span::styled(
-        if office_mode == crate::state::OfficeRenderMode::Full {
-            "📊  PowerPoint Presentation (Full requested · Text fallback)"
-        } else {
-            "📊  PowerPoint Presentation (Text Mode)"
-        },
-        Style::default().fg(SH_FN),
-    )));
-    lines.push(Line::from(Span::styled("─".repeat(50), Style::default().fg(SH_CMT))));
 
     let slides: Option<Vec<(u32, String)>> = safe_parse(move || {
         let mut archive = match zip::ZipArchive::new(file) {
@@ -1419,10 +1406,40 @@ fn render_pptx(
         return PreviewContent::Highlighted(lines);
     }
 
-    for (slide_n, xml) in slides {
+    let slide_count = slides.len();
+    lines.push(Line::from(vec![
+        Span::styled(
+            "📊  PowerPoint",
+            Style::default().fg(SH_FN).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if office_mode == crate::state::OfficeRenderMode::Full {
+                format!(
+                    "  ·  Portable slide preview  ·  {} / {}",
+                    slide_idx.saturating_add(1).min(slide_count),
+                    slide_count,
+                )
+            } else {
+                format!("  ·  Text outline  ·  {} slides", slide_count)
+            },
+            Style::default().fg(SH_CMT),
+        ),
+    ]));
+    lines.push(Line::from(Span::styled("─".repeat(72), Style::default().fg(SH_CMT))));
+
+    let visible_slides: Box<dyn Iterator<Item = &(u32, String)>> =
+        if office_mode == crate::state::OfficeRenderMode::Full {
+            let index = slide_idx.min(slide_count.saturating_sub(1));
+            Box::new(slides[index..=index].iter())
+        } else {
+            Box::new(slides.iter())
+        };
+
+    for (slide_n, xml) in visible_slides {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            format!("── Slide {} ──────────────────────────────", slide_n), Style::default().fg(SH_TYPE).add_modifier(Modifier::BOLD)
+            format!(" SLIDE {} ", slide_n),
+            Style::default().fg(Color::Black).bg(SH_TYPE).add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
         let extracted_text = xml_text(&xml);
@@ -1997,6 +2014,59 @@ mod tests {
         archive.finish().unwrap();
 
         assert_eq!(presentation_slide_count(&path), Some(3));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn portable_full_presentation_preview_shows_only_the_selected_slide() {
+        let path = std::env::temp_dir().join(format!(
+            "rusty-ranger-portable-slides-{}-{}.pptx",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = fs::File::create(&path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        for (number, text) in [(1, "FIRST SLIDE"), (2, "SECOND SLIDE"), (3, "THIRD SLIDE")] {
+            archive
+                .start_file(
+                    format!("ppt/slides/slide{number}.xml"),
+                    zip::write::FileOptions::default(),
+                )
+                .unwrap();
+            archive
+                .write_all(format!("<a:p><a:t>{text}</a:t></a:p>").as_bytes())
+                .unwrap();
+        }
+        archive.finish().unwrap();
+
+        let cache_path = get_office_cache_path(&path, 1);
+        OFFICE_RENDER_FAILURES
+            .lock()
+            .insert(cache_path.clone(), std::time::Instant::now());
+        match render_pptx(
+            &path,
+            0,
+            false,
+            crate::state::OfficeRenderMode::Full,
+            1,
+        ) {
+            PreviewContent::Highlighted(lines) => {
+                let rendered = lines
+                    .iter()
+                    .flat_map(|line| line.spans.iter())
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                assert!(rendered.contains("Portable slide preview"));
+                assert!(rendered.contains("SECOND SLIDE"));
+                assert!(!rendered.contains("FIRST SLIDE"));
+                assert!(!rendered.contains("renderer unavailable"));
+            }
+            _ => panic!("missing portable slide preview"),
+        }
+        OFFICE_RENDER_FAILURES.lock().remove(&cache_path);
         fs::remove_file(path).unwrap();
     }
 

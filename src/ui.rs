@@ -17,8 +17,13 @@ use crate::preview::{self, PreviewContent};
 pub fn draw(f: &mut Frame, app: &AppState) {
     let t = app.theme();
     let C_BORDER_LO = t.border_lo;
+    let root_style = if app.bold_ui {
+        Style::default().fg(t.text).bg(t.bg_root).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(t.text).bg(t.bg_root)
+    };
     f.render_widget(
-        Block::default().style(Style::default().fg(t.text).bg(t.bg_root)),
+        Block::default().style(root_style),
         f.size(),
     );
 
@@ -169,7 +174,32 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
             break;
         }
         let row_rect = Rect { x: inner.x, y, width: inner.width, height: 1 };
-        f.render_widget(Paragraph::new("").style(text_style), row_rect);
+        if is_active {
+            if app.rounded_selection && row_rect.width >= 2 {
+                let body = Rect {
+                    x: row_rect.x.saturating_add(1),
+                    y,
+                    width: row_rect.width.saturating_sub(2),
+                    height: 1,
+                };
+                f.render_widget(Paragraph::new("").style(text_style), body);
+                f.render_widget(
+                    Paragraph::new(Span::styled("◖", Style::default().fg(C_ACCENT).bg(t.bg_panel))),
+                    Rect { x: row_rect.x, y, width: 1, height: 1 },
+                );
+                f.render_widget(
+                    Paragraph::new(Span::styled("◗", Style::default().fg(C_ACCENT).bg(t.bg_panel))),
+                    Rect {
+                        x: row_rect.x.saturating_add(row_rect.width.saturating_sub(1)),
+                        y,
+                        width: 1,
+                        height: 1,
+                    },
+                );
+            } else {
+                f.render_widget(Paragraph::new("").style(text_style), row_rect);
+            }
+        }
         let icon_rect = Rect {
             x: inner.x.saturating_add(2),
             y,
@@ -269,18 +299,24 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
             };
             let cap_style = |active: bool| {
                 let color = if active { C_ACCENT } else { t.sel_bg_inactive };
-                Style::default().fg(color).bg(t.bg_panel)
+                if app.rounded_selection {
+                    Style::default().fg(color).bg(t.bg_panel)
+                } else {
+                    Style::default().bg(color)
+                }
             };
+            let left_cap = if app.rounded_selection { "◖" } else { " " };
+            let right_cap = if app.rounded_selection { "◗" } else { " " };
 
             let line = Line::from(vec![
                 label_span,
-                Span::styled("(", cap_style(!is_opt2)),
+                Span::styled(left_cap, cap_style(!is_opt2)),
                 Span::styled(opt1, badge_style(!is_opt2)),
-                Span::styled(")", cap_style(!is_opt2)),
+                Span::styled(right_cap, cap_style(!is_opt2)),
                 Span::raw(" "),
-                Span::styled("(", cap_style(is_opt2)),
+                Span::styled(left_cap, cap_style(is_opt2)),
                 Span::styled(opt2, badge_style(is_opt2)),
-                Span::styled(")", cap_style(is_opt2)),
+                Span::styled(right_cap, cap_style(is_opt2)),
             ]);
 
             f.render_widget(Paragraph::new(line), rect);
@@ -293,9 +329,18 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
         draw_toggle(f, geo, &mut y, "📄", "PDF", "Text", "Visual", app.pdf_mode == crate::state::PdfRenderMode::Visual, crate::state::ToggleAction::PdfMode);
         if y < max_y {
             let rect = Rect { x: inner.x, y, width: inner.width, height: 1 };
-            let prefix = Span::styled("↕ Sort ", Style::default().fg(C_TEXT));
+            let prefix = Span::styled("↕ ", Style::default().fg(C_TEXT));
             let mut click_x = rect.x + prefix.width() as u16;
-            let mut spans = vec![prefix];
+            let outer_color = t.sel_bg_inactive;
+            let outer_style = if app.rounded_selection {
+                Style::default().fg(outer_color).bg(t.bg_panel)
+            } else {
+                Style::default().bg(outer_color)
+            };
+            let left_cap = if app.rounded_selection { "◖" } else { " " };
+            let right_cap = if app.rounded_selection { "◗" } else { " " };
+            let mut spans = vec![prefix, Span::styled(left_cap, outer_style)];
+            click_x = click_x.saturating_add(1);
             for (label, mode, action) in [
                 ("Name", SortMode::Name, crate::state::ToggleAction::SortName),
                 ("Date", SortMode::Modified, crate::state::ToggleAction::SortModified),
@@ -317,12 +362,14 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
                 spans.push(Span::styled(badge, style));
                 click_x = click_x.saturating_add(badge_width);
             }
+            spans.push(Span::styled(right_cap, outer_style));
             f.render_widget(Paragraph::new(Line::from(spans)), rect);
             y += 1;
         }
         draw_toggle(f, geo, &mut y, "↕", "Order", "Asc", "Desc", app.sort_descending, crate::state::ToggleAction::SortOrder);
         draw_toggle(f, geo, &mut y, "🕒", "Details", "Off", "On", app.show_file_details, crate::state::ToggleAction::Details);
-        draw_toggle(f, geo, &mut y, "◖", "Select", "Flat", "Pill", app.rounded_selection, crate::state::ToggleAction::SelectionStyle);
+        draw_toggle(f, geo, &mut y, "◖", "Shape", "Flat", "Pill", app.rounded_selection, crate::state::ToggleAction::SelectionStyle);
+        draw_toggle(f, geo, &mut y, "B", "Font", "Reg", "Bold", app.bold_ui, crate::state::ToggleAction::FontWeight);
         draw_toggle(f, geo, &mut y, "◉", "Hover", "Off", "On", app.hover_enabled, crate::state::ToggleAction::Hover);
         draw_toggle(f, geo, &mut y, "✏️", "Edit", "Off", "On", app.edit_preview_mode, crate::state::ToggleAction::EditMode);
         draw_toggle(f, geo, &mut y, "📂", "DirClick", "Off", "On", app.dir_preview_clickable, crate::state::ToggleAction::DirPreviewClick);
@@ -1081,8 +1128,7 @@ fn draw_dir_pane(f: &mut Frame, app: &AppState, level: &DirLevel, is_current: bo
             if is_selected {
                 let bg = if is_current { C_SEL_BG } else { C_SEL_BG_INACTIVE };
                 let fg_color = if is_current { C_ACCENT } else { C_TEXT };
-                let cap_width = if app.rounded_selection { 2 } else { 1 };
-                let inner_w = (list_inner_area.width as usize).saturating_sub(cap_width);
+                let inner_w = (list_inner_area.width as usize).saturating_sub(2);
                 
                 let icon_selected_span = Span::styled(icon, Style::default().fg(icon_color).bg(bg));
                 let name_selected_span = Span::styled(shown_name.clone(), Style::default().fg(fg_color).bg(bg).add_modifier(Modifier::BOLD));
@@ -1093,9 +1139,9 @@ fn draw_dir_pane(f: &mut Frame, app: &AppState, level: &DirLevel, is_current: bo
                 
                 let mut spans = Vec::new();
                 if app.rounded_selection {
-                    spans.push(Span::styled("(", Style::default().fg(bg).bg(t.bg_panel)));
+                    spans.push(Span::styled("◖", Style::default().fg(bg).bg(t.bg_panel)));
                 } else {
-                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(" ", Style::default().bg(bg)));
                 }
                 spans.extend([
                     icon_selected_span,
@@ -1108,24 +1154,35 @@ fn draw_dir_pane(f: &mut Frame, app: &AppState, level: &DirLevel, is_current: bo
                     spans.push(Span::styled(details, Style::default().fg(C_MUTED).bg(bg)));
                 }
                 if app.rounded_selection {
-                    spans.push(Span::styled(")", Style::default().fg(bg).bg(t.bg_panel)));
+                    spans.push(Span::styled("◗", Style::default().fg(bg).bg(t.bg_panel)));
+                } else {
+                    spans.push(Span::styled(" ", Style::default().bg(bg)));
                 }
                 ListItem::new(Line::from(spans))
             } else if is_hovered {
                 let bg = t.sel_bg_inactive;
-                let used = 1 + icon_span.width() + 1 + Span::raw(shown_name.as_str()).width()
+                let inner_w = (list_inner_area.width as usize).saturating_sub(2);
+                let used = icon_span.width() + 1 + Span::raw(shown_name.as_str()).width()
                     + details_width + usize::from(!details.is_empty());
-                let mut spans = vec![
-                    Span::styled(" ", Style::default().bg(bg)),
+                let mut spans = vec![if app.rounded_selection {
+                    Span::styled("◖", Style::default().fg(bg).bg(t.bg_panel))
+                } else {
+                    Span::styled(" ", Style::default().bg(bg))
+                },
                     Span::styled(icon, Style::default().fg(icon_color).bg(bg)),
                     Span::styled(" ", Style::default().bg(bg)),
                     Span::styled(shown_name.clone(), Style::default().fg(C_ACCENT).bg(bg).add_modifier(Modifier::BOLD)),
-                    Span::styled(" ".repeat((list_inner_area.width as usize).saturating_sub(used)), Style::default().bg(bg)),
+                    Span::styled(" ".repeat(inner_w.saturating_sub(used)), Style::default().bg(bg)),
                 ];
                 if !details.is_empty() {
                     spans.push(Span::styled(" ", Style::default().bg(bg)));
                     spans.push(Span::styled(details, Style::default().fg(C_MUTED).bg(bg)));
                 }
+                spans.push(if app.rounded_selection {
+                    Span::styled("◗", Style::default().fg(bg).bg(t.bg_panel))
+                } else {
+                    Span::styled(" ", Style::default().bg(bg))
+                });
                 ListItem::new(Line::from(spans))
             } else if is_marked {
                 let used = 1 + icon_span.width() + 1 + Span::raw(shown_name.as_str()).width()
