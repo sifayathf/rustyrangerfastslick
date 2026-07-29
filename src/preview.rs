@@ -408,6 +408,8 @@ fn highlight_code_with_limit(text: &str, ext: &str, max_lines: usize) -> Vec<Lin
     let cmt_block = block_comment_chars(ext); // (open, close)
 
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let rendered_line_count = text.split('\n').take(max_lines).count().max(1);
+    let gutter_digits = rendered_line_count.to_string().len();
 
     // We need cross-line block-comment tracking
     let mut in_block_cmt = false;
@@ -417,7 +419,7 @@ fn highlight_code_with_limit(text: &str, ext: &str, max_lines: usize) -> Vec<Lin
 
         // Line number gutter
         spans.push(Span::styled(
-            format!("{:>2} │ ", ln_idx + 1),
+            format!("{:>width$}│ ", ln_idx + 1, width = gutter_digits),
             Style::default().fg(SH_LN),
         ));
 
@@ -1821,14 +1823,18 @@ fn text_preview(p: &PathBuf) -> PreviewContent {
     }
 
     let total = normalized.lines().count();
+    let gutter_digits = total.min(400).max(1).to_string().len();
     let mut lines = header;
     if normalized.is_empty() {
         lines.push(Line::from(Span::styled("<empty file>", Style::default().fg(SH_CMT))));
     } else {
         lines.extend(normalized.lines().enumerate().take(400).map(|(index, line)| {
             Line::from(vec![
-                Span::styled(format!("{:>2}", index + 1), Style::default().fg(SH_LN)),
-                Span::styled(" │ ", Style::default().fg(SH_CMT)),
+                Span::styled(
+                    format!("{:>width$}", index + 1, width = gutter_digits),
+                    Style::default().fg(SH_LN),
+                ),
+                Span::styled("│ ", Style::default().fg(SH_CMT)),
                 Span::styled(line.to_string(), Style::default().fg(SH_FG)),
             ])
         }));
@@ -2002,8 +2008,8 @@ mod tests {
         match text_preview(&path) {
             PreviewContent::Code(lines) => {
                 assert_eq!(lines.len(), 2);
-                assert_eq!(lines[0].spans[0].content.as_ref(), " 1");
-                assert_eq!(lines[0].spans[1].content.as_ref(), " │ ");
+                assert_eq!(lines[0].spans[0].content.as_ref(), "1");
+                assert_eq!(lines[0].spans[1].content.as_ref(), "│ ");
                 assert_eq!(lines[0].spans[2].content.as_ref(), "alpha");
                 assert_ne!(lines[0].spans[0].style.fg, lines[0].spans[2].style.fg);
             }
@@ -2011,6 +2017,21 @@ mod tests {
         }
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn code_gutter_expands_once_and_stays_aligned_past_line_100() {
+        let source = (1..=105)
+            .map(|line| format!("value_{line} = {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = highlight_code_with_limit(&source, "py", 400);
+
+        assert_eq!(lines[0].spans[0].content.as_ref(), "  1│ ");
+        assert_eq!(lines[98].spans[0].content.as_ref(), " 99│ ");
+        assert_eq!(lines[99].spans[0].content.as_ref(), "100│ ");
+        assert_eq!(lines[104].spans[0].content.as_ref(), "105│ ");
+        assert!(lines.iter().all(|line| line.spans[0].width() == 5));
     }
 
     #[test]

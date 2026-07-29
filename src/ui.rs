@@ -246,7 +246,9 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
             if *y >= max_y { return; }
             let rect = Rect { x: inner.x, y: *y, width: inner.width, height: 1 };
             
-            let label_span = Span::styled(format!("  {} {:<6}", icon, label), Style::default().fg(C_TEXT));
+            // Keep the label/control pair inside the narrow sidebar. Leading
+            // padding here previously forced the second pill into the next row.
+            let label_span = Span::styled(format!("{} {:<6}", icon, label), Style::default().fg(C_TEXT));
             let badge_style = |active: bool| if active {
                 Style::default().fg(Color::Black).bg(C_ACCENT).add_modifier(Modifier::BOLD)
             } else {
@@ -292,7 +294,9 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
                 } else {
                     Style::default().fg(C_MUTED).bg(t.sel_bg_inactive)
                 };
-                let badge = format!("{}", label);
+                // Explicit interior spacing makes all three sort targets
+                // visually distinct and independently clickable.
+                let badge = format!(" {} ", label);
                 let badge_width = Span::raw(&badge).width() as u16;
                 geo.toggle_rects.push((
                     Rect { x: click_x, y, width: badge_width, height: 1 },
@@ -308,6 +312,7 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
         draw_toggle(f, geo, &mut y, "↕", "Order", "Asc", "Desc", app.sort_descending, crate::state::ToggleAction::SortOrder);
         draw_toggle(f, geo, &mut y, "🕒", "Details", "Off", "On", app.show_file_details, crate::state::ToggleAction::Details);
         draw_toggle(f, geo, &mut y, "◖", "Select", "Flat", "Pill", app.rounded_selection, crate::state::ToggleAction::SelectionStyle);
+        draw_toggle(f, geo, &mut y, "◉", "Hover", "Off", "On", app.hover_enabled, crate::state::ToggleAction::Hover);
         draw_toggle(f, geo, &mut y, "✏️", "Edit", "Off", "On", app.edit_preview_mode, crate::state::ToggleAction::EditMode);
         draw_toggle(f, geo, &mut y, "📂", "DirClick", "Off", "On", app.dir_preview_clickable, crate::state::ToggleAction::DirPreviewClick);
     }
@@ -1406,7 +1411,12 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
                 .take(app.edit_cursor_col.min(raw_line.chars().count()))
                 .collect::<String>();
             let display_head = preview::expand_editor_tabs(&head);
-            let gutter_width = Span::raw(format!("{:>2} │ ", app.edit_cursor_row + 1)).width() as u16;
+            let gutter_digits = app.edit_buffer.len().max(1).to_string().len();
+            let gutter_width = Span::raw(format!(
+                "{:>width$}│ ",
+                app.edit_cursor_row + 1,
+                width = gutter_digits,
+            )).width() as u16;
             let cursor_x = editor_area.x
                 .saturating_add(gutter_width)
                 .saturating_add(Span::raw(display_head).width() as u16);

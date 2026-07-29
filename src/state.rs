@@ -190,6 +190,7 @@ pub enum ToggleAction {
     SortOrder,
     Details,
     SelectionStyle,
+    Hover,
 }
 
 pub struct AppTheme {
@@ -305,6 +306,7 @@ pub struct AppState {
     pub sort_descending:       bool,
     pub show_file_details:     bool,
     pub rounded_selection:     bool,
+    pub hover_enabled:         bool,
     pub search_active:         bool,
     pub search_query:          String,
     pub search_original_selection: Option<usize>,
@@ -348,6 +350,7 @@ pub struct AppState {
     pub context_menu_items:  Vec<ContextAction>,
     pub context_menu_hover:  Option<usize>,
     pub hovered_row:         Option<(usize, usize)>,
+    pending_event:           Option<Event>,
     pub pending_menu_pos:    (u16, u16),
 
     // Stable Properties target and non-blocking recursive folder totals.
@@ -395,6 +398,7 @@ impl AppState {
             sort_descending:       false,
             show_file_details:     false,
             rounded_selection:     false,
+            hover_enabled:         true,
             search_active:         false,
             search_query:          String::new(),
             search_original_selection: None,
@@ -426,6 +430,7 @@ impl AppState {
             context_menu_items: Vec::new(),
             context_menu_hover: None,
             hovered_row: None,
+            pending_event: None,
             pending_menu_pos: (0, 0),
             properties_path: None,
             properties_stats: None,
@@ -549,12 +554,19 @@ impl AppState {
     pub fn handle_events(&mut self) -> anyhow::Result<bool> {
         self.refresh_property_scan();
 
-        // Poll with timeout to prevent blocking forever
-        if !event::poll(Duration::from_millis(16))? {
-            return Ok(false);
-        }
+        // Preserve the first non-movement event found while coalescing pointer
+        // movement. This keeps keys/clicks lossless without replaying hundreds
+        // of stale Windows Terminal mouse coordinates.
+        let next_event = if let Some(pending) = self.pending_event.take() {
+            pending
+        } else {
+            if !event::poll(Duration::from_millis(16))? {
+                return Ok(false);
+            }
+            event::read()?
+        };
 
-        match event::read()? {
+        match next_event {
             Event::Key(key) => {
                 // Only process KeyPress events — ignore KeyRelease/KeyRepeat.
                 // Critical on Windows: prevents double-triggering.
@@ -869,16 +881,32 @@ impl AppState {
                     _ => {}
                 }
             }
-            Event::Mouse(mouse) => {
+            Event::Mouse(mut mouse) => {
                 self.last_event_time = Instant::now();
                 match mouse.kind {
                     MouseEventKind::Moved => {
+                        // Mouse tracking can arrive much faster than a full TUI
+                        // frame. Render only the newest position and retain the
+                        // first meaningful event for the next iteration.
+                        while event::poll(Duration::ZERO)? {
+                            match event::read()? {
+                                Event::Mouse(next) if next.kind == MouseEventKind::Moved => {
+                                    mouse = next;
+                                }
+                                other => {
+                                    self.pending_event = Some(other);
+                                    break;
+                                }
+                            }
+                        }
                         let geo = self.layout_geometry.lock().clone();
-                        self.hovered_row = geo.row_rects.iter().find_map(|(pane_idx, rows)| {
-                            rows.iter()
-                                .find(|(_, rect)| point_in(mouse.column, mouse.row, rect))
-                                .map(|(file_idx, _)| (*pane_idx, *file_idx))
-                        });
+                        self.hovered_row = self.hover_enabled.then(|| {
+                            geo.row_rects.iter().find_map(|(pane_idx, rows)| {
+                                rows.iter()
+                                    .find(|(_, rect)| point_in(mouse.column, mouse.row, rect))
+                                    .map(|(file_idx, _)| (*pane_idx, *file_idx))
+                            })
+                        }).flatten();
                         if self.mode == AppMode::ContextMenu {
                             self.context_menu_hover = geo.context_menu_item_rects.iter()
                                 .position(|(rect, _)| point_in(mouse.column, mouse.row, rect));
@@ -2163,6 +2191,16 @@ impl AppState {
                 self.rounded_selection = !self.rounded_selection;
                 self.set_notice(
                     format!("Selection style: {}", if self.rounded_selection { "Pill" } else { "Flat" }),
+                    false,
+                );
+            }
+            ToggleAction::Hover => {
+                self.hover_enabled = !self.hover_enabled;
+                if !self.hover_enabled {
+                    self.hovered_row = None;
+                }
+                self.set_notice(
+                    format!("Pointer hover highlighting: {}", if self.hover_enabled { "ON" } else { "OFF" }),
                     false,
                 );
             }
