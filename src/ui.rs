@@ -1,4 +1,5 @@
 // ================= src/ui.rs =================
+#![allow(non_snake_case)]
 use ratatui::{
     Frame,
     layout::{Layout, Direction, Constraint, Rect},
@@ -9,28 +10,14 @@ use ratatui::{
 use crate::state::{AppState, AppMode, DirLevel, LayoutGeometry, ContextAction};
 use crate::preview::{self, PreviewContent};
 
-// ── Theme ────────────────────────────────────────────────────────────────────
-const C_ACCENT:   Color = Color::Rgb(65, 166, 166);   // calm, softer cyan focus accent
-const C_ACCENT2:  Color = Color::Rgb(137, 180, 250);  // soft blue
-const C_BG_PANEL: Color = Color::Rgb(24, 26, 34);
-const C_BORDER:   Color = Color::Rgb(38, 40, 50);    // subtle border
-const C_BORDER_LO:Color = Color::Rgb(28, 30, 37);    // blends into panel bg
-const C_TEXT:     Color = Color::Rgb(214, 218, 230);
-const C_TEXT_SOFT:Color = Color::Rgb(160, 166, 185);  // softer grey for preview body text
-const C_MUTED:    Color = Color::Rgb(120, 126, 145);
-const C_WARN:     Color = Color::Rgb(240, 198, 116);
-const C_OK:       Color = Color::Rgb(137, 220, 165);
-const C_ERR:      Color = Color::Rgb(240, 120, 120);
-const C_SEL_BG:   Color = Color::Rgb(32, 64, 66);    // soft background selection highlight
-const C_SEL_BG_INACTIVE: Color = Color::Rgb(40, 42, 52);
-const C_MARK:     Color = Color::Rgb(210, 160, 90);
-const C_FOLDER:   Color = Color::Rgb(229, 192, 123);  // VS Code yellow/gold folder
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Top-level draw
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub fn draw(f: &mut Frame, app: &AppState) {
+    let t = app.theme();
+    let C_BORDER_LO = t.border_lo;
+
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -46,6 +33,11 @@ pub fn draw(f: &mut Frame, app: &AppState) {
     geo.row_rects.clear();
     geo.divider_rects.clear();
     geo.sidebar_item_rects.clear();
+    geo.toggle_rects.clear();
+    geo.preview_dir_item_rects.clear();
+    geo.edit_save_btn_rect = None;
+    geo.slide_prev_rect = None;
+    geo.slide_next_rect = None;
     geo.breadcrumb_segment_rects.clear();
     geo.context_menu_item_rects.clear();
     geo.context_menu_rect = None;
@@ -67,7 +59,7 @@ pub fn draw(f: &mut Frame, app: &AppState) {
         geo.sidebar_rect = body[0];
         geo.sidebar_divider_rect = body[1];
         draw_sidebar(f, app, body[0], &mut geo);
-        draw_vertical_divider(f, body[1]);
+        draw_vertical_divider(f, body[1], C_BORDER_LO);
     } else {
         geo.sidebar_rect = Rect::default();
         geo.sidebar_divider_rect = Rect::default();
@@ -98,20 +90,31 @@ pub fn draw(f: &mut Frame, app: &AppState) {
     }
 }
 
-fn draw_vertical_divider(f: &mut Frame, area: Rect) {
+fn draw_vertical_divider(f: &mut Frame, area: Rect, border_color: Color) {
     for y in area.y..area.y + area.height {
         f.render_widget(
-            Paragraph::new(Span::styled("│", Style::default().fg(C_BORDER_LO))),
+            Paragraph::new(Span::styled("│", Style::default().fg(border_color))),
             Rect { x: area.x, y, width: 1, height: 1 },
         );
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Left sidebar: Quick Access + Drives (click to navigate)
+// Left sidebar: Quick Access + Drives + Toggles
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeometry) {
+    let t = app.theme();
+    let C_ACCENT = t.accent;
+    let C_ACCENT2 = t.accent2;
+    let C_BG_PANEL = t.bg_panel;
+    let C_BORDER_LO = t.border_lo;
+    let C_TEXT = t.text;
+    let C_MUTED = t.muted;
+    let C_WARN = t.warn;
+    let C_OK = t.ok;
+    let C_ERR = t.err;
+
     let block = Block::default()
         .title(" DRIVES & LOCATIONS ")
         .title_style(Style::default().fg(C_MUTED).add_modifier(Modifier::BOLD))
@@ -172,8 +175,8 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
             Some(path.clone()));
     }
 
-    // Increased spacing between sections
-    y += 2;
+    // Spacing between sections
+    y += 1;
     push_line(f, geo, inner, &mut y, max_y,
         Line::from(Span::styled("  DRIVES", Style::default().fg(C_MUTED).add_modifier(Modifier::BOLD))), None);
 
@@ -226,6 +229,47 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
                 None);
         }
     }
+
+    // ── TOGGLES & SETTINGS (in the empty space below Drives) ─────────────
+    if y + 5 <= max_y {
+        y += 1;
+        push_line(f, geo, inner, &mut y, max_y,
+            Line::from(Span::styled("  TOGGLES & SETTINGS", Style::default().fg(C_MUTED).add_modifier(Modifier::BOLD))), None);
+
+        let draw_toggle = |f: &mut Frame, geo: &mut LayoutGeometry, y: &mut u16, icon: &'static str, label: &'static str, opt1: &'static str, opt2: &'static str, is_opt2: bool, action: crate::state::ToggleAction| {
+            if *y >= max_y { return; }
+            let rect = Rect { x: inner.x, y: *y, width: inner.width, height: 1 };
+            
+            let label_span = Span::styled(format!("  {} {:<9}", icon, label), Style::default().fg(C_TEXT));
+            let badge1_style = if !is_opt2 {
+                Style::default().fg(Color::Black).bg(C_ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(C_MUTED).bg(t.sel_bg_inactive)
+            };
+            let badge2_style = if is_opt2 {
+                Style::default().fg(Color::Black).bg(C_ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(C_MUTED).bg(t.sel_bg_inactive)
+            };
+
+            let line = Line::from(vec![
+                label_span,
+                Span::styled(format!(" {} ", opt1), badge1_style),
+                Span::styled(" ", Style::default()),
+                Span::styled(format!(" {} ", opt2), badge2_style),
+            ]);
+
+            f.render_widget(Paragraph::new(line), rect);
+            geo.toggle_rects.push((rect, action));
+            *y += 1;
+        };
+
+        draw_toggle(f, geo, &mut y, "🎨", "Theme", "Dark", "Light", app.theme_mode == crate::state::ThemeMode::Light, crate::state::ToggleAction::Theme);
+        draw_toggle(f, geo, &mut y, "📊", "Office", "Text", "Full", app.office_mode == crate::state::OfficeRenderMode::Full, crate::state::ToggleAction::OfficeMode);
+        draw_toggle(f, geo, &mut y, "📄", "PDF", "Text", "Visual", app.pdf_mode == crate::state::PdfRenderMode::Visual, crate::state::ToggleAction::PdfMode);
+        draw_toggle(f, geo, &mut y, "✏️", "Edit", "Off", "On", app.edit_preview_mode, crate::state::ToggleAction::EditMode);
+        draw_toggle(f, geo, &mut y, "📂", "DirClick", "Off", "On", app.dir_preview_clickable, crate::state::ToggleAction::DirPreviewClick);
+    }
 }
 
 /// Renders one sidebar row at the current `y` cursor, advances it, and
@@ -267,6 +311,11 @@ fn truncate(s: &str, max: usize) -> String {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn draw_input_modal(f: &mut Frame, app: &AppState) {
+    let t = app.theme();
+    let C_ACCENT = t.accent;
+    let C_ACCENT2 = t.accent2;
+    let C_TEXT = t.text;
+
     let title = if app.mode == AppMode::Rename { " Rename " } else { " New Folder " };
     let term_size = f.size();
 
@@ -287,7 +336,7 @@ fn draw_input_modal(f: &mut Frame, app: &AppState) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(C_ACCENT))
-        .style(Style::default().bg(Color::Rgb(28, 30, 38)));
+        .style(Style::default().bg(t.bg_panel));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -318,6 +367,11 @@ fn draw_input_modal(f: &mut Frame, app: &AppState) {
 }
 
 fn draw_confirm_modal(f: &mut Frame, app: &AppState) {
+    let t = app.theme();
+    let C_TEXT = t.text;
+    let C_MUTED = t.muted;
+    let C_ERR = t.err;
+
     let permanent = app.mode == AppMode::ConfirmDeletePermanent;
     let n = app.selected_paths().len().max(1);
     let title = if permanent { " Permanently Delete " } else { " Delete " };
@@ -341,7 +395,7 @@ fn draw_confirm_modal(f: &mut Frame, app: &AppState) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(C_ERR))
-        .style(Style::default().bg(Color::Rgb(28, 30, 38)));
+        .style(Style::default().bg(t.bg_panel));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let text = vec![
@@ -358,6 +412,13 @@ fn draw_confirm_modal(f: &mut Frame, app: &AppState) {
 }
 
 fn draw_properties_modal(f: &mut Frame, app: &AppState) {
+    let t = app.theme();
+    let C_ACCENT = t.accent;
+    let C_TEXT = t.text;
+    let C_MUTED = t.muted;
+    let C_WARN = t.warn;
+    let C_ERR = t.err;
+
     let Some(path) = app.selected_file().or_else(|| {
         let cur = app.current();
         if cur.files.is_empty() { None } else { Some(cur.files[cur.selected].path.clone()) }
@@ -377,7 +438,7 @@ fn draw_properties_modal(f: &mut Frame, app: &AppState) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(C_ACCENT))
-        .style(Style::default().bg(Color::Rgb(28, 30, 38)));
+        .style(Style::default().bg(t.bg_panel));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -446,6 +507,11 @@ fn format_epoch(secs: u64) -> String {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn draw_context_menu(f: &mut Frame, app: &AppState, geo: &mut LayoutGeometry) {
+    let t = app.theme();
+    let C_ACCENT = t.accent;
+    let C_TEXT = t.text;
+    let C_ERR = t.err;
+
     let items = &app.context_menu_items;
     if items.is_empty() { return; }
 
@@ -465,7 +531,7 @@ fn draw_context_menu(f: &mut Frame, app: &AppState, geo: &mut LayoutGeometry) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(C_ACCENT))
-        .style(Style::default().bg(Color::Rgb(30, 32, 40)));
+        .style(Style::default().bg(t.bg_panel));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -478,7 +544,7 @@ fn draw_context_menu(f: &mut Frame, app: &AppState, geo: &mut LayoutGeometry) {
         let (fg, bg) = if is_hovered {
             (Color::Black, C_ACCENT)
         } else {
-            (base_fg, Color::Rgb(30, 32, 40))
+            (base_fg, t.bg_panel)
         };
 
         let label_text = format!(" {}", action.label());
@@ -499,6 +565,12 @@ fn draw_context_menu(f: &mut Frame, app: &AppState, geo: &mut LayoutGeometry) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn draw_breadcrumb(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeometry) {
+    let t = app.theme();
+    let C_ACCENT = t.accent;
+    let C_TEXT = t.text;
+    let C_MUTED = t.muted;
+    let C_WARN = t.warn;
+
     let path = app.current().path.clone();
     let path_str = path.display().to_string();
 
@@ -613,13 +685,13 @@ fn draw_panes(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeometr
 
     for (i, level) in panes.iter().enumerate() {
         geo.pane_rects.push(chunks[i]);
-        draw_dir_pane(f, level, (start + i) == app.current_level, chunks[i], geo, (start + i) - start);
+        draw_dir_pane(f, app, level, (start + i) == app.current_level, chunks[i], geo, (start + i) - start);
     }
 
     if has_preview {
         if let Some(current) = panes.last() {
             geo.preview_rect = Some(chunks[np]);
-            draw_preview_pane(f, app, current, chunks[np]);
+            draw_preview_pane(f, app, current, chunks[np], geo);
         }
     }
 }
@@ -628,7 +700,18 @@ fn draw_panes(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeometr
 // Directory column pane
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn draw_dir_pane(f: &mut Frame, level: &DirLevel, is_current: bool, area: Rect, geo: &mut LayoutGeometry, pane_idx: usize) {
+fn draw_dir_pane(f: &mut Frame, app: &AppState, level: &DirLevel, is_current: bool, area: Rect, geo: &mut LayoutGeometry, pane_idx: usize) {
+    let t = app.theme();
+    let C_ACCENT = t.accent;
+    let C_ACCENT2 = t.accent2;
+    let C_BORDER = t.border;
+    let C_TEXT = t.text;
+    let C_MUTED = t.muted;
+    let C_SEL_BG = t.sel_bg;
+    let C_SEL_BG_INACTIVE = t.sel_bg_inactive;
+    let C_MARK = t.mark;
+    let C_FOLDER = t.folder;
+
     let path_str = level.path.display().to_string();
     let title = if path_str == "\\\\drives" {
         "Drives".to_string()
@@ -765,7 +848,18 @@ fn draw_dir_pane(f: &mut Frame, level: &DirLevel, is_current: bool, area: Rect, 
 // Preview pane
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect) {
+fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect, geo: &mut LayoutGeometry) {
+    let t = app.theme();
+    let C_ACCENT = t.accent;
+    let C_BORDER = t.border;
+    let C_BORDER_LO = t.border_lo;
+    let C_TEXT = t.text;
+    let C_TEXT_SOFT = t.text_soft;
+    let C_MUTED = t.muted;
+    let C_WARN = t.warn;
+    let C_OK = t.ok;
+    let C_FOLDER = t.folder;
+
     if level.files.is_empty() {
         app.native_preview.hide();
         f.render_widget(
@@ -790,9 +884,9 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
 
         let dir_name = selected.path.file_name().unwrap_or_default().to_string_lossy().to_string();
         let stats_title = if img_count > 0 {
-            format!(" {} │ {} dirs  {} files  {} imgs ", dir_name, dir_count, file_count, img_count)
+            format!(" {} │ {} dirs  {} files  {} imgs (Clickable) ", dir_name, dir_count, file_count, img_count)
         } else {
-            format!(" {} │ {} dirs  {} files ", dir_name, dir_count, file_count)
+            format!(" {} │ {} dirs  {} files (Clickable) ", dir_name, dir_count, file_count)
         };
 
         let visible_h = area.height.saturating_sub(2) as usize;
@@ -800,7 +894,8 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
 
         let items: Vec<ListItem> = children.iter()
             .take(visible_h)
-            .map(|p| {
+            .enumerate()
+            .map(|(i, p)| {
                 let raw = p.path.file_name().unwrap_or_else(|| p.path.as_os_str()).to_string_lossy();
                 let name = truncate(&raw, name_budget.max(4));
                 let folder_icon = get_icon_set().folder;
@@ -810,6 +905,15 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
                     let ext = p.path.extension().and_then(|s| s.to_str()).unwrap_or("");
                     file_icon(ext)
                 };
+
+                let row_rect = Rect {
+                    x: area.x + 1,
+                    y: area.y + 1 + i as u16,
+                    width: area.width.saturating_sub(2),
+                    height: 1,
+                };
+                geo.preview_dir_item_rects.push((row_rect, p.path.clone()));
+
                 ListItem::new(Line::from(vec![
                     Span::styled(icon, Style::default().fg(icon_color)),
                     Span::styled(" ", Style::default()),
@@ -839,6 +943,83 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
     let size_str = meta.as_ref().map(|m| preview::human_size(m.len())).unwrap_or_default();
     let ext = selected.path.extension().and_then(|s| s.to_str()).unwrap_or("").to_uppercase();
 
+    // ── Interactive Preview Editor Mode ───────────────────────────────────────
+    if app.edit_preview_mode {
+        app.native_preview.hide();
+        let title_text = if app.edit_dirty {
+            format!(" EDIT MODE │ {} * ", name)
+        } else {
+            format!(" EDIT MODE │ {} ", name)
+        };
+        let title_color = if app.edit_dirty { C_WARN } else { C_OK };
+        
+        let block = Block::default()
+            .title(title_text)
+            .title_style(Style::default().fg(title_color).add_modifier(Modifier::BOLD))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(title_color));
+            
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        // Header action button bar
+        let save_btn_text = if app.edit_dirty { " [ 💾 Save (Ctrl+S) ] " } else { " [ Saved ] " };
+        let save_btn_style = if app.edit_dirty {
+            Style::default().fg(Color::Black).bg(C_OK).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(C_MUTED)
+        };
+        let save_btn_span = Span::styled(save_btn_text, save_btn_style);
+        let btn_w = save_btn_span.width() as u16;
+        let save_rect = Rect {
+            x: inner.x + inner.width.saturating_sub(btn_w + 1),
+            y: inner.y,
+            width: btn_w,
+            height: 1,
+        };
+        geo.edit_save_btn_rect = Some(save_rect);
+
+        let editor_area = Rect {
+            x: inner.x,
+            y: inner.y + 1,
+            width: inner.width,
+            height: inner.height.saturating_sub(1),
+        };
+
+        // Render buffer text with line numbers and active cursor caret
+        let mut lines = Vec::new();
+        let scroll = app.preview_scroll;
+        let visible_height = editor_area.height as usize;
+        
+        for (i, raw_line) in app.edit_buffer.iter().enumerate().skip(scroll).take(visible_height) {
+            let line_num_span = Span::styled(format!("{:>4} │ ", i + 1), Style::default().fg(C_MUTED));
+            if i == app.edit_cursor_row {
+                let chars: Vec<char> = raw_line.chars().collect();
+                let col = app.edit_cursor_col.min(chars.len());
+                let (head, tail) = chars.split_at(col);
+                let head_str: String = head.iter().collect();
+                let tail_str: String = tail.iter().collect();
+                let line_spans = vec![
+                    line_num_span,
+                    Span::styled(head_str, Style::default().fg(C_TEXT)),
+                    Span::styled("│", Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD | Modifier::RAPID_BLINK)),
+                    Span::styled(tail_str, Style::default().fg(C_TEXT)),
+                ];
+                lines.push(Line::from(line_spans));
+            } else {
+                lines.push(Line::from(vec![
+                    line_num_span,
+                    Span::styled(raw_line.clone(), Style::default().fg(C_TEXT)),
+                ]));
+            }
+        }
+
+        f.render_widget(Paragraph::new(Text::from(lines)), editor_area);
+        f.render_widget(Paragraph::new(Line::from(save_btn_span)), save_rect);
+        return;
+    }
+
     let title = if app.mode != AppMode::Normal {
         " PREVIEW │ mode active (Esc to cancel) ".to_string()
     } else {
@@ -857,7 +1038,7 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
 
     let scroll = app.preview_scroll as u16;
 
-    match preview::render(&selected.path, app.image_rotation, app.image_flip_h) {
+    match preview::render(&selected.path, app.image_rotation, app.image_flip_h, app.office_mode, app.pdf_mode, app.pptx_slide_index) {
         PreviewContent::Text(txt) => {
             app.native_preview.hide();
             let padded: Vec<String> = txt.lines().map(|line| format!("  {}", line)).collect();
@@ -1134,7 +1315,7 @@ fn file_icon(ext: &str) -> (&'static str, Color) {
     const MEDIA:   Color = Color::Rgb(250, 179, 135); // peach
     const ARCHIVE: Color = Color::Rgb(249, 226, 175); // yellow
     const BIN:     Color = Color::Rgb(243, 139, 168); // red
-    const PLAIN:   Color = C_MUTED;
+    const PLAIN:   Color = Color::Rgb(120, 126, 145);
 
     let set = get_icon_set();
     match ext.to_lowercase().as_str() {
@@ -1191,6 +1372,13 @@ fn file_icon(ext: &str) -> (&'static str, Color) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn draw_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
+    let t = app.theme();
+    let C_TEXT = t.text;
+    let C_MUTED = t.muted;
+    let C_WARN = t.warn;
+    let C_OK = t.ok;
+    let C_ERR = t.err;
+
     if let Some((msg, is_err)) = app.active_notice() {
         let style = if is_err {
             Style::default().fg(Color::White).bg(C_ERR).add_modifier(Modifier::BOLD)

@@ -109,6 +109,96 @@ impl ContextAction {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ThemeMode {
+    Dark,
+    Light,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OfficeRenderMode {
+    Text,
+    Full,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PdfRenderMode {
+    Text,
+    Visual,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ToggleAction {
+    Theme,
+    OfficeMode,
+    PdfMode,
+    EditMode,
+    DirPreviewClick,
+}
+
+pub struct AppTheme {
+    pub bg_panel: ratatui::style::Color,
+    pub bg_root: ratatui::style::Color,
+    pub border: ratatui::style::Color,
+    pub border_lo: ratatui::style::Color,
+    pub text: ratatui::style::Color,
+    pub text_soft: ratatui::style::Color,
+    pub muted: ratatui::style::Color,
+    pub accent: ratatui::style::Color,
+    pub accent2: ratatui::style::Color,
+    pub sel_bg: ratatui::style::Color,
+    pub sel_bg_inactive: ratatui::style::Color,
+    pub folder: ratatui::style::Color,
+    pub ok: ratatui::style::Color,
+    pub warn: ratatui::style::Color,
+    pub err: ratatui::style::Color,
+    pub mark: ratatui::style::Color,
+}
+
+impl AppTheme {
+    pub fn dark() -> Self {
+        Self {
+            bg_panel: ratatui::style::Color::Rgb(24, 26, 34),
+            bg_root: ratatui::style::Color::Rgb(18, 20, 26),
+            border: ratatui::style::Color::Rgb(38, 40, 50),
+            border_lo: ratatui::style::Color::Rgb(28, 30, 37),
+            text: ratatui::style::Color::Rgb(214, 218, 230),
+            text_soft: ratatui::style::Color::Rgb(160, 166, 185),
+            muted: ratatui::style::Color::Rgb(120, 126, 145),
+            accent: ratatui::style::Color::Rgb(65, 166, 166),
+            accent2: ratatui::style::Color::Rgb(137, 180, 250),
+            sel_bg: ratatui::style::Color::Rgb(32, 64, 66),
+            sel_bg_inactive: ratatui::style::Color::Rgb(40, 42, 52),
+            folder: ratatui::style::Color::Rgb(229, 192, 123),
+            ok: ratatui::style::Color::Rgb(137, 220, 165),
+            warn: ratatui::style::Color::Rgb(240, 198, 116),
+            err: ratatui::style::Color::Rgb(240, 120, 120),
+            mark: ratatui::style::Color::Rgb(210, 160, 90),
+        }
+    }
+
+    pub fn light() -> Self {
+        Self {
+            bg_panel: ratatui::style::Color::Rgb(245, 247, 250),
+            bg_root: ratatui::style::Color::Rgb(235, 238, 242),
+            border: ratatui::style::Color::Rgb(210, 215, 225),
+            border_lo: ratatui::style::Color::Rgb(225, 228, 235),
+            text: ratatui::style::Color::Rgb(30, 35, 45),
+            text_soft: ratatui::style::Color::Rgb(70, 80, 95),
+            muted: ratatui::style::Color::Rgb(120, 130, 145),
+            accent: ratatui::style::Color::Rgb(0, 122, 204),
+            accent2: ratatui::style::Color::Rgb(30, 144, 255),
+            sel_bg: ratatui::style::Color::Rgb(215, 232, 255),
+            sel_bg_inactive: ratatui::style::Color::Rgb(230, 236, 245),
+            folder: ratatui::style::Color::Rgb(218, 165, 32),
+            ok: ratatui::style::Color::Rgb(40, 160, 80),
+            warn: ratatui::style::Color::Rgb(210, 130, 20),
+            err: ratatui::style::Color::Rgb(220, 50, 50),
+            mark: ratatui::style::Color::Rgb(180, 100, 20),
+        }
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct LayoutGeometry {
     pub breadcrumb_rect: Rect,
@@ -123,6 +213,15 @@ pub struct LayoutGeometry {
     pub sidebar_rect: Rect,
     pub sidebar_item_rects: Vec<(Rect, PathBuf)>,
     pub sidebar_divider_rect: Rect,
+    pub toggle_rects: Vec<(Rect, ToggleAction)>,
+
+    // Clickable directory preview items
+    pub preview_dir_item_rects: Vec<(Rect, PathBuf)>,
+
+    // Preview editor & slide controls
+    pub edit_save_btn_rect: Option<Rect>,
+    pub slide_prev_rect: Option<Rect>,
+    pub slide_next_rect: Option<Rect>,
 
     // Clickable breadcrumb path segments
     pub breadcrumb_segment_rects: Vec<(Rect, PathBuf)>,
@@ -136,6 +235,21 @@ pub struct AppState {
     pub levels:        Vec<DirLevel>,
     pub current_level: usize,
     last_event_time:   Instant,
+
+    // Settings & Toggles
+    pub theme_mode:            ThemeMode,
+    pub office_mode:           OfficeRenderMode,
+    pub pdf_mode:              PdfRenderMode,
+    pub edit_preview_mode:     bool,
+    pub dir_preview_clickable: bool,
+    pub pptx_slide_index:      usize,
+
+    // Interactive Preview Editor state
+    pub edit_buffer:           Vec<String>,
+    pub edit_cursor_row:       usize,
+    pub edit_cursor_col:       usize,
+    pub edit_dirty:            bool,
+    pub edit_path:             Option<PathBuf>,
 
     // Preview interaction state
     pub mode:            AppMode,  // current application mode
@@ -199,6 +313,17 @@ impl AppState {
             levels:         vec![level],
             current_level:  0,
             last_event_time: Instant::now(),
+            theme_mode:            ThemeMode::Dark,
+            office_mode:           OfficeRenderMode::Text,
+            pdf_mode:              PdfRenderMode::Text,
+            edit_preview_mode:     false,
+            dir_preview_clickable: true,
+            pptx_slide_index:      0,
+            edit_buffer:           Vec::new(),
+            edit_cursor_row:       0,
+            edit_cursor_col:       0,
+            edit_dirty:            false,
+            edit_path:             None,
             mode:           AppMode::Normal,
             input_buffer:   String::new(),
             input_cursor:   0,
@@ -224,6 +349,13 @@ impl AppState {
             notice: None,
             native_preview: crate::native::NativePreviewManager::new(),
         })
+    }
+
+    pub fn theme(&self) -> AppTheme {
+        match self.theme_mode {
+            ThemeMode::Dark => AppTheme::dark(),
+            ThemeMode::Light => AppTheme::light(),
+        }
     }
 
     /// Re-scan drive list at most every 5s (used/free space can change).
@@ -281,6 +413,12 @@ impl AppState {
                 }
 
                 self.last_event_time = Instant::now();
+
+                if self.edit_preview_mode && self.mode == AppMode::Normal {
+                    if self.handle_edit_key(key.code, key.modifiers) {
+                        return Ok(false);
+                    }
+                }
 
                 match (key.code, key.modifiers) {
                     // ── Quit ────────────────────────────────────────────────
@@ -587,8 +725,63 @@ impl AppState {
                             return Ok(false);
                         }
 
-                        // ── Sidebar: drives / quick access ──
+                        // ── Settings Toggles ──
                         let mut handled = false;
+                        for (rect, action) in geo.toggle_rects.iter() {
+                            if point_in(mouse.column, mouse.row, rect) {
+                                self.toggle_setting(*action);
+                                handled = true;
+                                break;
+                            }
+                        }
+                        if handled { return Ok(false); }
+
+                        // ── Save button in Preview Editor ──
+                        if let Some(rect) = geo.edit_save_btn_rect {
+                            if point_in(mouse.column, mouse.row, &rect) {
+                                self.save_edited_preview();
+                                return Ok(false);
+                            }
+                        }
+
+                        // ── Slide Prev / Next in visual preview ──
+                        if let Some(rect) = geo.slide_prev_rect {
+                            if point_in(mouse.column, mouse.row, &rect) {
+                                self.pptx_slide_index = self.pptx_slide_index.saturating_sub(1);
+                                return Ok(false);
+                            }
+                        }
+                        if let Some(rect) = geo.slide_next_rect {
+                            if point_in(mouse.column, mouse.row, &rect) {
+                                self.pptx_slide_index = self.pptx_slide_index.saturating_add(1);
+                                return Ok(false);
+                            }
+                        }
+
+                        // ── Clickable Directory Preview Items ──
+                        if self.dir_preview_clickable {
+                            for (rect, path) in geo.preview_dir_item_rects.iter() {
+                                if point_in(mouse.column, mouse.row, rect) {
+                                    if path.is_dir() {
+                                        self.navigate_to(path);
+                                    } else if let Some(parent) = path.parent() {
+                                        let file_name = path.file_name();
+                                        self.navigate_to(parent);
+                                        if let Some(name) = file_name {
+                                            if let Some(cur) = self.levels.last_mut() {
+                                                if let Some(idx) = cur.files.iter().position(|f| f.path.file_name() == Some(name)) {
+                                                    cur.selected = idx;
+                                                    cur.select_anchor = idx;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    return Ok(false);
+                                }
+                            }
+                        }
+
+                        // ── Sidebar: drives / quick access ──
                         for (rect, path) in geo.sidebar_item_rects.iter() {
                             if point_in(mouse.column, mouse.row, rect) {
                                 self.navigate_to(path);
@@ -1407,6 +1600,213 @@ impl AppState {
         }
         #[cfg(not(windows))]
         { let _ = path; }
+    }
+
+    pub fn toggle_setting(&mut self, action: ToggleAction) {
+        match action {
+            ToggleAction::Theme => {
+                self.theme_mode = match self.theme_mode {
+                    ThemeMode::Dark => ThemeMode::Light,
+                    ThemeMode::Light => ThemeMode::Dark,
+                };
+                self.set_notice(format!("Theme: {}", if self.theme_mode == ThemeMode::Dark { "Dark Mode" } else { "Light Mode" }), false);
+            }
+            ToggleAction::OfficeMode => {
+                self.office_mode = match self.office_mode {
+                    OfficeRenderMode::Text => OfficeRenderMode::Full,
+                    OfficeRenderMode::Full => OfficeRenderMode::Text,
+                };
+                self.set_notice(format!("Office mode: {}", if self.office_mode == OfficeRenderMode::Text { "Text" } else { "Full (Visual)" }), false);
+            }
+            ToggleAction::PdfMode => {
+                self.pdf_mode = match self.pdf_mode {
+                    PdfRenderMode::Text => PdfRenderMode::Visual,
+                    PdfRenderMode::Visual => PdfRenderMode::Text,
+                };
+                self.set_notice(format!("PDF mode: {}", if self.pdf_mode == PdfRenderMode::Text { "Text" } else { "Visual" }), false);
+            }
+            ToggleAction::EditMode => {
+                self.edit_preview_mode = !self.edit_preview_mode;
+                if self.edit_preview_mode {
+                    self.sync_edit_buffer_with_selected();
+                }
+                self.set_notice(format!("Preview Edit Mode: {}", if self.edit_preview_mode { "ON" } else { "OFF" }), false);
+            }
+            ToggleAction::DirPreviewClick => {
+                self.dir_preview_clickable = !self.dir_preview_clickable;
+                self.set_notice(format!("Directory Preview Clickable: {}", if self.dir_preview_clickable { "ON" } else { "OFF" }), false);
+            }
+        }
+    }
+
+    pub fn sync_edit_buffer_with_selected(&mut self) {
+        if let Some(p) = self.selected_file() {
+            if p.is_file() {
+                if let Ok(content) = fs::read_to_string(&p) {
+                    self.edit_buffer = content.lines().map(|s| s.to_string()).collect();
+                    if self.edit_buffer.is_empty() {
+                        self.edit_buffer.push(String::new());
+                    }
+                    self.edit_cursor_row = 0;
+                    self.edit_cursor_col = 0;
+                    self.edit_dirty = false;
+                    self.edit_path = Some(p);
+                }
+            }
+        }
+    }
+
+    pub fn save_edited_preview(&mut self) {
+        if let Some(path) = &self.edit_path {
+            let text = self.edit_buffer.join("\n");
+            match fs::write(path, text) {
+                Ok(_) => {
+                    self.edit_dirty = false;
+                    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+                    self.set_notice(format!("✓ Saved {}", file_name), false);
+                }
+                Err(e) => {
+                    self.set_notice(format!("⚠ Failed to save: {}", e), true);
+                }
+            }
+        }
+    }
+
+    pub fn handle_edit_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        if !self.edit_preview_mode || self.edit_buffer.is_empty() {
+            return false;
+        }
+
+        if modifiers.contains(KeyModifiers::CONTROL) {
+            if code == KeyCode::Char('s') || code == KeyCode::Char('S') {
+                self.save_edited_preview();
+                return true;
+            }
+        }
+
+        match code {
+            KeyCode::Char(c) if modifiers == KeyModifiers::NONE || modifiers == KeyModifiers::SHIFT => {
+                if self.edit_cursor_row < self.edit_buffer.len() {
+                    let line = &mut self.edit_buffer[self.edit_cursor_row];
+                    let idx = line.char_indices().nth(self.edit_cursor_col).map(|(i, _)| i).unwrap_or(line.len());
+                    line.insert(idx, c);
+                    self.edit_cursor_col += 1;
+                    self.edit_dirty = true;
+                    return true;
+                }
+            }
+            KeyCode::Enter => {
+                if self.edit_cursor_row < self.edit_buffer.len() {
+                    let line = self.edit_buffer[self.edit_cursor_row].clone();
+                    let idx = line.char_indices().nth(self.edit_cursor_col).map(|(i, _)| i).unwrap_or(line.len());
+                    let (head, tail) = line.split_at(idx);
+                    self.edit_buffer[self.edit_cursor_row] = head.to_string();
+                    self.edit_buffer.insert(self.edit_cursor_row + 1, tail.to_string());
+                    self.edit_cursor_row += 1;
+                    self.edit_cursor_col = 0;
+                    self.edit_dirty = true;
+                    return true;
+                }
+            }
+            KeyCode::Backspace => {
+                if self.edit_cursor_col > 0 {
+                    let line = &mut self.edit_buffer[self.edit_cursor_row];
+                    let idx = line.char_indices().nth(self.edit_cursor_col - 1).map(|(i, _)| i).unwrap_or(0);
+                    let end = line.char_indices().nth(self.edit_cursor_col).map(|(i, _)| i).unwrap_or(line.len());
+                    line.replace_range(idx..end, "");
+                    self.edit_cursor_col -= 1;
+                    self.edit_dirty = true;
+                    return true;
+                } else if self.edit_cursor_row > 0 {
+                    let curr = self.edit_buffer.remove(self.edit_cursor_row);
+                    self.edit_cursor_row -= 1;
+                    let prev = &mut self.edit_buffer[self.edit_cursor_row];
+                    self.edit_cursor_col = prev.chars().count();
+                    prev.push_str(&curr);
+                    self.edit_dirty = true;
+                    return true;
+                }
+            }
+            KeyCode::Delete => {
+                if self.edit_cursor_row < self.edit_buffer.len() {
+                    let len = self.edit_buffer[self.edit_cursor_row].chars().count();
+                    if self.edit_cursor_col < len {
+                        let line = &mut self.edit_buffer[self.edit_cursor_row];
+                        let idx = line.char_indices().nth(self.edit_cursor_col).map(|(i, _)| i).unwrap_or(0);
+                        let end = line.char_indices().nth(self.edit_cursor_col + 1).map(|(i, _)| i).unwrap_or(line.len());
+                        line.replace_range(idx..end, "");
+                        self.edit_dirty = true;
+                        return true;
+                    } else if self.edit_cursor_row + 1 < self.edit_buffer.len() {
+                        let next = self.edit_buffer.remove(self.edit_cursor_row + 1);
+                        self.edit_buffer[self.edit_cursor_row].push_str(&next);
+                        self.edit_dirty = true;
+                        return true;
+                    }
+                }
+            }
+            KeyCode::Up => {
+                if self.edit_cursor_row > 0 {
+                    self.edit_cursor_row -= 1;
+                    let len = self.edit_buffer[self.edit_cursor_row].chars().count();
+                    self.edit_cursor_col = self.edit_cursor_col.min(len);
+                    return true;
+                }
+            }
+            KeyCode::Down => {
+                if self.edit_cursor_row + 1 < self.edit_buffer.len() {
+                    self.edit_cursor_row += 1;
+                    let len = self.edit_buffer[self.edit_cursor_row].chars().count();
+                    self.edit_cursor_col = self.edit_cursor_col.min(len);
+                    return true;
+                }
+            }
+            KeyCode::Left => {
+                if self.edit_cursor_col > 0 {
+                    self.edit_cursor_col -= 1;
+                    return true;
+                } else if self.edit_cursor_row > 0 {
+                    self.edit_cursor_row -= 1;
+                    self.edit_cursor_col = self.edit_buffer[self.edit_cursor_row].chars().count();
+                    return true;
+                }
+            }
+            KeyCode::Right => {
+                if self.edit_cursor_row < self.edit_buffer.len() {
+                    let len = self.edit_buffer[self.edit_cursor_row].chars().count();
+                    if self.edit_cursor_col < len {
+                        self.edit_cursor_col += 1;
+                        return true;
+                    } else if self.edit_cursor_row + 1 < self.edit_buffer.len() {
+                        self.edit_cursor_row += 1;
+                        self.edit_cursor_col = 0;
+                        return true;
+                    }
+                }
+            }
+            KeyCode::Home => {
+                self.edit_cursor_col = 0;
+                return true;
+            }
+            KeyCode::End => {
+                if self.edit_cursor_row < self.edit_buffer.len() {
+                    self.edit_cursor_col = self.edit_buffer[self.edit_cursor_row].chars().count();
+                    return true;
+                }
+            }
+            KeyCode::Tab => {
+                if self.edit_cursor_row < self.edit_buffer.len() {
+                    let line = &mut self.edit_buffer[self.edit_cursor_row];
+                    let idx = line.char_indices().nth(self.edit_cursor_col).map(|(i, _)| i).unwrap_or(line.len());
+                    line.insert_str(idx, "    ");
+                    self.edit_cursor_col += 4;
+                    self.edit_dirty = true;
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        false
     }
 }
 

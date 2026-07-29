@@ -107,7 +107,14 @@ pub fn cached_list_dir(path: &PathBuf) -> Vec<crate::state::DirEntryInfo> {
 
 // ── Public render function ────────────────────────────────────────────────────
 
-pub fn render(p: &PathBuf, rotation: u32, flip_h: bool) -> PreviewContent {
+pub fn render(
+    p: &PathBuf,
+    rotation: u32,
+    flip_h: bool,
+    office_mode: crate::state::OfficeRenderMode,
+    pdf_mode: crate::state::PdfRenderMode,
+    slide_idx: usize,
+) -> PreviewContent {
     if p.is_dir() { return PreviewContent::Text(String::new()); }
 
     let ext = p.extension()
@@ -122,10 +129,10 @@ pub fn render(p: &PathBuf, rotation: u32, flip_h: bool) -> PreviewContent {
             => render_video(p),
         "mp3"|"flac"|"wav"|"ogg"|"aac"|"m4a"|"opus"|"wma"
             => render_audio(p),
-        "docx"|"doc"   => render_docx(p, rotation, flip_h),
-        "xlsx"|"xls"|"ods" => render_excel(p, rotation, flip_h),
-        "pptx"|"ppt"   => render_pptx(p, rotation, flip_h),
-        "pdf"           => render_pdf(p),
+        "docx"|"doc"   => render_docx(p, rotation, flip_h, office_mode),
+        "xlsx"|"xls"|"ods" => render_excel(p, rotation, flip_h, office_mode),
+        "pptx"|"ppt"   => render_pptx(p, rotation, flip_h, office_mode, slide_idx),
+        "pdf"           => render_pdf(p, pdf_mode),
         "rtf"           => render_rtf(p),
         "csv"|"tsv"     => render_csv(p),
         "ipynb"         => render_notebook(p),
@@ -731,7 +738,7 @@ where
     f()
 }
 
-fn render_pdf(p: &PathBuf) -> PreviewContent {
+fn render_pdf(p: &PathBuf, pdf_mode: crate::state::PdfRenderMode) -> PreviewContent {
     let mut lines = meta_header(p);
     match fs::read(p) {
         Ok(bytes) => {
@@ -749,7 +756,11 @@ fn render_pdf(p: &PathBuf) -> PreviewContent {
 
             match safe_parse(move || run_silenced(|| pdf_extract::extract_text_from_mem(&bytes))) {
                 Some(Ok(text)) => {
-                    lines.push(Line::from(Span::styled("📄  PDF Document", Style::default().fg(SH_FN))));
+                    let mode_badge = if pdf_mode == crate::state::PdfRenderMode::Text { " [Text Mode]" } else { " [Visual Mode]" };
+                    lines.push(Line::from(vec![
+                        Span::styled("📄  PDF Document", Style::default().fg(SH_FN)),
+                        Span::styled(mode_badge, Style::default().fg(SH_CMT)),
+                    ]));
                     lines.push(Line::from(Span::styled("─".repeat(50), Style::default().fg(SH_CMT))));
                     if text.trim().is_empty() {
                         lines.push(Line::from(Span::styled(
@@ -757,7 +768,7 @@ fn render_pdf(p: &PathBuf) -> PreviewContent {
                             Style::default().fg(SH_CMT)
                         )));
                     } else {
-                        for l in text.lines().filter(|l| !l.trim().is_empty()).take(300) {
+                        for l in text.lines().filter(|l| !l.trim().is_empty()) {
                             lines.push(highlight_document_line(l));
                         }
                     }
@@ -871,9 +882,11 @@ fn try_render_office_exact(p: &PathBuf, rotation: u32, flip_h: bool) -> Option<P
 
 // ── DOCX ──────────────────────────────────────────────────────────────────────
 
-fn render_docx(p: &PathBuf, rotation: u32, flip_h: bool) -> PreviewContent {
-    if let Some(content) = try_render_office_exact(p, rotation, flip_h) {
-        return content;
+fn render_docx(p: &PathBuf, rotation: u32, flip_h: bool, office_mode: crate::state::OfficeRenderMode) -> PreviewContent {
+    if office_mode == crate::state::OfficeRenderMode::Full {
+        if let Some(content) = try_render_office_exact(p, rotation, flip_h) {
+            return content;
+        }
     }
 
     let mut lines = meta_header(p);
@@ -913,11 +926,11 @@ fn render_docx(p: &PathBuf, rotation: u32, flip_h: bool) -> PreviewContent {
         }
     };
 
-    lines.push(Line::from(Span::styled("📘  Word Document (Text Fallback)", Style::default().fg(SH_FN))));
+    lines.push(Line::from(Span::styled("📘  Word Document (Text Mode)", Style::default().fg(SH_FN))));
     lines.push(Line::from(Span::styled("─".repeat(50), Style::default().fg(SH_CMT))));
     
     let mut last_was_empty = false;
-    for l in xml_text(&xml).trim().lines().take(300) {
+    for l in xml_text(&xml).trim().lines() {
         let is_empty = l.trim().is_empty();
         if is_empty {
             if last_was_empty { continue; }
@@ -933,9 +946,17 @@ fn render_docx(p: &PathBuf, rotation: u32, flip_h: bool) -> PreviewContent {
 
 // ── PPTX ──────────────────────────────────────────────────────────────────────
 
-fn render_pptx(p: &PathBuf, rotation: u32, flip_h: bool) -> PreviewContent {
-    if let Some(content) = try_render_office_exact(p, rotation, flip_h) {
-        return content;
+fn render_pptx(
+    p: &PathBuf,
+    rotation: u32,
+    flip_h: bool,
+    office_mode: crate::state::OfficeRenderMode,
+    _slide_idx: usize,
+) -> PreviewContent {
+    if office_mode == crate::state::OfficeRenderMode::Full {
+        if let Some(content) = try_render_office_exact(p, rotation, flip_h) {
+            return content;
+        }
     }
 
     let mut lines = meta_header(p);
@@ -947,7 +968,7 @@ fn render_pptx(p: &PathBuf, rotation: u32, flip_h: bool) -> PreviewContent {
         }
     };
 
-    lines.push(Line::from(Span::styled("📊  PowerPoint (Text Fallback)", Style::default().fg(SH_FN))));
+    lines.push(Line::from(Span::styled("📊  PowerPoint Presentation (Text Mode)", Style::default().fg(SH_FN))));
     lines.push(Line::from(Span::styled("─".repeat(50), Style::default().fg(SH_CMT))));
 
     let slides: Option<Vec<(u32, String)>> = safe_parse(move || {
@@ -956,7 +977,7 @@ fn render_pptx(p: &PathBuf, rotation: u32, flip_h: bool) -> PreviewContent {
             Err(_) => return Vec::new(),
         };
         let mut out = Vec::new();
-        for slide_n in 1..=50u32 {
+        for slide_n in 1..=100u32 {
             let name = format!("ppt/slides/slide{}.xml", slide_n);
             let mut xml = String::new();
             let found = (0..archive.len()).any(|i| {
@@ -978,14 +999,28 @@ fn render_pptx(p: &PathBuf, rotation: u32, flip_h: bool) -> PreviewContent {
         return PreviewContent::Highlighted(lines);
     };
 
+    if slides.is_empty() {
+        lines.push(Line::from(Span::styled("  Empty presentation", Style::default().fg(SH_CMT))));
+        return PreviewContent::Highlighted(lines);
+    }
+
     for (slide_n, xml) in slides {
+        lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            format!("── Slide {} ", slide_n), Style::default().fg(SH_TYPE)
+            format!("── Slide {} ──────────────────────────────", slide_n), Style::default().fg(SH_TYPE).add_modifier(Modifier::BOLD)
         )));
-        for l in xml_text(&xml).trim().lines().take(10) {
-            if !l.trim().is_empty() {
-                lines.push(highlight_document_line(l));
+        lines.push(Line::from(""));
+        let extracted_text = xml_text(&xml);
+        let mut slide_has_text = false;
+        for l in extracted_text.lines() {
+            let trimmed = l.trim();
+            if !trimmed.is_empty() {
+                lines.push(highlight_document_line(trimmed));
+                slide_has_text = true;
             }
+        }
+        if !slide_has_text {
+            lines.push(Line::from(Span::styled("  (Slide content visual only)", Style::default().fg(SH_CMT))));
         }
     }
     PreviewContent::Highlighted(lines)
@@ -993,9 +1028,11 @@ fn render_pptx(p: &PathBuf, rotation: u32, flip_h: bool) -> PreviewContent {
 
 // ── Excel ─────────────────────────────────────────────────────────────────────
 
-fn render_excel(p: &PathBuf, rotation: u32, flip_h: bool) -> PreviewContent {
-    if let Some(content) = try_render_office_exact(p, rotation, flip_h) {
-        return content;
+fn render_excel(p: &PathBuf, rotation: u32, flip_h: bool, office_mode: crate::state::OfficeRenderMode) -> PreviewContent {
+    if office_mode == crate::state::OfficeRenderMode::Full {
+        if let Some(content) = try_render_office_exact(p, rotation, flip_h) {
+            return content;
+        }
     }
 
     use calamine::{Reader, open_workbook_auto};

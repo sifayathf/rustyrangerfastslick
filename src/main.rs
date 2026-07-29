@@ -29,9 +29,9 @@ const FONT_SIZE: u32 = 9;
 fn try_relaunch_in_wt_profile() -> bool {
     use std::path::PathBuf;
 
-    // If --launched flag is present, we're already in the right profile
+    // Only relaunch into a dedicated WT profile if explicitly requested with --wt flag
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--launched") {
+    if !args.iter().any(|a| a == "--wt") {
         return false;
     }
 
@@ -151,6 +151,14 @@ fn try_relaunch_in_wt_profile() -> bool {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Install panic hook to ensure terminal state is always restored
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        default_hook(info);
+    }));
+
     // Try to relaunch in a dedicated Windows Terminal profile with the right font
     #[cfg(windows)]
     {
