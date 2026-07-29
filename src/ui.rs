@@ -10,6 +10,11 @@ use ratatui::{
 use crate::state::{AppState, AppMode, DirLevel, LayoutGeometry, ContextAction, SortMode, ThemeMode};
 use crate::preview::{self, PreviewContent};
 
+// A one-cell terminal pill needs the filled half of each cap to touch the
+// label background. Reversing these creates two detached dots.
+const PILL_LEFT_CAP: &str = "◗";
+const PILL_RIGHT_CAP: &str = "◖";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Top-level draw
 // ─────────────────────────────────────────────────────────────────────────────
@@ -184,11 +189,11 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
                 };
                 f.render_widget(Paragraph::new("").style(text_style), body);
                 f.render_widget(
-                    Paragraph::new(Span::styled("◖", Style::default().fg(C_ACCENT).bg(t.bg_panel))),
+                    Paragraph::new(Span::styled(PILL_LEFT_CAP, Style::default().fg(C_ACCENT).bg(t.bg_panel))),
                     Rect { x: row_rect.x, y, width: 1, height: 1 },
                 );
                 f.render_widget(
-                    Paragraph::new(Span::styled("◗", Style::default().fg(C_ACCENT).bg(t.bg_panel))),
+                    Paragraph::new(Span::styled(PILL_RIGHT_CAP, Style::default().fg(C_ACCENT).bg(t.bg_panel))),
                     Rect {
                         x: row_rect.x.saturating_add(row_rect.width.saturating_sub(1)),
                         y,
@@ -305,8 +310,8 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
                     Style::default().bg(color)
                 }
             };
-            let left_cap = if app.rounded_selection { "◖" } else { " " };
-            let right_cap = if app.rounded_selection { "◗" } else { " " };
+            let left_cap = if app.rounded_selection { PILL_LEFT_CAP } else { " " };
+            let right_cap = if app.rounded_selection { PILL_RIGHT_CAP } else { " " };
 
             let line = Line::from(vec![
                 label_span,
@@ -337,8 +342,8 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
             } else {
                 Style::default().bg(outer_color)
             };
-            let left_cap = if app.rounded_selection { "◖" } else { " " };
-            let right_cap = if app.rounded_selection { "◗" } else { " " };
+            let left_cap = if app.rounded_selection { PILL_LEFT_CAP } else { " " };
+            let right_cap = if app.rounded_selection { PILL_RIGHT_CAP } else { " " };
             let mut spans = vec![prefix, Span::styled(left_cap, outer_style)];
             click_x = click_x.saturating_add(1);
             for (label, mode, action) in [
@@ -368,7 +373,7 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
         }
         draw_toggle(f, geo, &mut y, "↕", "Order", "Asc", "Desc", app.sort_descending, crate::state::ToggleAction::SortOrder);
         draw_toggle(f, geo, &mut y, "🕒", "Details", "Off", "On", app.show_file_details, crate::state::ToggleAction::Details);
-        draw_toggle(f, geo, &mut y, "◖", "Shape", "Flat", "Pill", app.rounded_selection, crate::state::ToggleAction::SelectionStyle);
+        draw_toggle(f, geo, &mut y, "●", "Shape", "Flat", "Pill", app.rounded_selection, crate::state::ToggleAction::SelectionStyle);
         draw_toggle(f, geo, &mut y, "B", "Font", "Reg", "Bold", app.bold_ui, crate::state::ToggleAction::FontWeight);
         draw_toggle(f, geo, &mut y, "◉", "Hover", "Off", "On", app.hover_enabled, crate::state::ToggleAction::Hover);
         draw_toggle(f, geo, &mut y, "✏️", "Edit", "Off", "On", app.edit_preview_mode, crate::state::ToggleAction::EditMode);
@@ -1139,7 +1144,7 @@ fn draw_dir_pane(f: &mut Frame, app: &AppState, level: &DirLevel, is_current: bo
                 
                 let mut spans = Vec::new();
                 if app.rounded_selection {
-                    spans.push(Span::styled("◖", Style::default().fg(bg).bg(t.bg_panel)));
+                    spans.push(Span::styled(PILL_LEFT_CAP, Style::default().fg(bg).bg(t.bg_panel)));
                 } else {
                     spans.push(Span::styled(" ", Style::default().bg(bg)));
                 }
@@ -1154,7 +1159,7 @@ fn draw_dir_pane(f: &mut Frame, app: &AppState, level: &DirLevel, is_current: bo
                     spans.push(Span::styled(details, Style::default().fg(C_MUTED).bg(bg)));
                 }
                 if app.rounded_selection {
-                    spans.push(Span::styled("◗", Style::default().fg(bg).bg(t.bg_panel)));
+                    spans.push(Span::styled(PILL_RIGHT_CAP, Style::default().fg(bg).bg(t.bg_panel)));
                 } else {
                     spans.push(Span::styled(" ", Style::default().bg(bg)));
                 }
@@ -1165,7 +1170,7 @@ fn draw_dir_pane(f: &mut Frame, app: &AppState, level: &DirLevel, is_current: bo
                 let used = icon_span.width() + 1 + Span::raw(shown_name.as_str()).width()
                     + details_width + usize::from(!details.is_empty());
                 let mut spans = vec![if app.rounded_selection {
-                    Span::styled("◖", Style::default().fg(bg).bg(t.bg_panel))
+                    Span::styled(PILL_LEFT_CAP, Style::default().fg(bg).bg(t.bg_panel))
                 } else {
                     Span::styled(" ", Style::default().bg(bg))
                 },
@@ -1179,7 +1184,7 @@ fn draw_dir_pane(f: &mut Frame, app: &AppState, level: &DirLevel, is_current: bo
                     spans.push(Span::styled(details, Style::default().fg(C_MUTED).bg(bg)));
                 }
                 spans.push(if app.rounded_selection {
-                    Span::styled("◗", Style::default().fg(bg).bg(t.bg_panel))
+                    Span::styled(PILL_RIGHT_CAP, Style::default().fg(bg).bg(t.bg_panel))
                 } else {
                     Span::styled(" ", Style::default().bg(bg))
                 });
@@ -1979,4 +1984,14 @@ fn draw_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
     spans.push(Span::styled(" quit", label_style));
 
     f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(bg)), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PILL_LEFT_CAP, PILL_RIGHT_CAP};
+
+    #[test]
+    fn pill_caps_join_the_label_instead_of_pointing_outward() {
+        assert_eq!(format!("{PILL_LEFT_CAP}value{PILL_RIGHT_CAP}"), "◗value◖");
+    }
 }
