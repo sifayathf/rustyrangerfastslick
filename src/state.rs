@@ -189,6 +189,7 @@ pub enum ToggleAction {
     SortSize,
     SortOrder,
     Details,
+    SelectionStyle,
 }
 
 pub struct AppTheme {
@@ -281,6 +282,7 @@ pub struct LayoutGeometry {
     // Clickable breadcrumb path segments
     pub breadcrumb_segment_rects: Vec<(Rect, PathBuf)>,
     pub search_rect: Option<Rect>,
+    pub pane_sort_rect: Option<Rect>,
 
     // Right-click context menu
     pub context_menu_rect: Option<Rect>,
@@ -302,6 +304,7 @@ pub struct AppState {
     pub sort_mode:             SortMode,
     pub sort_descending:       bool,
     pub show_file_details:     bool,
+    pub rounded_selection:     bool,
     pub search_active:         bool,
     pub search_query:          String,
     pub search_original_selection: Option<usize>,
@@ -390,6 +393,7 @@ impl AppState {
             sort_mode:             SortMode::Name,
             sort_descending:       false,
             show_file_details:     false,
+            rounded_selection:     false,
             search_active:         false,
             search_query:          String::new(),
             search_original_selection: None,
@@ -1018,6 +1022,11 @@ impl AppState {
                         }
                         if handled { return Ok(false); }
 
+                        if geo.pane_sort_rect.as_ref().is_some_and(|rect| point_in(mouse.column, mouse.row, rect)) {
+                            self.select_sort_mode(self.sort_mode);
+                            return Ok(false);
+                        }
+
                         // ── Divider drag ──
                         for (idx, dr) in geo.divider_rects.iter().enumerate() {
                             if point_in(mouse.column, mouse.row, dr) {
@@ -1146,6 +1155,10 @@ impl AppState {
         }
         for (idx, pr) in geo.pane_rects.iter().enumerate() {
             if point_in(col, row, pr) {
+                if self.search_active && !self.search_query.is_empty() && idx + 1 == geo.pane_rects.len() {
+                    self.select_next_search_match(down);
+                    return;
+                }
                 let num = self.levels.len();
                 let start = if num > 4 { num - 4 } else { 0 };
                 let real_idx = start + idx;
@@ -1496,12 +1509,8 @@ impl AppState {
         if self.search_query.is_empty() {
             return Vec::new();
         }
-        let needle = self.search_query.to_lowercase();
         self.current().files.iter().enumerate()
-            .filter_map(|(index, entry)| {
-                let name = entry.path.file_name()?.to_string_lossy();
-                name.to_lowercase().contains(&needle).then_some(index)
-            })
+            .filter_map(|(index, entry)| filename_matches(entry, &self.search_query).then_some(index))
             .collect()
     }
 
@@ -2143,6 +2152,13 @@ impl AppState {
                     false,
                 );
             }
+            ToggleAction::SelectionStyle => {
+                self.rounded_selection = !self.rounded_selection;
+                self.set_notice(
+                    format!("Selection style: {}", if self.rounded_selection { "Pill" } else { "Flat" }),
+                    false,
+                );
+            }
         }
     }
 
@@ -2433,6 +2449,13 @@ fn scan_folder_stats(
 
     stats.complete = true;
     let _ = sender.send(stats);
+}
+
+pub fn filename_matches(entry: &DirEntryInfo, query: &str) -> bool {
+    !query.is_empty()
+        && entry.path.file_name().is_some_and(|name| {
+            name.to_string_lossy().to_lowercase().contains(&query.to_lowercase())
+        })
 }
 
 fn split_edit_text(content: &str) -> (Vec<String>, &'static str) {
@@ -2884,5 +2907,20 @@ mod tests {
         assert_eq!(stats.inaccessible, 0);
 
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn filename_filter_is_case_insensitive_and_literal() {
+        let entry = DirEntryInfo {
+            path: PathBuf::from("Quarterly Report [FINAL].PDF"),
+            is_dir: false,
+            size: 0,
+            modified: None,
+        };
+        assert!(filename_matches(&entry, "report"));
+        assert!(filename_matches(&entry, "[FINAL]"));
+        assert!(filename_matches(&entry, ".pdf"));
+        assert!(!filename_matches(&entry, "draft"));
+        assert!(!filename_matches(&entry, ""));
     }
 }

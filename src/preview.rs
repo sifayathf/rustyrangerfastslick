@@ -367,7 +367,7 @@ fn highlight_code_with_limit(text: &str, ext: &str, max_lines: usize) -> Vec<Lin
 
         // Line number gutter
         spans.push(Span::styled(
-            format!("{:>4} │ ", ln_idx + 1),
+            format!("{:>3} │ ", ln_idx + 1),
             Style::default().fg(SH_LN),
         ));
 
@@ -1679,31 +1679,26 @@ fn text_preview(p: &PathBuf) -> PreviewContent {
         return PreviewContent::Code(lines);
     }
 
-    // Plain text
-    let content: String = normalized.lines()
-        .enumerate()
-        .take(400)
-        .map(|(i, line)| format!("{:>4}  {}", i + 1, line))
-        .collect::<Vec<_>>()
-        .join("\n");
-
     let total = normalized.lines().count();
-    let tail = if total > 400 {
-        format!("\n\n… {} more lines", total - 400)
-    } else { String::new() };
-
-    // Convert meta_header to plain text prefix
-    let header_text: String = header.iter()
-        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    PreviewContent::Text(format!(
-        "{}\n{}{}",
-        header_text,
-        if content.is_empty() { "<empty file>".to_string() } else { content },
-        tail
-    ))
+    let mut lines = header;
+    if normalized.is_empty() {
+        lines.push(Line::from(Span::styled("<empty file>", Style::default().fg(SH_CMT))));
+    } else {
+        lines.extend(normalized.lines().enumerate().take(400).map(|(index, line)| {
+            Line::from(vec![
+                Span::styled(format!("{:>3}", index + 1), Style::default().fg(SH_LN)),
+                Span::styled(" │ ", Style::default().fg(SH_CMT)),
+                Span::styled(line.to_string(), Style::default().fg(SH_FG)),
+            ])
+        }));
+    }
+    if total > 400 {
+        lines.push(Line::from(Span::styled(
+            format!("… {} more lines", total - 400),
+            Style::default().fg(SH_CMT),
+        )));
+    }
+    PreviewContent::Code(lines)
 }
 
 // ── Hex dump lines ────────────────────────────────────────────────────────────
@@ -1848,6 +1843,32 @@ mod tests {
         archive.finish().unwrap();
 
         assert_eq!(presentation_slide_count(&path), Some(3));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unknown_text_files_use_a_separate_line_number_gutter() {
+        let path = std::env::temp_dir().join(format!(
+            "rusty-ranger-plain-preview-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, "alpha\nbeta").unwrap();
+
+        match text_preview(&path) {
+            PreviewContent::Code(lines) => {
+                assert_eq!(lines.len(), 2);
+                assert_eq!(lines[0].spans[0].content.as_ref(), "  1");
+                assert_eq!(lines[0].spans[1].content.as_ref(), " │ ");
+                assert_eq!(lines[0].spans[2].content.as_ref(), "alpha");
+                assert_ne!(lines[0].spans[0].style.fg, lines[0].spans[2].style.fg);
+            }
+            _ => panic!("plain text should render with a styled gutter"),
+        }
+
         fs::remove_file(path).unwrap();
     }
 }

@@ -44,6 +44,7 @@ pub fn draw(f: &mut Frame, app: &AppState) {
     geo.slide_next_rect = None;
     geo.breadcrumb_segment_rects.clear();
     geo.search_rect = None;
+    geo.pane_sort_rect = None;
     geo.context_menu_item_rects.clear();
     geo.context_menu_rect = None;
 
@@ -301,6 +302,7 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
         }
         draw_toggle(f, geo, &mut y, "↕", "Order", "Asc", "Desc", app.sort_descending, crate::state::ToggleAction::SortOrder);
         draw_toggle(f, geo, &mut y, "🕒", "Details", "Off", "On", app.show_file_details, crate::state::ToggleAction::Details);
+        draw_toggle(f, geo, &mut y, "◖", "Select", "Flat", "Pill", app.rounded_selection, crate::state::ToggleAction::SelectionStyle);
         draw_toggle(f, geo, &mut y, "✏️", "Edit", "Off", "On", app.edit_preview_mode, crate::state::ToggleAction::EditMode);
         draw_toggle(f, geo, &mut y, "📂", "DirClick", "Off", "On", app.dir_preview_clickable, crate::state::ToggleAction::DirPreviewClick);
     }
@@ -655,6 +657,15 @@ fn theme_preview_lines(mut lines: Vec<Line<'static>>, mode: ThemeMode) -> Vec<Li
     for line in &mut lines {
         for span in &mut line.spans {
             let adjusted = match span.style.fg {
+                Some(Color::Rgb(203, 166, 247)) => Some(Color::Rgb(122, 62, 157)), // keyword
+                Some(Color::Rgb(166, 227, 161)) => Some(Color::Rgb(42, 115, 54)),  // string
+                Some(Color::Rgb(108, 112, 134)) => Some(Color::Rgb(102, 110, 125)), // comment
+                Some(Color::Rgb(250, 179, 135)) => Some(Color::Rgb(156, 82, 28)),   // number
+                Some(Color::Rgb(137, 180, 250)) => Some(Color::Rgb(28, 88, 170)),   // operator
+                Some(Color::Rgb(205, 214, 244)) => Some(Color::Rgb(38, 45, 58)),    // text
+                Some(Color::Rgb(88, 91, 112)) => Some(Color::Rgb(105, 112, 128)),   // line number
+                Some(Color::Rgb(249, 226, 175)) => Some(Color::Rgb(137, 96, 0)),    // builtin/type
+                Some(Color::Rgb(116, 199, 236)) => Some(Color::Rgb(0, 105, 135)),   // function
                 Some(Color::Rgb(r, g, b)) => {
                     let luminance = (u16::from(r) * 3 + u16::from(g) * 6 + u16::from(b)) / 10;
                     if luminance > 140 {
@@ -774,6 +785,32 @@ fn draw_breadcrumb(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGe
         segments.push((label, acc.clone()));
     }
 
+    for (label, _) in &mut segments {
+        let trimmed = label.trim_end_matches(['\\', '/']);
+        if !trimmed.is_empty() {
+            *label = trimmed.to_string();
+        }
+    }
+    let search_width = area.width.min(if app.search_active { 42 } else { 18 });
+    let available = area.width.saturating_sub(search_width).saturating_sub(3) as usize;
+    let mut hidden_middle = false;
+    while segments.len() > 3 && (
+        segments.iter().map(|(label, _)| label.chars().count()).sum::<usize>()
+            + segments.len().saturating_sub(1) * 3
+            + usize::from(hidden_middle) * 4
+    ) > available {
+        segments.remove(1);
+        hidden_middle = true;
+    }
+    while segments.len() > 1 && (
+        segments.iter().map(|(label, _)| label.chars().count()).sum::<usize>()
+            + segments.len().saturating_sub(1) * 3
+            + usize::from(hidden_middle) * 4
+    ) > available {
+        segments.remove(0);
+        hidden_middle = true;
+    }
+
     let mut x = area.x + 2;
     for (i, (label, seg_path)) in segments.iter().enumerate() {
         let is_last = i == segments.len() - 1;
@@ -782,18 +819,18 @@ fn draw_breadcrumb(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGe
         } else {
             Style::default().fg(C_TEXT)
         };
-        let text = label.trim_end_matches(['\\', '/']).to_string();
-        let text = if text.is_empty() { label.clone() } else { text };
+        if i > 0 {
+            let separator = if i == 1 && hidden_middle { " … > " } else { " > " };
+            spans.push(Span::styled(separator, Style::default().fg(C_MUTED)));
+            x += separator.chars().count() as u16;
+        }
+        let text = label.clone();
         let w = text.chars().count() as u16;
         if x + w <= area.x + area.width {
             geo.breadcrumb_segment_rects.push((Rect { x, y: area.y, width: w, height: 1 }, seg_path.clone()));
         }
         spans.push(Span::styled(text, style));
         x += w;
-        if !is_last {
-            spans.push(Span::styled("    >    ", Style::default().fg(C_MUTED)));
-            x += 9;
-        }
     }
 
     let mode_badge = match app.mode {
@@ -941,8 +978,24 @@ fn draw_dir_pane(f: &mut Frame, app: &AppState, level: &DirLevel, is_current: bo
         Style::default().fg(C_BORDER)
     };
 
-    let visible_h    = area.height.saturating_sub(2) as usize;
-    let scroll_start = level.scroll.min(level.files.len().saturating_sub(visible_h));
+    let visible_h = area.height.saturating_sub(2) as usize;
+    let filtered_indices: Vec<usize> = if is_current && app.search_active && !app.search_query.is_empty() {
+        level.files.iter().enumerate()
+            .filter_map(|(index, entry)| crate::state::filename_matches(entry, &app.search_query).then_some(index))
+            .collect()
+    } else {
+        (0..level.files.len()).collect()
+    };
+    let filtered_selected = filtered_indices.iter()
+        .position(|index| *index == level.selected)
+        .unwrap_or(0);
+    let scroll_start = if is_current && app.search_active && !app.search_query.is_empty() {
+        filtered_selected
+            .saturating_sub(visible_h.saturating_sub(1) / 2)
+            .min(filtered_indices.len().saturating_sub(visible_h))
+    } else {
+        level.scroll.min(filtered_indices.len().saturating_sub(visible_h))
+    };
 
     let mut row_rects_for_pane = Vec::new();
     let list_inner_area = Rect {
@@ -951,13 +1004,14 @@ fn draw_dir_pane(f: &mut Frame, app: &AppState, level: &DirLevel, is_current: bo
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(2),
     };
-    let items: Vec<ListItem> = level.files
+    let items: Vec<ListItem> = filtered_indices
         .iter()
-        .enumerate()
         .skip(scroll_start)
         .take(visible_h)
         .enumerate()
-        .map(|(render_i, (file_i, p))| {
+        .map(|(render_i, file_i)| {
+            let file_i = *file_i;
+            let p = &level.files[file_i];
             row_rects_for_pane.push((file_i, Rect {
                 x: list_inner_area.x,
                 y: list_inner_area.y + render_i as u16,
@@ -998,14 +1052,15 @@ fn draw_dir_pane(f: &mut Frame, app: &AppState, level: &DirLevel, is_current: bo
             let is_search_match = is_current
                 && app.search_active
                 && !app.search_query.is_empty()
-                && raw_name.to_lowercase().contains(&app.search_query.to_lowercase());
+                && crate::state::filename_matches(p, &app.search_query);
 
             let icon_span = Span::styled(icon, Style::default().fg(icon_color));
 
             if is_selected {
                 let bg = if is_current { C_SEL_BG } else { C_SEL_BG_INACTIVE };
                 let fg_color = if is_current { C_ACCENT } else { C_TEXT };
-                let inner_w = list_inner_area.width as usize;
+                let cap_width = if app.rounded_selection { 2 } else { 0 };
+                let inner_w = (list_inner_area.width as usize).saturating_sub(cap_width);
                 
                 let icon_selected_span = Span::styled(icon, Style::default().fg(icon_color).bg(bg));
                 let name_selected_span = Span::styled(shown_name.clone(), Style::default().fg(fg_color).bg(bg).add_modifier(Modifier::BOLD));
@@ -1014,15 +1069,22 @@ fn draw_dir_pane(f: &mut Frame, app: &AppState, level: &DirLevel, is_current: bo
                     + details_width + usize::from(!details.is_empty());
                 let pad_w = inner_w.saturating_sub(disp_w);
                 
-                let mut spans = vec![
+                let mut spans = Vec::new();
+                if app.rounded_selection {
+                    spans.push(Span::styled("", Style::default().fg(bg).bg(t.bg_panel)));
+                }
+                spans.extend([
                     icon_selected_span,
                     Span::styled(" ", Style::default().bg(bg)),
                     name_selected_span,
                     Span::styled(" ".repeat(pad_w), Style::default().bg(bg)),
-                ];
+                ]);
                 if !details.is_empty() {
                     spans.push(Span::styled(" ", Style::default().bg(bg)));
                     spans.push(Span::styled(details, Style::default().fg(C_MUTED).bg(bg)));
+                }
+                if app.rounded_selection {
+                    spans.push(Span::styled("", Style::default().fg(bg).bg(t.bg_panel)));
                 }
                 ListItem::new(Line::from(spans))
             } else if is_marked {
@@ -1067,7 +1129,9 @@ fn draw_dir_pane(f: &mut Frame, app: &AppState, level: &DirLevel, is_current: bo
     geo.row_rects.insert(pane_idx, row_rects_for_pane);
 
     let marked_count = level.marked.len();
-    let title_text = if marked_count > 0 {
+    let title_text = if is_current && app.search_active && !app.search_query.is_empty() {
+        format!(" {} · {} matches · {} {} ", if title.is_empty() { "/" } else { &title }, filtered_indices.len(), app.sort_mode.label(), if app.sort_descending { "↓" } else { "↑" })
+    } else if marked_count > 0 {
         format!(" {} · {} marked ", if title.is_empty() { "/" } else { &title }, marked_count)
     } else {
         format!(
@@ -1078,6 +1142,7 @@ fn draw_dir_pane(f: &mut Frame, app: &AppState, level: &DirLevel, is_current: bo
         )
     };
 
+    let title_width = title_text.chars().count().min(area.width as usize) as u16;
     let list = List::new(items).block(
         Block::default()
             .title(title_text)
@@ -1088,14 +1153,22 @@ fn draw_dir_pane(f: &mut Frame, app: &AppState, level: &DirLevel, is_current: bo
             .style(Style::default().bg(t.bg_panel)),
     );
     f.render_widget(list, area);
+    if is_current {
+        geo.pane_sort_rect = Some(Rect {
+            x: area.x.saturating_add(1),
+            y: area.y,
+            width: title_width.saturating_sub(1),
+            height: 1,
+        });
+    }
 
     // Simple scrollbar indicator for long directories.
-    if level.files.len() > visible_h && area.height > 4 {
+    if filtered_indices.len() > visible_h && area.height > 4 {
         let track_h = area.height.saturating_sub(2) as usize;
-        let ratio = visible_h as f64 / level.files.len() as f64;
+        let ratio = visible_h as f64 / filtered_indices.len() as f64;
         let thumb_h = ((track_h as f64) * ratio).max(1.0) as usize;
-        let thumb_pos = if level.files.len() > visible_h {
-            ((track_h.saturating_sub(thumb_h)) as f64 * (scroll_start as f64 / (level.files.len() - visible_h) as f64)) as usize
+        let thumb_pos = if filtered_indices.len() > visible_h {
+            ((track_h.saturating_sub(thumb_h)) as f64 * (scroll_start as f64 / (filtered_indices.len() - visible_h) as f64)) as usize
         } else { 0 };
         for i in 0..track_h {
             let on_thumb = i >= thumb_pos && i < thumb_pos + thumb_h;
@@ -1126,7 +1199,7 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
         app.native_preview.hide();
         f.render_widget(
             Paragraph::new(Span::styled("Empty", Style::default().fg(C_MUTED)))
-                .block(Block::default().title(" PREVIEW ").borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(C_BORDER)).style(Style::default().bg(t.bg_panel))),
+                .block(Block::default().title(" PREVIEW ").borders(Borders::TOP | Borders::RIGHT | Borders::BOTTOM).border_type(BorderType::Rounded).border_style(Style::default().fg(C_BORDER)).style(Style::default().bg(t.bg_panel))),
             area,
         );
         return;
@@ -1209,7 +1282,7 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
                 Block::default()
                     .title(stats_title)
                     .title_style(Style::default().fg(C_OK))
-                    .borders(Borders::ALL)
+                    .borders(Borders::TOP | Borders::RIGHT | Borders::BOTTOM)
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(C_BORDER_LO))
                     .style(Style::default().bg(t.bg_panel)),
@@ -1239,7 +1312,7 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
         let block = Block::default()
             .title(title_text)
             .title_style(Style::default().fg(title_color).add_modifier(Modifier::BOLD))
-            .borders(Borders::ALL)
+            .borders(Borders::TOP | Borders::RIGHT | Borders::BOTTOM)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(title_color))
             .style(Style::default().bg(t.bg_panel));
@@ -1307,7 +1380,7 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
                 .take(app.edit_cursor_col.min(raw_line.chars().count()))
                 .collect::<String>();
             let display_head = preview::expand_editor_tabs(&head);
-            let gutter_width = Span::raw(format!("{:>4} │ ", app.edit_cursor_row + 1)).width() as u16;
+            let gutter_width = Span::raw(format!("{:>3} │ ", app.edit_cursor_row + 1)).width() as u16;
             let cursor_x = editor_area.x
                 .saturating_add(gutter_width)
                 .saturating_add(Span::raw(display_head).width() as u16);
@@ -1328,7 +1401,7 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
     let block = Block::default()
         .title(title)
         .title_style(if app.mode != AppMode::Normal { Style::default().fg(C_WARN) } else { Style::default().fg(C_MUTED) })
-        .borders(Borders::ALL)
+        .borders(Borders::TOP | Borders::RIGHT | Borders::BOTTOM)
         .border_type(BorderType::Rounded)
         .border_style(if app.mode != AppMode::Normal { Style::default().fg(C_WARN) } else { Style::default().fg(C_BORDER_LO) })
         .style(Style::default().bg(t.bg_panel));
@@ -1365,9 +1438,7 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
             app.native_preview.hide();
             let mut padded_lines = Vec::new();
             for line in theme_preview_lines(lines, app.theme_mode) {
-                let mut spans = line.spans;
-                spans.insert(0, Span::raw("  "));
-                padded_lines.push(Line::from(spans));
+                padded_lines.push(line);
             }
             let para = Paragraph::new(Text::from(padded_lines))
                 .scroll((scroll, 0));
@@ -1474,7 +1545,6 @@ struct IconSet {
     pub pictures: &'static str,
     pub drive: &'static str,
     pub rs: &'static str,
-    pub py: &'static str,
     pub js: &'static str,
     pub ts: &'static str,
     pub html: &'static str,
@@ -1513,7 +1583,6 @@ const EMOJI_ICONS: IconSet = IconSet {
     pictures: "🖼",
     drive: "💾",
     rs: "🦀",
-    py: "🐍",
     js: "📜",
     ts: "📘",
     html: "🌐",
@@ -1552,7 +1621,6 @@ const NERD_ICONS: IconSet = IconSet {
     pictures: "",
     drive: "",
     rs: "",
-    py: "",
     js: "",
     ts: "",
     html: "",
@@ -1591,7 +1659,6 @@ const ASCII_ICONS: IconSet = IconSet {
     pictures: "p",
     drive: "c",
     rs: "R",
-    py: "P",
     js: "J",
     ts: "T",
     html: "H",
@@ -1650,7 +1717,7 @@ fn file_icon(ext: &str) -> (&'static str, Color) {
     match ext.to_lowercase().as_str() {
         // Specific languages with their iconic brand colors
         "rs" => (set.rs, Color::Rgb(224, 112, 16)), // orange
-        "py" => (set.py, Color::Rgb(255, 224, 64)), // yellow
+        "py" | "pyw" => ("Py", Color::Rgb(55, 118, 171)), // Python's standard Windows blue
         "js"|"mjs"|"cjs" => (set.js, Color::Rgb(240, 219, 79)), // yellow
         "ts"|"tsx"|"jsx" => (set.ts, Color::Rgb(0, 122, 204)), // blue
         "html"|"htm" => (set.html, Color::Rgb(227, 76, 38)), // HTML red
