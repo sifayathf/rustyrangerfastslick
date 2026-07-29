@@ -166,15 +166,25 @@ pub fn render(
     let visual_requested = (office_full
         && matches!(ext.as_str(), "doc" | "docx" | "xls" | "xlsx" | "ods" | "ppt" | "pptx"))
         || (pdf_visual && ext == "pdf");
-    if !visual_requested {
-        if let Some(cache) = PREVIEW_CACHE.lock().as_ref() {
-            if cache.path == *p
-                && cache.modified == modified
-                && cache.len == len
-                && cache.office_full == office_full
-                && cache.pdf_visual == pdf_visual
-                && cache.slide_idx == slide_idx
-            {
+    let visual_ready = if office_full
+        && matches!(ext.as_str(), "doc" | "docx" | "xls" | "xlsx" | "ods" | "ppt" | "pptx")
+    {
+        get_office_cache_path(p, slide_idx).exists()
+    } else if pdf_visual && ext == "pdf" {
+        get_pdf_cache_path(p, 0).exists()
+    } else {
+        false
+    };
+    if let Some(cache) = PREVIEW_CACHE.lock().as_ref() {
+        if cache.path == *p
+            && cache.modified == modified
+            && cache.len == len
+            && cache.office_full == office_full
+            && cache.pdf_visual == pdf_visual
+            && cache.slide_idx == slide_idx
+        {
+            let cached_visual = matches!(cache.content, PreviewContent::ImageFallback(_));
+            if !visual_requested || !visual_ready || cached_visual {
                 return cache.content.clone();
             }
         }
@@ -198,17 +208,15 @@ pub fn render(
             => render_archive(p),
         _   => text_preview(p),
     };
-    if !visual_requested {
-        *PREVIEW_CACHE.lock() = Some(PreviewCacheEntry {
-            path: p.clone(),
-            modified,
-            len,
-            office_full,
-            pdf_visual,
-            slide_idx,
-            content: content.clone(),
-        });
-    }
+    *PREVIEW_CACHE.lock() = Some(PreviewCacheEntry {
+        path: p.clone(),
+        modified,
+        len,
+        office_full,
+        pdf_visual,
+        slide_idx,
+        content: content.clone(),
+    });
     content
 }
 
@@ -226,7 +234,11 @@ pub fn is_visual_preview(
         ext.as_str(),
         "jpg" | "jpeg" | "png" | "bmp" | "gif" | "webp" | "tiff" | "tif" | "ico"
     ) || (matches!(ext.as_str(), "doc" | "docx" | "xls" | "xlsx" | "ods" | "ppt" | "pptx")
-        && office_mode == crate::state::OfficeRenderMode::Full)
+        && office_mode == crate::state::OfficeRenderMode::Full
+        && path.is_some_and(|path| {
+            get_office_cache_path(path, 0).exists()
+                || IMG_CACHE.lock().as_ref().is_some_and(|entry| entry.path == *path)
+        }))
         || (ext == "pdf" && pdf_mode == crate::state::PdfRenderMode::Visual)
 }
 
@@ -1270,19 +1282,15 @@ fn generate_office_exact_sync(
 
 fn render_docx(p: &PathBuf, rotation: u32, flip_h: bool, office_mode: crate::state::OfficeRenderMode) -> PreviewContent {
     if office_mode == crate::state::OfficeRenderMode::Full {
+        if let Some(content) = try_render_embedded_office_thumbnail(p, rotation, flip_h) {
+            return content;
+        }
         if let Some(content) = try_render_office_exact(p, rotation, flip_h, 0) {
             return content;
         }
     }
 
     let mut lines = meta_header(p);
-    if office_mode == crate::state::OfficeRenderMode::Full {
-        lines.push(Line::from(Span::styled(
-            "⚠ Full preview backend unavailable; showing structured text fallback",
-            Style::default().fg(SH_TYPE),
-        )));
-        lines.push(Line::from(""));
-    }
     let file = match fs::File::open(p) {
         Ok(f)  => f,
         Err(e) => {
@@ -1321,9 +1329,9 @@ fn render_docx(p: &PathBuf, rotation: u32, flip_h: bool, office_mode: crate::sta
 
     lines.push(Line::from(Span::styled(
         if office_mode == crate::state::OfficeRenderMode::Full {
-            "📘  Word Document (Full requested · Text fallback)"
+            "📘  Word Document  ·  Portable structured preview"
         } else {
-            "📘  Word Document (Text Mode)"
+            "📘  Word Document  ·  Text mode"
         },
         Style::default().fg(SH_FN),
     )));
@@ -1462,6 +1470,9 @@ fn render_pptx(
 
 fn render_excel(p: &PathBuf, rotation: u32, flip_h: bool, office_mode: crate::state::OfficeRenderMode) -> PreviewContent {
     if office_mode == crate::state::OfficeRenderMode::Full {
+        if let Some(content) = try_render_embedded_office_thumbnail(p, rotation, flip_h) {
+            return content;
+        }
         if let Some(content) = try_render_office_exact(p, rotation, flip_h, 0) {
             return content;
         }
@@ -1469,27 +1480,27 @@ fn render_excel(p: &PathBuf, rotation: u32, flip_h: bool, office_mode: crate::st
 
     use calamine::{Reader, open_workbook_auto};
     let mut lines = meta_header(p);
-    if office_mode == crate::state::OfficeRenderMode::Full {
-        lines.push(Line::from(Span::styled(
-            "⚠ Full spreadsheet renderer unavailable; showing grid fallback",
-            Style::default().fg(SH_TYPE),
-        )));
-        lines.push(Line::from(""));
-    }
     let outcome: Option<Vec<Line<'static>>> = safe_parse(move || {
         let mut out: Vec<Line<'static>> = Vec::new();
         match open_workbook_auto(p) {
             Ok(mut wb) => {
                 let sheets = wb.sheet_names().to_vec();
                 out.push(Line::from(vec![
-                    Span::styled("📊  Sheets: ", Style::default().fg(SH_FN)),
+                    Span::styled(
+                        if office_mode == crate::state::OfficeRenderMode::Full {
+                            "📊  Spreadsheet  ·  Portable grid  ·  Sheets: "
+                        } else {
+                            "📊  Spreadsheet  ·  Sheets: "
+                        },
+                        Style::default().fg(SH_FN),
+                    ),
                     Span::styled(sheets.join(", "), Style::default().fg(SH_STR)),
                 ]));
                 out.push(Line::from(Span::styled("─".repeat(80), Style::default().fg(SH_CMT))));
 
                 if let Some(first) = sheets.first() {
                     if let Ok(range) = wb.worksheet_range(first) {
-                        for (ri, row) in range.rows().enumerate().take(40) {
+                        for (ri, row) in range.rows().enumerate() {
                             let formatted: String = row.iter()
                                 .map(|c| { let s = c.to_string(); format!(" {:<16} ", safe_truncate(&s, 15)) })
                                 .collect::<Vec<_>>()
@@ -1519,7 +1530,7 @@ fn render_excel(p: &PathBuf, rotation: u32, flip_h: bool, office_mode: crate::st
             Style::default().fg(Color::Red)
         ))),
     }
-    PreviewContent::Highlighted(lines)
+    PreviewContent::Code(Arc::new(lines))
 }
 
 // ── CSV / TSV ─────────────────────────────────────────────────────────────────
