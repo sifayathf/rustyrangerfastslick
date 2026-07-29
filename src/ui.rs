@@ -10,10 +10,10 @@ use ratatui::{
 use crate::state::{AppState, AppMode, DirLevel, LayoutGeometry, ContextAction, SortMode, ThemeMode};
 use crate::preview::{self, PreviewContent};
 
-// A one-cell terminal pill needs the filled half of each cap to touch the
-// label background. Reversing these creates two detached dots.
-const PILL_LEFT_CAP: &str = "◗";
-const PILL_RIGHT_CAP: &str = "◖";
+// Full-cell Powerline caps used by the original oval implementation. Standard
+// circle halves (◗/◖) are much shorter than a terminal row and look like dots.
+const PILL_LEFT_CAP: &str = "";
+const PILL_RIGHT_CAP: &str = "";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Top-level draw
@@ -1991,7 +1991,7 @@ mod tests {
     use super::{PILL_LEFT_CAP, PILL_RIGHT_CAP};
 
     #[test]
-    fn pill_caps_join_the_label_instead_of_pointing_outward() {
-        assert_eq!(format!("{PILL_LEFT_CAP}value{PILL_RIGHT_CAP}"), "◗value◖");
+    fn pill_caps_use_the_original_full_height_geometry() {
+        assert_eq!(format!("{PILL_LEFT_CAP}value{PILL_RIGHT_CAP}"), "value");
     }
 }

@@ -19,10 +19,10 @@ const WT_PROFILE_NAME: &str = "Rusty Ranger";
 /// GUID for the dedicated Windows Terminal profile (stable, deterministic)
 const WT_PROFILE_GUID: &str = "{a7b3c4d5-e6f7-4a8b-9c0d-1e2f3a4b5c6d}";
 /// Desired font face for the file manager
-// Cascadia Mono is the terminal-safe member of the family: every printable
-// character advances exactly one cell and programming ligatures cannot alter
-// the visual grid on another machine.
-const FONT_FACE: &str = "Cascadia Mono";
+// Match the original rounded-control implementation. Windows Terminal's
+// Cascadia Code profile supplies the full-cell Powerline separator geometry
+// used for pill caps while keeping the normal text grid monospace.
+const FONT_FACE: &str = "Cascadia Code";
 /// Desired font size (pt) — 9pt gives a compact, Windows-Explorer-like look
 const FONT_SIZE: u32 = 9;
 
