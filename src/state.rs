@@ -378,11 +378,14 @@ impl AppState {
         let level = DirLevel::new(home.clone(), files);
 
         let mut quick_access: Vec<(&'static str, PathBuf)> = Vec::new();
-        if let Some(h) = dirs::home_dir() { quick_access.push(("🏠 Home", h)); }
-        if let Some(d) = dirs::desktop_dir() { quick_access.push(("🖥 Desktop", d)); }
-        if let Some(d) = dirs::document_dir() { quick_access.push(("📄 Documents", d)); }
-        if let Some(d) = dirs::download_dir() { quick_access.push(("⬇ Downloads", d)); }
-        if let Some(d) = dirs::picture_dir() { quick_access.push(("🖼 Pictures", d)); }
+        // Store labels without embedded emoji. Emoji cell widths vary between
+        // terminal/font combinations and used to leave the final character
+        // outside the active-row highlight on other machines.
+        if let Some(h) = dirs::home_dir() { quick_access.push(("Home", h)); }
+        if let Some(d) = dirs::desktop_dir() { quick_access.push(("Desktop", d)); }
+        if let Some(d) = dirs::document_dir() { quick_access.push(("Documents", d)); }
+        if let Some(d) = dirs::download_dir() { quick_access.push(("Downloads", d)); }
+        if let Some(d) = dirs::picture_dir() { quick_access.push(("Pictures", d)); }
 
         Ok(Self {
             levels:         vec![level],
@@ -913,12 +916,36 @@ impl AppState {
                         }
                     }
                     MouseEventKind::ScrollDown => {
+                        let mut steps = 1usize;
+                        while steps < 32 && event::poll(Duration::ZERO)? {
+                            match event::read()? {
+                                Event::Mouse(next) if next.kind == MouseEventKind::ScrollDown => {
+                                    steps += 1;
+                                }
+                                other => {
+                                    self.pending_event = Some(other);
+                                    break;
+                                }
+                            }
+                        }
                         let geo = self.layout_geometry.lock().clone();
-                        self.handle_scroll(&geo, mouse.column, mouse.row, true);
+                        self.handle_scroll(&geo, mouse.column, mouse.row, true, steps);
                     }
                     MouseEventKind::ScrollUp => {
+                        let mut steps = 1usize;
+                        while steps < 32 && event::poll(Duration::ZERO)? {
+                            match event::read()? {
+                                Event::Mouse(next) if next.kind == MouseEventKind::ScrollUp => {
+                                    steps += 1;
+                                }
+                                other => {
+                                    self.pending_event = Some(other);
+                                    break;
+                                }
+                            }
+                        }
                         let geo = self.layout_geometry.lock().clone();
-                        self.handle_scroll(&geo, mouse.column, mouse.row, false);
+                        self.handle_scroll(&geo, mouse.column, mouse.row, false, steps);
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
                         let geo = self.layout_geometry.lock().clone();
@@ -1145,7 +1172,15 @@ impl AppState {
         Ok(false)
     }
 
-    fn handle_scroll(&mut self, geo: &LayoutGeometry, col: u16, row: u16, down: bool) {
+    fn handle_scroll(
+        &mut self,
+        geo: &LayoutGeometry,
+        col: u16,
+        row: u16,
+        down: bool,
+        steps: usize,
+    ) {
+        let rows = 3usize.saturating_mul(steps.max(1));
         if let Some(pr) = geo.preview_rect {
             if point_in(col, row, &pr) {
                 let selected = self.selected_file();
@@ -1166,11 +1201,11 @@ impl AppState {
                             .and_then(|path| crate::preview::presentation_slide_count(path))
                             .map(|count| count.saturating_sub(1));
                         self.pptx_slide_index = match last {
-                            Some(last) => self.pptx_slide_index.saturating_add(1).min(last),
-                            None => self.pptx_slide_index.saturating_add(1),
+                            Some(last) => self.pptx_slide_index.saturating_add(steps).min(last),
+                            None => self.pptx_slide_index.saturating_add(steps),
                         };
                     } else {
-                        self.pptx_slide_index = self.pptx_slide_index.saturating_sub(1);
+                        self.pptx_slide_index = self.pptx_slide_index.saturating_sub(steps);
                     }
                     self.preview_scroll = 0;
                 } else if crate::preview::is_visual_preview(
@@ -1181,9 +1216,9 @@ impl AppState {
                     // Static visual previews have nothing textual to scroll.
                     self.preview_scroll = 0;
                 } else if down {
-                    self.preview_scroll = self.preview_scroll.saturating_add(3);
+                    self.preview_scroll = self.preview_scroll.saturating_add(rows);
                 } else {
-                    self.preview_scroll = self.preview_scroll.saturating_sub(3);
+                    self.preview_scroll = self.preview_scroll.saturating_sub(rows);
                 }
                 return;
             }
@@ -1202,9 +1237,9 @@ impl AppState {
                     let level = &mut self.levels[real_idx];
                     let max_scroll = level.files.len().saturating_sub(visible);
                     if down {
-                        level.scroll = level.scroll.saturating_add(3).min(max_scroll);
+                        level.scroll = level.scroll.saturating_add(rows).min(max_scroll);
                     } else {
-                        level.scroll = level.scroll.saturating_sub(3);
+                        level.scroll = level.scroll.saturating_sub(rows);
                     }
                 }
                 return;

@@ -149,28 +149,25 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
         } else {
             Style::default().fg(C_TEXT)
         };
-        let label_lower = label.to_lowercase();
-        let icon = if label_lower.contains("home") {
-            set.home
-        } else if label_lower.contains("desktop") {
-            set.desktop
-        } else if label_lower.contains("document") {
-            set.documents
-        } else if label_lower.contains("download") {
-            set.downloads
-        } else if label_lower.contains("picture") {
-            set.pictures
+        // Fixed one-cell navigation markers are deliberately independent of
+        // the selected file-icon theme. Terminal emoji widths are not
+        // portable and made labels/highlights drift by one cell.
+        let icon = if *label == "Home" {
+            "H"
+        } else if *label == "Desktop" {
+            "D"
+        } else if *label == "Documents" {
+            "F"
+        } else if *label == "Downloads" {
+            "V"
+        } else if *label == "Pictures" {
+            "P"
         } else {
-            " "
+            "-"
         };
-        let clean_label_str = label.chars()
-            .skip_while(|c| !c.is_alphabetic())
-            .collect::<String>();
-        let clean_label = if clean_label_str.is_empty() { *label } else { &clean_label_str };
         
         let icon_span = Span::styled(icon, if is_active { text_style } else { Style::default().fg(C_ACCENT2) });
-        let gap_w = 4_usize.saturating_sub(icon_span.width());
-        let text_span = Span::styled(format!("{}{}", " ".repeat(gap_w), clean_label), text_style);
+        let text_span = Span::styled(format!("  {}", label), text_style);
         
         push_line(f, geo, inner, &mut y, max_y,
             Line::from(vec![
@@ -261,13 +258,13 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
 
             let line = Line::from(vec![
                 label_span,
-                Span::styled("", cap_style(!is_opt2)),
+                Span::styled("(", cap_style(!is_opt2)),
                 Span::styled(opt1, badge_style(!is_opt2)),
-                Span::styled("", cap_style(!is_opt2)),
+                Span::styled(")", cap_style(!is_opt2)),
                 Span::raw(" "),
-                Span::styled("", cap_style(is_opt2)),
+                Span::styled("(", cap_style(is_opt2)),
                 Span::styled(opt2, badge_style(is_opt2)),
-                Span::styled("", cap_style(is_opt2)),
+                Span::styled(")", cap_style(is_opt2)),
             ]);
 
             f.render_widget(Paragraph::new(line), rect);
@@ -275,15 +272,14 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
             *y += 1;
         };
 
-        draw_toggle(f, geo, &mut y, "🎨", "Theme", "Dark", "Light", app.theme_mode == crate::state::ThemeMode::Light, crate::state::ToggleAction::Theme);
-        draw_toggle(f, geo, &mut y, "📊", "Office", "Text", "Full", app.office_mode == crate::state::OfficeRenderMode::Full, crate::state::ToggleAction::OfficeMode);
-        draw_toggle(f, geo, &mut y, "📄", "PDF", "Text", "Visual", app.pdf_mode == crate::state::PdfRenderMode::Visual, crate::state::ToggleAction::PdfMode);
+        draw_toggle(f, geo, &mut y, "T", "Theme", "Dark", "Light", app.theme_mode == crate::state::ThemeMode::Light, crate::state::ToggleAction::Theme);
+        draw_toggle(f, geo, &mut y, "O", "Office", "Text", "Full", app.office_mode == crate::state::OfficeRenderMode::Full, crate::state::ToggleAction::OfficeMode);
+        draw_toggle(f, geo, &mut y, "P", "PDF", "Text", "Visual", app.pdf_mode == crate::state::PdfRenderMode::Visual, crate::state::ToggleAction::PdfMode);
         if y < max_y {
             let rect = Rect { x: inner.x, y, width: inner.width, height: 1 };
-            let prefix = Span::styled("  ↕ ", Style::default().fg(C_TEXT));
+            let prefix = Span::styled("S Sort ", Style::default().fg(C_TEXT));
             let mut click_x = rect.x + prefix.width() as u16;
-            let mut spans = vec![prefix, Span::styled("", Style::default().fg(t.sel_bg_inactive).bg(t.bg_panel))];
-            click_x = click_x.saturating_add(1);
+            let mut spans = vec![prefix];
             for (label, mode, action) in [
                 ("Name", SortMode::Name, crate::state::ToggleAction::SortName),
                 ("Date", SortMode::Modified, crate::state::ToggleAction::SortModified),
@@ -296,7 +292,7 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
                 };
                 // Explicit interior spacing makes all three sort targets
                 // visually distinct and independently clickable.
-                let badge = format!(" {} ", label);
+                let badge = format!("{} ", label);
                 let badge_width = Span::raw(&badge).width() as u16;
                 geo.toggle_rects.push((
                     Rect { x: click_x, y, width: badge_width, height: 1 },
@@ -305,16 +301,15 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
                 spans.push(Span::styled(badge, style));
                 click_x = click_x.saturating_add(badge_width);
             }
-            spans.push(Span::styled("", Style::default().fg(t.sel_bg_inactive).bg(t.bg_panel)));
             f.render_widget(Paragraph::new(Line::from(spans)), rect);
             y += 1;
         }
-        draw_toggle(f, geo, &mut y, "↕", "Order", "Asc", "Desc", app.sort_descending, crate::state::ToggleAction::SortOrder);
-        draw_toggle(f, geo, &mut y, "🕒", "Details", "Off", "On", app.show_file_details, crate::state::ToggleAction::Details);
-        draw_toggle(f, geo, &mut y, "◖", "Select", "Flat", "Pill", app.rounded_selection, crate::state::ToggleAction::SelectionStyle);
-        draw_toggle(f, geo, &mut y, "◉", "Hover", "Off", "On", app.hover_enabled, crate::state::ToggleAction::Hover);
-        draw_toggle(f, geo, &mut y, "✏️", "Edit", "Off", "On", app.edit_preview_mode, crate::state::ToggleAction::EditMode);
-        draw_toggle(f, geo, &mut y, "📂", "DirClick", "Off", "On", app.dir_preview_clickable, crate::state::ToggleAction::DirPreviewClick);
+        draw_toggle(f, geo, &mut y, "O", "Order", "Asc", "Desc", app.sort_descending, crate::state::ToggleAction::SortOrder);
+        draw_toggle(f, geo, &mut y, "I", "Details", "Off", "On", app.show_file_details, crate::state::ToggleAction::Details);
+        draw_toggle(f, geo, &mut y, "S", "Select", "Flat", "Pill", app.rounded_selection, crate::state::ToggleAction::SelectionStyle);
+        draw_toggle(f, geo, &mut y, "H", "Hover", "Off", "On", app.hover_enabled, crate::state::ToggleAction::Hover);
+        draw_toggle(f, geo, &mut y, "E", "Edit", "Off", "On", app.edit_preview_mode, crate::state::ToggleAction::EditMode);
+        draw_toggle(f, geo, &mut y, "D", "DirClick", "Off", "On", app.dir_preview_clickable, crate::state::ToggleAction::DirPreviewClick);
     }
 }
 
@@ -1082,7 +1077,7 @@ fn draw_dir_pane(f: &mut Frame, app: &AppState, level: &DirLevel, is_current: bo
                 
                 let mut spans = Vec::new();
                 if app.rounded_selection {
-                    spans.push(Span::styled("", Style::default().fg(bg).bg(t.bg_panel)));
+                    spans.push(Span::styled("(", Style::default().fg(bg).bg(t.bg_panel)));
                 } else {
                     spans.push(Span::raw(" "));
                 }
@@ -1097,7 +1092,7 @@ fn draw_dir_pane(f: &mut Frame, app: &AppState, level: &DirLevel, is_current: bo
                     spans.push(Span::styled(details, Style::default().fg(C_MUTED).bg(bg)));
                 }
                 if app.rounded_selection {
-                    spans.push(Span::styled("", Style::default().fg(bg).bg(t.bg_panel)));
+                    spans.push(Span::styled(")", Style::default().fg(bg).bg(t.bg_panel)));
                 }
                 ListItem::new(Line::from(spans))
             } else if is_hovered {
@@ -1472,12 +1467,12 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
         }
         PreviewContent::Code(lines) => {
             app.native_preview.hide();
-            let mut padded_lines = Vec::new();
-            for line in theme_preview_lines(lines, app.theme_mode) {
-                padded_lines.push(line);
-            }
-            let para = Paragraph::new(Text::from(padded_lines))
-                .scroll((scroll, 0));
+            // Code is line-addressable, so only style and draw the visible
+            // viewport. The cache still retains every line for instant scroll.
+            let start = (scroll as usize).min(lines.len());
+            let end = start.saturating_add(inner.height as usize).min(lines.len());
+            let visible = lines[start..end].to_vec();
+            let para = Paragraph::new(Text::from(theme_preview_lines(visible, app.theme_mode)));
             f.render_widget(para, inner);
         }
         PreviewContent::ImageFallback(info) => {
@@ -1729,10 +1724,12 @@ fn get_icon_set() -> &'static IconSet {
         let val = std::env::var("RUSTY_RANGER_ICONS").unwrap_or_default().to_lowercase();
         if val == "nerd" || std::env::var("NERD_FONT").is_ok() {
             NERD_ICONS
-        } else if val == "ascii" {
-            ASCII_ICONS
-        } else {
+        } else if val == "emoji" {
             EMOJI_ICONS
+        } else {
+            // Portable default. Emoji presentation and fallback-font width
+            // differ between Windows builds, so rich icons are opt-in.
+            ASCII_ICONS
         }
     });
     &SET

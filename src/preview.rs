@@ -36,7 +36,10 @@ pub enum PreviewContent {
     /// Same as `Highlighted`, but each line has a line-number gutter baked
     /// in — rendering this with word-wrap on breaks the gutter alignment,
     /// so the UI must render it unwrapped (clip instead of wrap).
-    Code(Vec<Line<'static>>),
+    // Shared because the preview cache is consulted every frame. A deep
+    // Vec<Line> clone made large notebooks allocate/copy their entire parsed
+    // document on every scroll tick.
+    Code(Arc<Vec<Line<'static>>>),
     ImageFallback(ImageFallbackInfo),
 }
 
@@ -369,12 +372,12 @@ fn highlight_document_line(line: &str) -> Line<'static> {
 // ── Syntax highlighting ───────────────────────────────────────────────────────
 
 fn highlight_code(text: &str, ext: &str) -> Vec<Line<'static>> {
-    highlight_code_with_limit(text, ext, 400)
+    highlight_code_with_limit(text, ext, usize::MAX)
 }
 
 /// Syntax-highlight the live editor buffer without flattening its line
-/// structure. Unlike the read-only preview, the editor must not truncate at
-/// 400 lines because its cursor can move through the entire file.
+/// structure. Both editor and read-only previews retain the whole file; the UI
+/// renders only the visible viewport.
 pub fn highlight_editor_buffer(buffer: &[String], ext: &str) -> Vec<Line<'static>> {
     let display_text = buffer.iter()
         .map(|line| expand_editor_tabs(line))
@@ -1590,7 +1593,7 @@ fn render_notebook(p: &PathBuf) -> PreviewContent {
         Ok(s)  => s,
         Err(e) => {
             lines.push(Line::from(Span::styled(format!("⚠ {}", e), Style::default().fg(Color::Red))));
-            return PreviewContent::Highlighted(lines);
+            return PreviewContent::Code(Arc::new(lines));
         }
     };
 
@@ -1598,7 +1601,7 @@ fn render_notebook(p: &PathBuf) -> PreviewContent {
         Ok(v)  => v,
         Err(e) => {
             lines.push(Line::from(Span::styled(format!("⚠ Not valid JSON: {}", e), Style::default().fg(Color::Red))));
-            return PreviewContent::Highlighted(lines);
+            return PreviewContent::Code(Arc::new(lines));
         }
     };
 
@@ -1606,17 +1609,18 @@ fn render_notebook(p: &PathBuf) -> PreviewContent {
     let cells = match nb["cells"].as_array() {
         Some(c) => c,
         None    => {
-            lines.push(Line::from(Span::styled("📓  No cells found", Style::default().fg(SH_CMT))));
-            return PreviewContent::Highlighted(lines);
+            lines.push(Line::from(Span::styled("Notebook contains no cells", Style::default().fg(SH_CMT))));
+            return PreviewContent::Code(Arc::new(lines));
         }
     };
 
     lines.push(Line::from(vec![
-        Span::styled("📓  Jupyter  ", Style::default().fg(SH_FN)),
-        Span::styled(format!("Kernel: {}  ({} cells)", kernel, cells.len()), Style::default().fg(SH_CMT)),
+        Span::styled("JUPYTER NOTEBOOK", Style::default().fg(SH_FN).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  |  Kernel: {}  |  {} cells", kernel, cells.len()), Style::default().fg(SH_CMT)),
     ]));
+    lines.push(Line::from(Span::styled("─".repeat(72), Style::default().fg(SH_CMT))));
 
-    for (i, cell) in cells.iter().enumerate().take(60) {
+    for (i, cell) in cells.iter().enumerate() {
         let ctype = cell["cell_type"].as_str().unwrap_or("?");
         let source: String = match cell["source"].as_array() {
             Some(ls) => ls.iter().filter_map(|l| l.as_str()).collect(),
@@ -1624,54 +1628,70 @@ fn render_notebook(p: &PathBuf) -> PreviewContent {
         };
 
         let (badge, badge_color) = match ctype {
-            "code"     => ("💻 CODE    ", SH_FN),
-            "markdown" => ("📝 MARKDOWN", SH_TYPE),
-            _          => ("📋 RAW     ", SH_CMT),
+            "code"     => ("CODE", SH_FN),
+            "markdown" => ("MARKDOWN", SH_TYPE),
+            _          => ("RAW", SH_CMT),
         };
+        let execution = cell["execution_count"]
+            .as_u64()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| " ".to_string());
 
-        lines.push(Line::from(Span::styled("─".repeat(44), Style::default().fg(SH_CMT))));
+        if i > 0 {
+            lines.push(Line::from(""));
+        }
         lines.push(Line::from(vec![
-            Span::styled(format!(" {} ", badge), Style::default().fg(badge_color).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("[{}]", i + 1), Style::default().fg(SH_CMT)),
+            Span::styled(
+                format!(" {} ", badge),
+                Style::default().fg(Color::Black).bg(badge_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                if ctype == "code" {
+                    format!(" In [{execution}]  ·  Cell {}", i + 1)
+                } else {
+                    format!("  Cell {}", i + 1)
+                },
+                Style::default().fg(SH_CMT),
+            ),
         ]));
 
         if ctype == "code" {
-            // syntax highlight the code cell using Python rules
-            let cell_lines = highlight_code(&source, "py");
-            lines.extend(cell_lines.into_iter().take(20));
+            lines.extend(highlight_code(&source, "py"));
         } else {
-            for l in source.lines().take(10) {
-                if !l.trim().is_empty() {
-                    lines.push(highlight_document_line(l));
-                }
+            for line in source.lines() {
+                lines.push(if line.trim().is_empty() {
+                    Line::from("")
+                } else {
+                    highlight_document_line(line)
+                });
             }
         }
 
-        // Outputs
+        // Render textual outputs as their own compact block. Rich binary MIME
+        // payloads are intentionally omitted; image output is not readable as
+        // terminal text and often contains megabytes of base64.
         if let Some(outputs) = cell["outputs"].as_array() {
-            for out in outputs.iter().take(2) {
+            for out in outputs {
                 let txt: String = out["text"].as_array()
                     .map(|a| a.iter().filter_map(|l| l.as_str()).collect())
                     .or_else(|| out["data"]["text/plain"].as_array()
                         .map(|a| a.iter().filter_map(|l| l.as_str()).collect()))
+                    .or_else(|| out["data"]["text/plain"].as_str().map(str::to_string))
                     .unwrap_or_default();
                 if !txt.is_empty() {
-                    lines.push(Line::from(Span::styled("  Out► ", Style::default().fg(SH_KW))));
-                    for ol in txt.lines().take(3) {
-                        lines.push(Line::from(Span::styled(format!("    {}", ol), Style::default().fg(SH_STR))));
+                    lines.push(Line::from(Span::styled(" OUTPUT ", Style::default().fg(Color::Black).bg(SH_KW).add_modifier(Modifier::BOLD))));
+                    for output_line in txt.lines() {
+                        lines.push(Line::from(vec![
+                            Span::styled("> ", Style::default().fg(SH_CMT)),
+                            Span::styled(output_line.to_string(), Style::default().fg(SH_STR)),
+                        ]));
                     }
                 }
             }
         }
     }
 
-    if cells.len() > 60 {
-        lines.push(Line::from(Span::styled(
-            format!("  … {} more cells", cells.len() - 60),
-            Style::default().fg(SH_CMT)
-        )));
-    }
-    PreviewContent::Highlighted(lines)
+    PreviewContent::Code(Arc::new(lines))
 }
 
 // ── RTF ───────────────────────────────────────────────────────────────────────
@@ -1811,24 +1831,17 @@ fn text_preview(p: &PathBuf) -> PreviewContent {
     // Use syntax highlighting for code files
     if is_code(&ext) && !normalized.is_empty() {
         let mut lines = header;
-        let total = normalized.lines().count();
         lines.extend(highlight_code(&normalized, &ext));
-        if total > 400 {
-            lines.push(Line::from(Span::styled(
-                format!("  … {} more lines", total - 400),
-                Style::default().fg(SH_CMT)
-            )));
-        }
-        return PreviewContent::Code(lines);
+        return PreviewContent::Code(Arc::new(lines));
     }
 
     let total = normalized.lines().count();
-    let gutter_digits = total.min(400).max(1).to_string().len();
+    let gutter_digits = total.max(1).to_string().len();
     let mut lines = header;
     if normalized.is_empty() {
         lines.push(Line::from(Span::styled("<empty file>", Style::default().fg(SH_CMT))));
     } else {
-        lines.extend(normalized.lines().enumerate().take(400).map(|(index, line)| {
+        lines.extend(normalized.lines().enumerate().map(|(index, line)| {
             Line::from(vec![
                 Span::styled(
                     format!("{:>width$}", index + 1, width = gutter_digits),
@@ -1839,13 +1852,7 @@ fn text_preview(p: &PathBuf) -> PreviewContent {
             ])
         }));
     }
-    if total > 400 {
-        lines.push(Line::from(Span::styled(
-            format!("… {} more lines", total - 400),
-            Style::default().fg(SH_CMT),
-        )));
-    }
-    PreviewContent::Code(lines)
+    PreviewContent::Code(Arc::new(lines))
 }
 
 // ── Hex dump lines ────────────────────────────────────────────────────────────
@@ -2032,6 +2039,123 @@ mod tests {
         assert_eq!(lines[99].spans[0].content.as_ref(), "100│ ");
         assert_eq!(lines[104].spans[0].content.as_ref(), "105│ ");
         assert!(lines.iter().all(|line| line.spans[0].width() == 5));
+    }
+
+    #[test]
+    fn read_only_code_preview_keeps_every_line() {
+        let path = std::env::temp_dir().join(format!(
+            "rusty-ranger-long-preview-{}-{}.py",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = (1..=710)
+            .map(|line| format!("value_{line} = {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, source).unwrap();
+
+        match text_preview(&path) {
+            PreviewContent::Code(lines) => {
+                assert_eq!(lines.len(), 710);
+                assert_eq!(lines[709].spans[0].content.as_ref(), "710│ ");
+            }
+            _ => panic!("Python should use the full code preview"),
+        }
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn notebook_preview_is_unwrapped_and_keeps_complete_cells_and_output() {
+        let path = std::env::temp_dir().join(format!(
+            "rusty-ranger-notebook-preview-{}-{}.ipynb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let notebook = serde_json::json!({
+            "metadata": { "kernelspec": { "display_name": "Python 3" } },
+            "cells": [{
+                "cell_type": "code",
+                "execution_count": 7,
+                "source": ["first = 1\n", "second = 2\n", "third = first + second"],
+                "outputs": [{ "text": ["one\n", "two\n", "three\n", "four\n"] }]
+            }, {
+                "cell_type": "markdown",
+                "source": ["# Complete markdown cell\n", "Final line"]
+            }]
+        });
+        fs::write(&path, serde_json::to_vec(&notebook).unwrap()).unwrap();
+
+        match render_notebook(&path) {
+            PreviewContent::Code(lines) => {
+                let rendered = lines
+                    .iter()
+                    .flat_map(|line| line.spans.iter())
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                assert!(rendered.contains("In [7]"));
+                assert!(rendered.contains("third"));
+                assert!(rendered.contains("four"));
+                assert!(rendered.contains("Complete markdown cell"));
+                assert!(!rendered.contains("more cells"));
+            }
+            _ => panic!("notebooks must use the non-wrapping code viewport"),
+        }
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cached_notebook_frames_share_the_parsed_line_buffer() {
+        let path = std::env::temp_dir().join(format!(
+            "rusty-ranger-notebook-cache-{}-{}.ipynb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let notebook = serde_json::json!({
+            "metadata": { "kernelspec": { "display_name": "Python 3" } },
+            "cells": [{
+                "cell_type": "code",
+                "execution_count": 1,
+                "source": (1..=500).map(|line| format!("value_{line} = {line}\n")).collect::<Vec<_>>(),
+                "outputs": []
+            }]
+        });
+        fs::write(&path, serde_json::to_vec(&notebook).unwrap()).unwrap();
+
+        let first = render(
+            &path,
+            0,
+            false,
+            crate::state::OfficeRenderMode::Text,
+            crate::state::PdfRenderMode::Text,
+            0,
+        );
+        let second = render(
+            &path,
+            0,
+            false,
+            crate::state::OfficeRenderMode::Text,
+            crate::state::PdfRenderMode::Text,
+            0,
+        );
+        match (first, second) {
+            (PreviewContent::Code(first), PreviewContent::Code(second)) => {
+                assert!(Arc::ptr_eq(&first, &second));
+            }
+            _ => panic!("cached notebook must remain a shared code viewport"),
+        }
+
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
