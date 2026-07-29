@@ -347,6 +347,7 @@ pub struct AppState {
     pub context_menu_target: Option<PathBuf>,
     pub context_menu_items:  Vec<ContextAction>,
     pub context_menu_hover:  Option<usize>,
+    pub hovered_row:         Option<(usize, usize)>,
     pub pending_menu_pos:    (u16, u16),
 
     // Stable Properties target and non-blocking recursive folder totals.
@@ -424,6 +425,7 @@ impl AppState {
             context_menu_target: None,
             context_menu_items: Vec::new(),
             context_menu_hover: None,
+            hovered_row: None,
             pending_menu_pos: (0, 0),
             properties_path: None,
             properties_stats: None,
@@ -548,7 +550,7 @@ impl AppState {
         self.refresh_property_scan();
 
         // Poll with timeout to prevent blocking forever
-        if !event::poll(Duration::from_millis(100))? {
+        if !event::poll(Duration::from_millis(16))? {
             return Ok(false);
         }
 
@@ -871,8 +873,13 @@ impl AppState {
                 self.last_event_time = Instant::now();
                 match mouse.kind {
                     MouseEventKind::Moved => {
+                        let geo = self.layout_geometry.lock().clone();
+                        self.hovered_row = geo.row_rects.iter().find_map(|(pane_idx, rows)| {
+                            rows.iter()
+                                .find(|(_, rect)| point_in(mouse.column, mouse.row, rect))
+                                .map(|(file_idx, _)| (*pane_idx, *file_idx))
+                        });
                         if self.mode == AppMode::ContextMenu {
-                            let geo = self.layout_geometry.lock().clone();
                             self.context_menu_hover = geo.context_menu_item_rects.iter()
                                 .position(|(rect, _)| point_in(mouse.column, mouse.row, rect));
                         }

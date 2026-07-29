@@ -246,23 +246,26 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
             if *y >= max_y { return; }
             let rect = Rect { x: inner.x, y: *y, width: inner.width, height: 1 };
             
-            let label_span = Span::styled(format!("  {} {:<9}", icon, label), Style::default().fg(C_TEXT));
-            let badge1_style = if !is_opt2 {
+            let label_span = Span::styled(format!("  {} {:<6}", icon, label), Style::default().fg(C_TEXT));
+            let badge_style = |active: bool| if active {
                 Style::default().fg(Color::Black).bg(C_ACCENT).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(C_MUTED).bg(t.sel_bg_inactive)
             };
-            let badge2_style = if is_opt2 {
-                Style::default().fg(Color::Black).bg(C_ACCENT).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(C_MUTED).bg(t.sel_bg_inactive)
+            let cap_style = |active: bool| {
+                let color = if active { C_ACCENT } else { t.sel_bg_inactive };
+                Style::default().fg(color).bg(t.bg_panel)
             };
 
             let line = Line::from(vec![
                 label_span,
-                Span::styled(format!(" {} ", opt1), badge1_style),
-                Span::styled(" ", Style::default()),
-                Span::styled(format!(" {} ", opt2), badge2_style),
+                Span::styled("", cap_style(!is_opt2)),
+                Span::styled(opt1, badge_style(!is_opt2)),
+                Span::styled("", cap_style(!is_opt2)),
+                Span::raw(" "),
+                Span::styled("", cap_style(is_opt2)),
+                Span::styled(opt2, badge_style(is_opt2)),
+                Span::styled("", cap_style(is_opt2)),
             ]);
 
             f.render_widget(Paragraph::new(line), rect);
@@ -277,7 +280,8 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
             let rect = Rect { x: inner.x, y, width: inner.width, height: 1 };
             let prefix = Span::styled("  ↕ ", Style::default().fg(C_TEXT));
             let mut click_x = rect.x + prefix.width() as u16;
-            let mut spans = vec![prefix];
+            let mut spans = vec![prefix, Span::styled("", Style::default().fg(t.sel_bg_inactive).bg(t.bg_panel))];
+            click_x = click_x.saturating_add(1);
             for (label, mode, action) in [
                 ("Name", SortMode::Name, crate::state::ToggleAction::SortName),
                 ("Date", SortMode::Modified, crate::state::ToggleAction::SortModified),
@@ -288,7 +292,7 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
                 } else {
                     Style::default().fg(C_MUTED).bg(t.sel_bg_inactive)
                 };
-                let badge = format!(" {} ", label);
+                let badge = format!("{}", label);
                 let badge_width = Span::raw(&badge).width() as u16;
                 geo.toggle_rects.push((
                     Rect { x: click_x, y, width: badge_width, height: 1 },
@@ -297,6 +301,7 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
                 spans.push(Span::styled(badge, style));
                 click_x = click_x.saturating_add(badge_width);
             }
+            spans.push(Span::styled("", Style::default().fg(t.sel_bg_inactive).bg(t.bg_panel)));
             f.render_widget(Paragraph::new(Line::from(spans)), rect);
             y += 1;
         }
@@ -1037,7 +1042,7 @@ fn draw_dir_pane(f: &mut Frame, app: &AppState, level: &DirLevel, is_current: bo
             };
             let details_width = Span::raw(details.as_str()).width();
             let name_budget = (list_inner_area.width as usize)
-                .saturating_sub(2 + details_width + usize::from(!details.is_empty()));
+                .saturating_sub(3 + details_width + usize::from(!details.is_empty()));
             let shown_name = truncate(&raw_name, name_budget.max(4));
 
             let folder_icon = get_icon_set().folder;
@@ -1049,6 +1054,7 @@ fn draw_dir_pane(f: &mut Frame, app: &AppState, level: &DirLevel, is_current: bo
             };
             let is_marked = level.marked.contains(&p.path);
             let is_selected = file_i == level.selected;
+            let is_hovered = app.hovered_row == Some((pane_idx, file_i));
             let is_search_match = is_current
                 && app.search_active
                 && !app.search_query.is_empty()
@@ -1059,7 +1065,7 @@ fn draw_dir_pane(f: &mut Frame, app: &AppState, level: &DirLevel, is_current: bo
             if is_selected {
                 let bg = if is_current { C_SEL_BG } else { C_SEL_BG_INACTIVE };
                 let fg_color = if is_current { C_ACCENT } else { C_TEXT };
-                let cap_width = if app.rounded_selection { 2 } else { 0 };
+                let cap_width = if app.rounded_selection { 2 } else { 1 };
                 let inner_w = (list_inner_area.width as usize).saturating_sub(cap_width);
                 
                 let icon_selected_span = Span::styled(icon, Style::default().fg(icon_color).bg(bg));
@@ -1072,6 +1078,8 @@ fn draw_dir_pane(f: &mut Frame, app: &AppState, level: &DirLevel, is_current: bo
                 let mut spans = Vec::new();
                 if app.rounded_selection {
                     spans.push(Span::styled("", Style::default().fg(bg).bg(t.bg_panel)));
+                } else {
+                    spans.push(Span::raw(" "));
                 }
                 spans.extend([
                     icon_selected_span,
@@ -1087,10 +1095,27 @@ fn draw_dir_pane(f: &mut Frame, app: &AppState, level: &DirLevel, is_current: bo
                     spans.push(Span::styled("", Style::default().fg(bg).bg(t.bg_panel)));
                 }
                 ListItem::new(Line::from(spans))
-            } else if is_marked {
-                let used = icon_span.width() + 1 + Span::raw(shown_name.as_str()).width()
+            } else if is_hovered {
+                let bg = t.sel_bg_inactive;
+                let used = 1 + icon_span.width() + 1 + Span::raw(shown_name.as_str()).width()
                     + details_width + usize::from(!details.is_empty());
                 let mut spans = vec![
+                    Span::styled(" ", Style::default().bg(bg)),
+                    Span::styled(icon, Style::default().fg(icon_color).bg(bg)),
+                    Span::styled(" ", Style::default().bg(bg)),
+                    Span::styled(shown_name.clone(), Style::default().fg(C_ACCENT).bg(bg).add_modifier(Modifier::BOLD)),
+                    Span::styled(" ".repeat((list_inner_area.width as usize).saturating_sub(used)), Style::default().bg(bg)),
+                ];
+                if !details.is_empty() {
+                    spans.push(Span::styled(" ", Style::default().bg(bg)));
+                    spans.push(Span::styled(details, Style::default().fg(C_MUTED).bg(bg)));
+                }
+                ListItem::new(Line::from(spans))
+            } else if is_marked {
+                let used = 1 + icon_span.width() + 1 + Span::raw(shown_name.as_str()).width()
+                    + details_width + usize::from(!details.is_empty());
+                let mut spans = vec![
+                    Span::raw(" "),
                     icon_span,
                     Span::styled(" ", Style::default()),
                     Span::styled(shown_name.clone(), Style::default().fg(C_MARK).add_modifier(Modifier::BOLD)),
@@ -1109,9 +1134,10 @@ fn draw_dir_pane(f: &mut Frame, app: &AppState, level: &DirLevel, is_current: bo
                 } else {
                     Style::default().fg(C_MUTED)
                 };
-                let used = icon_span.width() + 1 + Span::raw(shown_name.as_str()).width()
+                let used = 1 + icon_span.width() + 1 + Span::raw(shown_name.as_str()).width()
                     + details_width + usize::from(!details.is_empty());
                 let mut spans = vec![
+                    Span::raw(" "),
                     icon_span,
                     Span::styled(" ", Style::default()),
                     Span::styled(shown_name.clone(), style),
@@ -1380,7 +1406,7 @@ fn draw_preview_pane(f: &mut Frame, app: &AppState, level: &DirLevel, area: Rect
                 .take(app.edit_cursor_col.min(raw_line.chars().count()))
                 .collect::<String>();
             let display_head = preview::expand_editor_tabs(&head);
-            let gutter_width = Span::raw(format!("{:>3} │ ", app.edit_cursor_row + 1)).width() as u16;
+            let gutter_width = Span::raw(format!("{:>2} │ ", app.edit_cursor_row + 1)).width() as u16;
             let cursor_x = editor_area.x
                 .saturating_add(gutter_width)
                 .saturating_add(Span::raw(display_head).width() as u16);

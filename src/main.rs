@@ -29,9 +29,10 @@ const FONT_SIZE: u32 = 9;
 fn try_relaunch_in_wt_profile() -> bool {
     use std::path::PathBuf;
 
-    // Only relaunch into a dedicated WT profile if explicitly requested with --wt flag
+    // Relaunch once into the compact dedicated profile. Users can still use
+    // Ctrl+Plus in Windows Terminal when they prefer a larger layout.
     let args: Vec<String> = std::env::args().collect();
-    if !args.iter().any(|a| a == "--wt") {
+    if args.iter().any(|a| a == "--launched") {
         return false;
     }
 
@@ -189,7 +190,7 @@ fn main() -> anyhow::Result<()> {
                 >() as u32;
                 font_info.nFont = 0;
                 font_info.dwFontSize.X = 0;
-                font_info.dwFontSize.Y = 14; // 14px height (~10.5pt)
+                font_info.dwFontSize.Y = 12; // compact fallback matching the 9pt WT profile
                 font_info.FontFamily = 54; // FF_DONTCARE | TMPF_TRUETYPE
                 font_info.FontWeight = 400; // FW_NORMAL
 

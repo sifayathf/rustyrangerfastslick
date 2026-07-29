@@ -22,12 +22,14 @@ use ratatui::{
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct ImageFallbackInfo {
     pub path: PathBuf,
     pub dimensions: Option<(u32, u32)>,
     pub img: Option<std::sync::Arc<image::DynamicImage>>,
 }
 
+#[derive(Clone)]
 pub enum PreviewContent {
     Text(String),
     Highlighted(Vec<Line<'static>>),
@@ -61,6 +63,20 @@ struct ImgCache {
 static IMG_CACHE: Lazy<Mutex<Option<ImgCache>>> = Lazy::new(|| Mutex::new(None));
 static OFFICE_RENDER_FAILURES: Lazy<Mutex<std::collections::HashMap<PathBuf, std::time::Instant>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+static VISUAL_RENDER_PENDING: Lazy<Mutex<std::collections::HashSet<PathBuf>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
+
+struct PreviewCacheEntry {
+    path: PathBuf,
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+    office_full: bool,
+    pdf_visual: bool,
+    slide_idx: usize,
+    content: PreviewContent,
+}
+
+static PREVIEW_CACHE: Lazy<Mutex<Option<PreviewCacheEntry>>> = Lazy::new(|| Mutex::new(None));
 
 fn get_or_decode(path: &PathBuf, rotation: u32, flip_h: bool) -> Option<Arc<image::DynamicImage>> {
     {
@@ -139,7 +155,29 @@ pub fn render(
         .unwrap_or("")
         .to_lowercase();
 
-    match ext.as_str() {
+    let metadata = fs::metadata(p).ok();
+    let modified = metadata.as_ref().and_then(|value| value.modified().ok());
+    let len = metadata.as_ref().map_or(0, |value| value.len());
+    let office_full = office_mode == crate::state::OfficeRenderMode::Full;
+    let pdf_visual = pdf_mode == crate::state::PdfRenderMode::Visual;
+    let visual_requested = (office_full
+        && matches!(ext.as_str(), "doc" | "docx" | "xls" | "xlsx" | "ods" | "ppt" | "pptx"))
+        || (pdf_visual && ext == "pdf");
+    if !visual_requested {
+        if let Some(cache) = PREVIEW_CACHE.lock().as_ref() {
+            if cache.path == *p
+                && cache.modified == modified
+                && cache.len == len
+                && cache.office_full == office_full
+                && cache.pdf_visual == pdf_visual
+                && cache.slide_idx == slide_idx
+            {
+                return cache.content.clone();
+            }
+        }
+    }
+
+    let content = match ext.as_str() {
         "jpg"|"jpeg"|"png"|"bmp"|"gif"|"webp"|"tiff"|"tif"|"ico"
             => render_image(p, rotation, flip_h),
         "mp4"|"mkv"|"avi"|"mov"|"webm"|"flv"|"wmv"|"m4v"
@@ -156,7 +194,19 @@ pub fn render(
         "zip"|"7z"|"tar"|"gz"|"bz2"|"xz"|"rar"|"tgz"
             => render_archive(p),
         _   => text_preview(p),
+    };
+    if !visual_requested {
+        *PREVIEW_CACHE.lock() = Some(PreviewCacheEntry {
+            path: p.clone(),
+            modified,
+            len,
+            office_full,
+            pdf_visual,
+            slide_idx,
+            content: content.clone(),
+        });
     }
+    content
 }
 
 pub fn is_visual_preview(
@@ -367,7 +417,7 @@ fn highlight_code_with_limit(text: &str, ext: &str, max_lines: usize) -> Vec<Lin
 
         // Line number gutter
         spans.push(Span::styled(
-            format!("{:>3} │ ", ln_idx + 1),
+            format!("{:>2} │ ", ln_idx + 1),
             Style::default().fg(SH_LN),
         ));
 
@@ -828,7 +878,68 @@ where
     f()
 }
 
+fn get_pdf_cache_path(p: &PathBuf, page_idx: usize) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(p.to_string_lossy().as_bytes());
+    if let Ok(meta) = fs::metadata(p) {
+        if let Ok(modified) = meta.modified() {
+            if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
+                hasher.update(duration.as_secs().to_le_bytes());
+            }
+        }
+    }
+    hasher.update(page_idx.to_le_bytes());
+    std::env::temp_dir().join(format!("rr_pdf_{}.png", hex::encode(hasher.finalize())))
+}
+
+fn try_render_pdf_visual(p: &PathBuf, page_idx: usize) -> Result<Option<PreviewContent>, ()> {
+    let cache_path = get_pdf_cache_path(p, page_idx);
+    if cache_path.exists() {
+        return Ok(Some(render_image(&cache_path, 0, false)));
+    }
+    if OFFICE_RENDER_FAILURES.lock().get(&cache_path)
+        .is_some_and(|failed_at| failed_at.elapsed() < std::time::Duration::from_secs(30))
+    {
+        return Err(());
+    }
+    {
+        let mut pending = VISUAL_RENDER_PENDING.lock();
+        if !pending.insert(cache_path.clone()) {
+            return Ok(None);
+        }
+    }
+    let source = p.clone();
+    std::thread::spawn(move || {
+        let generated = render_office_pdf_page(&source, &cache_path, page_idx);
+        VISUAL_RENDER_PENDING.lock().remove(&cache_path);
+        if generated {
+            OFFICE_RENDER_FAILURES.lock().remove(&cache_path);
+        } else {
+            OFFICE_RENDER_FAILURES.lock().insert(cache_path, std::time::Instant::now());
+        }
+    });
+    Ok(None)
+}
+
 fn render_pdf(p: &PathBuf, pdf_mode: crate::state::PdfRenderMode) -> PreviewContent {
+    if pdf_mode == crate::state::PdfRenderMode::Visual {
+        match try_render_pdf_visual(p, 0) {
+            Ok(Some(content)) => return content,
+            Ok(None) => {
+                return PreviewContent::Highlighted(vec![
+                    Line::from(Span::styled("PDF Visual Preview", Style::default().fg(SH_FN).add_modifier(Modifier::BOLD))),
+                    Line::from(Span::styled("Rendering first page in the background…", Style::default().fg(SH_CMT))),
+                ]);
+            }
+            Err(()) => {
+                return PreviewContent::Highlighted(vec![
+                    Line::from(Span::styled("PDF visual renderer unavailable", Style::default().fg(Color::Red))),
+                    Line::from(Span::styled("Switch PDF to Text mode to read extracted content.", Style::default().fg(SH_CMT))),
+                ]);
+            }
+        }
+    }
     let mut lines = meta_header(p);
     match fs::read(p) {
         Ok(bytes) => {
@@ -846,10 +957,9 @@ fn render_pdf(p: &PathBuf, pdf_mode: crate::state::PdfRenderMode) -> PreviewCont
 
             match safe_parse(move || run_silenced(|| pdf_extract::extract_text_from_mem(&bytes))) {
                 Some(Ok(text)) => {
-                    let mode_badge = if pdf_mode == crate::state::PdfRenderMode::Text { " [Text Mode]" } else { " [Visual Mode]" };
                     lines.push(Line::from(vec![
                         Span::styled("📄  PDF Document", Style::default().fg(SH_FN)),
-                        Span::styled(mode_badge, Style::default().fg(SH_CMT)),
+                        Span::styled(" [Text Mode]", Style::default().fg(SH_CMT)),
                     ]));
                     lines.push(Line::from(Span::styled("─".repeat(50), Style::default().fg(SH_CMT))));
                     if text.trim().is_empty() {
@@ -899,6 +1009,7 @@ fn get_office_cache_path(p: &PathBuf, page_idx: usize) -> PathBuf {
     std::env::temp_dir().join(format!("rr_office_{}.png", hash))
 }
 
+#[cfg(test)]
 fn try_render_embedded_office_thumbnail(
     p: &PathBuf,
     rotation: u32,
@@ -950,13 +1061,17 @@ fn render_office_pdf_page(
 ) -> bool {
     let output_prefix = png_path.with_extension("");
     let page_number = page_idx.saturating_add(1).to_string();
-    let candidates = [
-        "pdftoppm",
-        "C:\\Program Files\\poppler\\Library\\bin\\pdftoppm.exe",
-        "C:\\Program Files\\poppler\\bin\\pdftoppm.exe",
+    let mut candidates = vec![
+        PathBuf::from("pdftoppm"),
+        PathBuf::from("C:\\Program Files\\poppler\\Library\\bin\\pdftoppm.exe"),
+        PathBuf::from("C:\\Program Files\\poppler\\bin\\pdftoppm.exe"),
+        PathBuf::from("C:\\ProgramData\\chocolatey\\bin\\pdftoppm.exe"),
     ];
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\native\\poppler\\Library\\bin\\pdftoppm.exe"));
+    }
     for candidate in candidates {
-        let status = Command::new(candidate)
+        let status = Command::new(&candidate)
             .arg("-f").arg(&page_number)
             .arg("-l").arg(&page_number)
             .arg("-singlefile")
@@ -975,6 +1090,35 @@ fn render_office_pdf_page(
 }
 
 fn try_render_office_exact(
+    p: &PathBuf,
+    rotation: u32,
+    flip_h: bool,
+    page_idx: usize,
+) -> Option<PreviewContent> {
+    let cache_path = get_office_cache_path(p, page_idx);
+    if cache_path.exists() {
+        return Some(render_image(&cache_path, rotation, flip_h));
+    }
+    if OFFICE_RENDER_FAILURES.lock().get(&cache_path)
+        .is_some_and(|failed_at| failed_at.elapsed() < std::time::Duration::from_secs(30))
+    {
+        return None;
+    }
+    {
+        let mut pending = VISUAL_RENDER_PENDING.lock();
+        if !pending.insert(cache_path.clone()) {
+            return None;
+        }
+    }
+    let source = p.clone();
+    std::thread::spawn(move || {
+        let _ = generate_office_exact_sync(&source, rotation, flip_h, page_idx);
+        VISUAL_RENDER_PENDING.lock().remove(&cache_path);
+    });
+    None
+}
+
+fn generate_office_exact_sync(
     p: &PathBuf,
     rotation: u32,
     flip_h: bool,
@@ -1002,11 +1146,6 @@ fn try_render_office_exact(
             }
         }
     }
-    if page_idx == 0 {
-        if let Some(thumbnail) = try_render_embedded_office_thumbnail(p, rotation, flip_h) {
-            return Some(thumbnail);
-        }
-    }
     {
         let failures = OFFICE_RENDER_FAILURES.lock();
         if failures.get(&cache_path)
@@ -1023,13 +1162,15 @@ fn try_render_office_exact(
     let pdf_path = work_dir.join("document.pdf");
 
     if ext == "ppt" || ext == "pptx" {
-        // PowerPoint slide collections are one-based.
+        // Keep the COM invocation aligned with the proven main-branch
+        // implementation; slide collections are one-based.
         let script = format!(
             "$ErrorActionPreference = 'Stop'\n\
              $ppt = $null\n$pres = $null\n\
              try {{\n\
                $ppt = New-Object -ComObject PowerPoint.Application\n\
-               $pres = $ppt.Presentations.Open('{}', -1, 0, 0)\n\
+               $ppt.Visible = [Microsoft.Office.Core.MsoTriState]::msoFalse\n\
+               $pres = $ppt.Presentations.Open('{}', [Microsoft.Office.Core.MsoTriState]::msoTrue, [Microsoft.Office.Core.MsoTriState]::msoFalse, [Microsoft.Office.Core.MsoTriState]::msoFalse)\n\
                $pres.Slides.Item({}).Export('{}', 'PNG')\n\
              }} finally {{\n\
                if ($pres -ne $null) {{ $pres.Close() }}\n\
@@ -1686,7 +1827,7 @@ fn text_preview(p: &PathBuf) -> PreviewContent {
     } else {
         lines.extend(normalized.lines().enumerate().take(400).map(|(index, line)| {
             Line::from(vec![
-                Span::styled(format!("{:>3}", index + 1), Style::default().fg(SH_LN)),
+                Span::styled(format!("{:>2}", index + 1), Style::default().fg(SH_LN)),
                 Span::styled(" │ ", Style::default().fg(SH_CMT)),
                 Span::styled(line.to_string(), Style::default().fg(SH_FG)),
             ])
@@ -1861,7 +2002,7 @@ mod tests {
         match text_preview(&path) {
             PreviewContent::Code(lines) => {
                 assert_eq!(lines.len(), 2);
-                assert_eq!(lines[0].spans[0].content.as_ref(), "  1");
+                assert_eq!(lines[0].spans[0].content.as_ref(), " 1");
                 assert_eq!(lines[0].spans[1].content.as_ref(), " │ ");
                 assert_eq!(lines[0].spans[2].content.as_ref(), "alpha");
                 assert_ne!(lines[0].spans[0].style.fg, lines[0].spans[2].style.fg);
@@ -1870,5 +2011,50 @@ mod tests {
         }
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pdf_visual_backend_produces_a_real_image_when_available() {
+        let base = std::env::temp_dir().join(format!(
+            "rusty-ranger-pdf-visual-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pdf = base.with_extension("pdf");
+        let png = base.with_extension("png");
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>",
+            "<< /Length 22 >>\nstream\n0 0 1 rg 20 20 160 160 re f\nendstream",
+        ];
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", index + 1, object).as_bytes());
+        }
+        let xref = bytes.len();
+        bytes.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes());
+        for offset in offsets {
+            bytes.extend_from_slice(format!("{:010} 00000 n \n", offset).as_bytes());
+        }
+        bytes.extend_from_slice(format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            objects.len() + 1,
+            xref
+        ).as_bytes());
+        fs::write(&pdf, bytes).unwrap();
+
+        if render_office_pdf_page(&pdf, &png, 0) {
+            let image = image::open(&png).expect("rendered PDF page should be a valid image");
+            assert!(image.width() > 0 && image.height() > 0);
+        }
+
+        let _ = fs::remove_file(pdf);
+        let _ = fs::remove_file(png);
     }
 }
