@@ -19,6 +19,7 @@ pub enum PreviewCmd {
         cell_rect: TuiRect,
         term_cols: u16,
         term_rows: u16,
+        background: u32,
     },
     Hide,
     Quit,
@@ -37,8 +38,8 @@ impl NativePreviewManager {
         Self { sender: tx }
     }
 
-    pub fn show(&self, img: Arc<DynamicImage>, path: std::path::PathBuf, rotation: u32, flip_h: bool, cell_rect: TuiRect, term_cols: u16, term_rows: u16) {
-        let _ = self.sender.send(PreviewCmd::ShowImage { img, path, rotation, flip_h, cell_rect, term_cols, term_rows });
+    pub fn show(&self, img: Arc<DynamicImage>, path: std::path::PathBuf, rotation: u32, flip_h: bool, cell_rect: TuiRect, term_cols: u16, term_rows: u16, background: u32) {
+        let _ = self.sender.send(PreviewCmd::ShowImage { img, path, rotation, flip_h, cell_rect, term_cols, term_rows, background });
     }
 
     pub fn hide(&self) {
@@ -218,6 +219,7 @@ struct WindowState {
     img_bgra: Vec<u8>,
     img_w: u32,
     img_h: u32,
+    background: u32,
 }
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -240,8 +242,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
                     GetClientRect(hwnd, &mut rect);
                     
-                    // Dark background fill (#1e1e2e equivalent)
-                    let brush = CreateSolidBrush(30 | (30 << 8) | (46 << 16));
+                    let brush = CreateSolidBrush(state.background);
                     FillRect(hdc, &rect, brush);
                     DeleteObject(brush);
 
@@ -290,6 +291,7 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
             img_bgra: Vec::new(),
             img_w: 0,
             img_h: 0,
+            background: 30 | (30 << 8) | (46 << 16),
         })));
 
         let class_name = "RustyRangerPreview\0".encode_utf16().collect::<Vec<_>>();
@@ -337,7 +339,7 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
         // PPTX), which are all near-identically-sized generated PNGs — using
         // pointer identity there caused the overlay to wrongly think a
         // brand-new preview was "the same image" and skip repainting.
-        let mut last_key: Option<(std::path::PathBuf, u32, bool)> = None;
+        let mut last_key: Option<(std::path::PathBuf, u32, bool, u32)> = None;
         let mut last_cell_rect: TuiRect = TuiRect { x: 0, y: 0, width: 0, height: 0 };
         let mut last_term_cols: u16 = 0;
         let mut last_term_rows: u16 = 0;
@@ -383,8 +385,8 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
 
             if let Some(cmd) = latest_cmd {
                 match cmd {
-                    PreviewCmd::ShowImage { img, path, rotation, flip_h, cell_rect, term_cols, term_rows } => {
-                        let key = (path, rotation, flip_h);
+                    PreviewCmd::ShowImage { img, path, rotation, flip_h, cell_rect, term_cols, term_rows, background } => {
+                        let key = (path, rotation, flip_h, background);
                         let unchanged = Some(&key) == last_key.as_ref()
                             && cell_rect == last_cell_rect
                             && term_cols == last_term_cols
@@ -392,6 +394,9 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
                             && is_visible;
 
                         if !unchanged {
+                            if let Ok(mut state) = (*state_ptr).lock() {
+                                state.background = background;
+                            }
                             last_cell_rect = cell_rect;
                             last_term_cols = term_cols;
                             last_term_rows = term_rows;

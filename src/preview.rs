@@ -59,6 +59,8 @@ struct ImgCache {
 }
 
 static IMG_CACHE: Lazy<Mutex<Option<ImgCache>>> = Lazy::new(|| Mutex::new(None));
+static OFFICE_RENDER_FAILURES: Lazy<Mutex<std::collections::HashMap<PathBuf, std::time::Instant>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
 fn get_or_decode(path: &PathBuf, rotation: u32, flip_h: bool) -> Option<Arc<image::DynamicImage>> {
     {
@@ -105,6 +107,21 @@ pub fn cached_list_dir(path: &PathBuf) -> Vec<crate::state::DirEntryInfo> {
     entries
 }
 
+/// Drop the directory-preview cache after a filesystem mutation.
+/// Passing `None` clears it unconditionally; a path only clears a matching
+/// cached directory.
+pub fn invalidate_cached_dir(path: Option<&std::path::Path>) {
+    let mut cache = DIR_CACHE.lock();
+    let should_clear = match (cache.as_ref(), path) {
+        (Some(entry), Some(path)) => entry.path == path,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    if should_clear {
+        *cache = None;
+    }
+}
+
 // ── Public render function ────────────────────────────────────────────────────
 
 pub fn render(
@@ -140,6 +157,46 @@ pub fn render(
             => render_archive(p),
         _   => text_preview(p),
     }
+}
+
+pub fn is_visual_preview(
+    path: Option<&PathBuf>,
+    office_mode: crate::state::OfficeRenderMode,
+    pdf_mode: crate::state::PdfRenderMode,
+) -> bool {
+    let ext = path
+        .and_then(|value| value.extension())
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "jpg" | "jpeg" | "png" | "bmp" | "gif" | "webp" | "tiff" | "tif" | "ico"
+    ) || (matches!(ext.as_str(), "doc" | "docx" | "xls" | "xlsx" | "ods" | "ppt" | "pptx")
+        && office_mode == crate::state::OfficeRenderMode::Full)
+        || (ext == "pdf" && pdf_mode == crate::state::PdfRenderMode::Visual)
+}
+
+pub fn presentation_slide_count(path: &PathBuf) -> Option<usize> {
+    if path.extension()
+        .and_then(|value| value.to_str())
+        .is_none_or(|value| !value.eq_ignore_ascii_case("pptx"))
+    {
+        return None;
+    }
+    let file = fs::File::open(path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let count = (0..archive.len())
+        .filter_map(|index| archive.by_index(index).ok().map(|entry| entry.name().to_string()))
+        .filter(|name| {
+            let Some(stem) = name.strip_prefix("ppt/slides/slide") else {
+                return false;
+            };
+            stem.strip_suffix(".xml")
+                .is_some_and(|number| !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()))
+        })
+        .count();
+    (count > 0).then_some(count)
 }
 
 // ── Metadata header ───────────────────────────────────────────────────────────
@@ -262,6 +319,39 @@ fn highlight_document_line(line: &str) -> Line<'static> {
 // ── Syntax highlighting ───────────────────────────────────────────────────────
 
 fn highlight_code(text: &str, ext: &str) -> Vec<Line<'static>> {
+    highlight_code_with_limit(text, ext, 400)
+}
+
+/// Syntax-highlight the live editor buffer without flattening its line
+/// structure. Unlike the read-only preview, the editor must not truncate at
+/// 400 lines because its cursor can move through the entire file.
+pub fn highlight_editor_buffer(buffer: &[String], ext: &str) -> Vec<Line<'static>> {
+    let display_text = buffer.iter()
+        .map(|line| expand_editor_tabs(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    highlight_code_with_limit(&display_text, ext, usize::MAX)
+}
+
+/// Expand tabs for display only. The underlying edit buffer keeps the exact
+/// characters from disk, while the preview uses stable four-column tab stops.
+pub fn expand_editor_tabs(line: &str) -> String {
+    let mut result = String::new();
+    let mut column = 0usize;
+    for ch in line.chars() {
+        if ch == '\t' {
+            let spaces = 4 - (column % 4);
+            result.push_str(&" ".repeat(spaces));
+            column += spaces;
+        } else {
+            result.push(ch);
+            column += 1;
+        }
+    }
+    result
+}
+
+fn highlight_code_with_limit(text: &str, ext: &str, max_lines: usize) -> Vec<Line<'static>> {
     let keywords  = language_keywords(ext);
     let types_bi  = language_types(ext);
     let cmt_line  = line_comment_prefix(ext);
@@ -272,7 +362,7 @@ fn highlight_code(text: &str, ext: &str) -> Vec<Line<'static>> {
     // We need cross-line block-comment tracking
     let mut in_block_cmt = false;
 
-    for (ln_idx, raw_line) in text.lines().enumerate().take(400) {
+    for (ln_idx, raw_line) in text.split('\n').enumerate().take(max_lines) {
         let mut spans: Vec<Span<'static>> = Vec::new();
 
         // Line number gutter
@@ -793,7 +883,7 @@ fn render_pdf(p: &PathBuf, pdf_mode: crate::state::PdfRenderMode) -> PreviewCont
 
 // ── EXACT OFFICE RENDERING ────────────────────────────────────────────────────
 
-fn get_office_cache_path(p: &PathBuf) -> PathBuf {
+fn get_office_cache_path(p: &PathBuf, page_idx: usize) -> PathBuf {
     use sha2::{Sha256, Digest};
     let mut hasher = Sha256::new();
     hasher.update(p.to_string_lossy().as_bytes());
@@ -804,33 +894,152 @@ fn get_office_cache_path(p: &PathBuf) -> PathBuf {
             }
         }
     }
+    hasher.update(page_idx.to_le_bytes());
     let hash = hex::encode(hasher.finalize());
     std::env::temp_dir().join(format!("rr_office_{}.png", hash))
 }
 
-fn try_render_office_exact(p: &PathBuf, rotation: u32, flip_h: bool) -> Option<PreviewContent> {
+fn try_render_embedded_office_thumbnail(
+    p: &PathBuf,
+    rotation: u32,
+    flip_h: bool,
+) -> Option<PreviewContent> {
+    let file = fs::File::open(p).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    for name in [
+        "docProps/thumbnail.jpeg",
+        "docProps/thumbnail.jpg",
+        "docProps/thumbnail.png",
+        "docProps/Thumbnail.jpeg",
+    ] {
+        let mut entry = match archive.by_name(name) {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).ok()?;
+        let raw = image::load_from_memory(&bytes).ok()?;
+        let rotated = match rotation {
+            90 => raw.rotate90(),
+            180 => raw.rotate180(),
+            270 => raw.rotate270(),
+            _ => raw,
+        };
+        let image = if flip_h { rotated.fliph() } else { rotated };
+        let dimensions = Some((image.width(), image.height()));
+        let image = Arc::new(image);
+        *IMG_CACHE.lock() = Some(ImgCache {
+            path: p.clone(),
+            rotation,
+            flip_h,
+            img: Arc::clone(&image),
+        });
+        return Some(PreviewContent::ImageFallback(ImageFallbackInfo {
+            path: p.clone(),
+            dimensions,
+            img: Some(image),
+        }));
+    }
+    None
+}
+
+fn render_office_pdf_page(
+    pdf_path: &std::path::Path,
+    png_path: &std::path::Path,
+    page_idx: usize,
+) -> bool {
+    let output_prefix = png_path.with_extension("");
+    let page_number = page_idx.saturating_add(1).to_string();
+    let candidates = [
+        "pdftoppm",
+        "C:\\Program Files\\poppler\\Library\\bin\\pdftoppm.exe",
+        "C:\\Program Files\\poppler\\bin\\pdftoppm.exe",
+    ];
+    for candidate in candidates {
+        let status = Command::new(candidate)
+            .arg("-f").arg(&page_number)
+            .arg("-l").arg(&page_number)
+            .arg("-singlefile")
+            .arg("-png")
+            .arg("-r").arg("144")
+            .arg(pdf_path)
+            .arg(&output_prefix)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if status.map_or(false, |value| value.success()) && png_path.exists() {
+            return true;
+        }
+    }
+    false
+}
+
+fn try_render_office_exact(
+    p: &PathBuf,
+    rotation: u32,
+    flip_h: bool,
+    page_idx: usize,
+) -> Option<PreviewContent> {
     let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-    let cache_path = get_office_cache_path(p);
+    let cache_path = get_office_cache_path(p, page_idx);
 
     if cache_path.exists() {
         return Some(render_image(&cache_path, rotation, flip_h));
     }
+    {
+        let cache = IMG_CACHE.lock();
+        if let Some(entry) = cache.as_ref() {
+            if page_idx == 0
+                && &entry.path == p
+                && entry.rotation == rotation
+                && entry.flip_h == flip_h
+            {
+                return Some(PreviewContent::ImageFallback(ImageFallbackInfo {
+                    path: p.clone(),
+                    dimensions: Some((entry.img.width(), entry.img.height())),
+                    img: Some(Arc::clone(&entry.img)),
+                }));
+            }
+        }
+    }
+    if page_idx == 0 {
+        if let Some(thumbnail) = try_render_embedded_office_thumbnail(p, rotation, flip_h) {
+            return Some(thumbnail);
+        }
+    }
+    {
+        let failures = OFFICE_RENDER_FAILURES.lock();
+        if failures.get(&cache_path)
+            .is_some_and(|failed_at| failed_at.elapsed() < std::time::Duration::from_secs(30))
+        {
+            return None;
+        }
+    }
 
     let mut generated = false;
+    let cache_stem = cache_path.file_stem().unwrap_or_default().to_string_lossy();
+    let work_dir = std::env::temp_dir().join(format!("{}_work", cache_stem));
+    let _ = fs::create_dir_all(&work_dir);
+    let pdf_path = work_dir.join("document.pdf");
 
     if ext == "ppt" || ext == "pptx" {
-        // Use PowerPoint COM to export the first slide to PNG
+        // PowerPoint slide collections are one-based.
         let script = format!(
-            "$ppt = New-Object -ComObject PowerPoint.Application\n\
-             $ppt.Visible = [Microsoft.Office.Core.MsoTriState]::msoFalse\n\
-             $pres = $ppt.Presentations.Open('{}', [Microsoft.Office.Core.MsoTriState]::msoTrue, [Microsoft.Office.Core.MsoTriState]::msoFalse, [Microsoft.Office.Core.MsoTriState]::msoFalse)\n\
-             $pres.Slides.Item(1).Export('{}', 'PNG')\n\
-             $pres.Close()\n\
-             $ppt.Quit()\n",
+            "$ErrorActionPreference = 'Stop'\n\
+             $ppt = $null\n$pres = $null\n\
+             try {{\n\
+               $ppt = New-Object -ComObject PowerPoint.Application\n\
+               $pres = $ppt.Presentations.Open('{}', -1, 0, 0)\n\
+               $pres.Slides.Item({}).Export('{}', 'PNG')\n\
+             }} finally {{\n\
+               if ($pres -ne $null) {{ $pres.Close() }}\n\
+               if ($ppt -ne $null) {{ $ppt.Quit() }}\n\
+             }}\n",
             p.to_string_lossy().replace("'", "''"),
+            page_idx.saturating_add(1),
             cache_path.to_string_lossy().replace("'", "''")
         );
-        let ps_path = std::env::temp_dir().join("rr_ppt_export.ps1");
+        let ps_path = work_dir.join("powerpoint_export.ps1");
         if fs::write(&ps_path, script).is_ok() {
             let status = Command::new("powershell")
                 .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps_path.to_str().unwrap()])
@@ -840,32 +1049,62 @@ fn try_render_office_exact(p: &PathBuf, rotation: u32, flip_h: bool) -> Option<P
             if status.map_or(false, |s| s.success()) && cache_path.exists() {
                 generated = true;
             }
-            let _ = fs::remove_file(ps_path);
         }
     }
 
-    if !generated && (ext == "doc" || ext == "docx" || ext == "xls" || ext == "xlsx" || ext == "ppt" || ext == "pptx") {
-        // Try LibreOffice headless
+    if !generated && (ext == "doc" || ext == "docx" || ext == "xls" || ext == "xlsx") {
+        let escaped_input = p.to_string_lossy().replace("'", "''");
+        let escaped_pdf = pdf_path.to_string_lossy().replace("'", "''");
+        let script = if ext == "doc" || ext == "docx" {
+            format!(
+                "$ErrorActionPreference = 'Stop'\n$word = $null\n$doc = $null\n\
+                 try {{\n$word = New-Object -ComObject Word.Application\n$word.Visible = $false\n\
+                 $doc = $word.Documents.Open('{}', $false, $true)\n\
+                 $doc.ExportAsFixedFormat('{}', 17)\n\
+                 }} finally {{ if ($doc -ne $null) {{ $doc.Close(0) }}; if ($word -ne $null) {{ $word.Quit() }} }}",
+                escaped_input, escaped_pdf
+            )
+        } else {
+            format!(
+                "$ErrorActionPreference = 'Stop'\n$excel = $null\n$book = $null\n\
+                 try {{\n$excel = New-Object -ComObject Excel.Application\n$excel.Visible = $false\n\
+                 $book = $excel.Workbooks.Open('{}', 0, $true)\n\
+                 $book.ExportAsFixedFormat(0, '{}')\n\
+                 }} finally {{ if ($book -ne $null) {{ $book.Close($false) }}; if ($excel -ne $null) {{ $excel.Quit() }} }}",
+                escaped_input, escaped_pdf
+            )
+        };
+        let ps_path = work_dir.join("office_export.ps1");
+        if fs::write(&ps_path, script).is_ok() {
+            let _ = Command::new("powershell")
+                .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps_path.to_str().unwrap()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            if pdf_path.exists() {
+                generated = render_office_pdf_page(&pdf_path, &cache_path, page_idx);
+            }
+        }
+    }
+
+    if !generated {
+        // LibreOffice reliably exports Office documents to PDF (not directly
+        // to PNG). Rasterize the first PDF page in a second step.
         let soffice_paths = [
             "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
             "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
             "soffice",
         ];
-        
-        let temp_dir = std::env::temp_dir();
         for soffice in soffice_paths {
             let status = Command::new(soffice)
-                .args(["--headless", "--convert-to", "png", "--outdir", temp_dir.to_str().unwrap(), p.to_str().unwrap()])
+                .args(["--headless", "--convert-to", "pdf", "--outdir", work_dir.to_str().unwrap(), p.to_str().unwrap()])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
-                
             if status.map_or(false, |s| s.success()) {
-                // LibreOffice outputs to <temp_dir>/<filename>.png
                 let base_name = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
-                let lo_out = temp_dir.join(format!("{}.png", base_name));
-                if lo_out.exists() {
-                    let _ = fs::rename(&lo_out, &cache_path);
+                let converted_pdf = work_dir.join(format!("{}.pdf", base_name));
+                if converted_pdf.exists() && render_office_pdf_page(&converted_pdf, &cache_path, page_idx) {
                     generated = true;
                     break;
                 }
@@ -874,8 +1113,10 @@ fn try_render_office_exact(p: &PathBuf, rotation: u32, flip_h: bool) -> Option<P
     }
 
     if generated && cache_path.exists() {
+        OFFICE_RENDER_FAILURES.lock().remove(&cache_path);
         Some(render_image(&cache_path, rotation, flip_h))
     } else {
+        OFFICE_RENDER_FAILURES.lock().insert(cache_path, std::time::Instant::now());
         None
     }
 }
@@ -884,12 +1125,19 @@ fn try_render_office_exact(p: &PathBuf, rotation: u32, flip_h: bool) -> Option<P
 
 fn render_docx(p: &PathBuf, rotation: u32, flip_h: bool, office_mode: crate::state::OfficeRenderMode) -> PreviewContent {
     if office_mode == crate::state::OfficeRenderMode::Full {
-        if let Some(content) = try_render_office_exact(p, rotation, flip_h) {
+        if let Some(content) = try_render_office_exact(p, rotation, flip_h, 0) {
             return content;
         }
     }
 
     let mut lines = meta_header(p);
+    if office_mode == crate::state::OfficeRenderMode::Full {
+        lines.push(Line::from(Span::styled(
+            "⚠ Full preview backend unavailable; showing structured text fallback",
+            Style::default().fg(SH_TYPE),
+        )));
+        lines.push(Line::from(""));
+    }
     let file = match fs::File::open(p) {
         Ok(f)  => f,
         Err(e) => {
@@ -926,7 +1174,14 @@ fn render_docx(p: &PathBuf, rotation: u32, flip_h: bool, office_mode: crate::sta
         }
     };
 
-    lines.push(Line::from(Span::styled("📘  Word Document (Text Mode)", Style::default().fg(SH_FN))));
+    lines.push(Line::from(Span::styled(
+        if office_mode == crate::state::OfficeRenderMode::Full {
+            "📘  Word Document (Full requested · Text fallback)"
+        } else {
+            "📘  Word Document (Text Mode)"
+        },
+        Style::default().fg(SH_FN),
+    )));
     lines.push(Line::from(Span::styled("─".repeat(50), Style::default().fg(SH_CMT))));
     
     let mut last_was_empty = false;
@@ -951,15 +1206,22 @@ fn render_pptx(
     rotation: u32,
     flip_h: bool,
     office_mode: crate::state::OfficeRenderMode,
-    _slide_idx: usize,
+    slide_idx: usize,
 ) -> PreviewContent {
     if office_mode == crate::state::OfficeRenderMode::Full {
-        if let Some(content) = try_render_office_exact(p, rotation, flip_h) {
+        if let Some(content) = try_render_office_exact(p, rotation, flip_h, slide_idx) {
             return content;
         }
     }
 
     let mut lines = meta_header(p);
+    if office_mode == crate::state::OfficeRenderMode::Full {
+        lines.push(Line::from(Span::styled(
+            "⚠ Full slide renderer unavailable; showing slide text fallback",
+            Style::default().fg(SH_TYPE),
+        )));
+        lines.push(Line::from(""));
+    }
     let file = match fs::File::open(p) {
         Ok(f)  => f,
         Err(e) => {
@@ -968,7 +1230,14 @@ fn render_pptx(
         }
     };
 
-    lines.push(Line::from(Span::styled("📊  PowerPoint Presentation (Text Mode)", Style::default().fg(SH_FN))));
+    lines.push(Line::from(Span::styled(
+        if office_mode == crate::state::OfficeRenderMode::Full {
+            "📊  PowerPoint Presentation (Full requested · Text fallback)"
+        } else {
+            "📊  PowerPoint Presentation (Text Mode)"
+        },
+        Style::default().fg(SH_FN),
+    )));
     lines.push(Line::from(Span::styled("─".repeat(50), Style::default().fg(SH_CMT))));
 
     let slides: Option<Vec<(u32, String)>> = safe_parse(move || {
@@ -1030,13 +1299,20 @@ fn render_pptx(
 
 fn render_excel(p: &PathBuf, rotation: u32, flip_h: bool, office_mode: crate::state::OfficeRenderMode) -> PreviewContent {
     if office_mode == crate::state::OfficeRenderMode::Full {
-        if let Some(content) = try_render_office_exact(p, rotation, flip_h) {
+        if let Some(content) = try_render_office_exact(p, rotation, flip_h, 0) {
             return content;
         }
     }
 
     use calamine::{Reader, open_workbook_auto};
     let mut lines = meta_header(p);
+    if office_mode == crate::state::OfficeRenderMode::Full {
+        lines.push(Line::from(Span::styled(
+            "⚠ Full spreadsheet renderer unavailable; showing grid fallback",
+            Style::default().fg(SH_TYPE),
+        )));
+        lines.push(Line::from(""));
+    }
     let outcome: Option<Vec<Line<'static>>> = safe_parse(move || {
         let mut out: Vec<Line<'static>> = Vec::new();
         match open_workbook_auto(p) {
@@ -1504,4 +1780,74 @@ fn xml_text(xml: &str) -> String {
 pub fn save_file(path: &PathBuf, content: &str) -> anyhow::Result<()> {
     fs::write(path, content)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Cursor, Write};
+
+    #[test]
+    fn full_office_preview_uses_embedded_thumbnail() {
+        let path = std::env::temp_dir().join(format!(
+            "rusty-ranger-office-preview-{}-{}.pptx",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(4, 3)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+
+        let file = fs::File::create(&path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        archive.start_file(
+            "docProps/thumbnail.png",
+            zip::write::FileOptions::default(),
+        ).unwrap();
+        archive.write_all(png.get_ref()).unwrap();
+        archive.finish().unwrap();
+
+        match try_render_embedded_office_thumbnail(&path, 0, false) {
+            Some(PreviewContent::ImageFallback(info)) => {
+                assert_eq!(info.dimensions, Some((4, 3)));
+                assert!(info.img.is_some());
+            }
+            _ => panic!("expected embedded Office thumbnail preview"),
+        }
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn counts_only_real_presentation_slides() {
+        let path = std::env::temp_dir().join(format!(
+            "rusty-ranger-slide-count-{}-{}.pptx",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = fs::File::create(&path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        for name in [
+            "ppt/slides/slide1.xml",
+            "ppt/slides/slide2.xml",
+            "ppt/slides/slide3.xml",
+            "ppt/slides/_rels/slide1.xml.rels",
+        ] {
+            archive
+                .start_file(name, zip::write::FileOptions::default())
+                .unwrap();
+            archive.write_all(b"<xml/>").unwrap();
+        }
+        archive.finish().unwrap();
+
+        assert_eq!(presentation_slide_count(&path), Some(3));
+        fs::remove_file(path).unwrap();
+    }
 }
