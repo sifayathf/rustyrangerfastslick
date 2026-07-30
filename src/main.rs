@@ -1,17 +1,18 @@
 // ================= src/main.rs =================
-use std::io;
 use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
-    terminal::{enable_raw_mode, disable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-    event::{EnableMouseCapture, DisableMouseCapture},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{backend::CrosstermBackend, Terminal};
+use std::io;
 
-mod state;
-mod ui;
-mod preview;
 mod native;
 mod overlay;
+mod preview;
+mod settings;
+mod state;
+mod ui;
 use state::AppState;
 
 /// Profile name used in Windows Terminal settings.json
@@ -22,14 +23,12 @@ const WT_PROFILE_GUID: &str = "{a7b3c4d5-e6f7-4a8b-9c0d-1e2f3a4b5c6d}";
 // Match the original rounded-control implementation. Windows Terminal's
 // Cascadia Code profile supplies the full-cell Powerline separator geometry
 // used for pill caps while keeping the normal text grid monospace.
-const FONT_FACE: &str = "Cascadia Code";
 /// Desired font size (pt) — 9pt gives a compact, Windows-Explorer-like look
-const FONT_SIZE: u32 = 9;
 
 /// Detect Windows Terminal and relaunch in a dedicated profile with the right font.
 /// Returns `true` if we relaunched (caller should exit), `false` to continue normally.
 #[cfg(windows)]
-fn try_relaunch_in_wt_profile() -> bool {
+fn try_relaunch_in_wt_profile(user_settings: &settings::UserSettings) -> bool {
     use std::path::PathBuf;
 
     // Relaunch once into the compact dedicated profile. Users can still use
@@ -96,8 +95,9 @@ fn try_relaunch_in_wt_profile() -> bool {
         "commandline": format!("\"{}\" --launched", exe_path),
         "hidden": false,
         "font": {
-            "face": FONT_FACE,
-            "size": FONT_SIZE
+            "face": user_settings.font_face.as_str(),
+            "size": user_settings.font_size,
+            "weight": user_settings.font_weight
         },
         "colorScheme": "One Half Dark",
         "cursorShape": "filledBox",
@@ -111,9 +111,10 @@ fn try_relaunch_in_wt_profile() -> bool {
         if let Some(list) = profiles.get_mut("list") {
             if let Some(arr) = list.as_array_mut() {
                 // Check if profile already exists
-                if let Some(existing) = arr.iter_mut().find(|p| {
-                    p.get("guid").and_then(|g| g.as_str()) == Some(WT_PROFILE_GUID)
-                }) {
+                if let Some(existing) = arr
+                    .iter_mut()
+                    .find(|p| p.get("guid").and_then(|g| g.as_str()) == Some(WT_PROFILE_GUID))
+                {
                     // Update existing profile's commandline and font
                     *existing = profile;
                     needs_write = true;
@@ -163,10 +164,12 @@ fn main() -> anyhow::Result<()> {
         default_hook(info);
     }));
 
+    let user_settings = settings::load();
+
     // Try to relaunch in a dedicated Windows Terminal profile with the right font
     #[cfg(windows)]
     {
-        if try_relaunch_in_wt_profile() {
+        if try_relaunch_in_wt_profile(&user_settings) {
             // We've spawned a new WT window with the right profile; exit this instance
             std::process::exit(0);
         }
@@ -193,21 +196,19 @@ fn main() -> anyhow::Result<()> {
                 >() as u32;
                 font_info.nFont = 0;
                 font_info.dwFontSize.X = 0;
-                font_info.dwFontSize.Y = 12; // compact fallback matching the 9pt WT profile
+                font_info.dwFontSize.Y = ((user_settings.font_size as i16) + 3).clamp(11, 19);
                 font_info.FontFamily = 54; // FF_DONTCARE | TMPF_TRUETYPE
-                font_info.FontWeight = 400; // FW_NORMAL
+                font_info.FontWeight = user_settings.font_weight as u32;
 
-                let name = "Consolas\0".encode_utf16().collect::<Vec<_>>();
+                let name = format!("{}\0", user_settings.font_face)
+                    .encode_utf16()
+                    .collect::<Vec<_>>();
                 let len = name.len().min(32);
                 for i in 0..len {
                     font_info.FaceName[i] = name[i];
                 }
 
-                windows_sys::Win32::System::Console::SetCurrentConsoleFontEx(
-                    handle,
-                    0,
-                    &font_info,
-                );
+                windows_sys::Win32::System::Console::SetCurrentConsoleFontEx(handle, 0, &font_info);
             }
         }
     }
@@ -241,4 +242,3 @@ fn main() -> anyhow::Result<()> {
     overlay::shutdown();
     Ok(())
 }
-

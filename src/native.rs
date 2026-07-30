@@ -1,14 +1,14 @@
 // ================= src/native.rs =================
+use image::DynamicImage;
+use ratatui::layout::Rect as TuiRect;
+use std::collections::HashMap;
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::sync::mpsc::{channel, Sender, Receiver};
-use std::collections::HashMap;
-use image::DynamicImage;
-use windows_sys::Win32::Foundation::{HWND, RECT, POINT, LPARAM, WPARAM, LRESULT};
-use windows_sys::Win32::UI::WindowsAndMessaging::*;
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
-use ratatui::layout::Rect as TuiRect;
+use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 pub enum PreviewCmd {
     ShowImage {
@@ -20,6 +20,7 @@ pub enum PreviewCmd {
         term_cols: u16,
         term_rows: u16,
         background: u32,
+        ultra_fast: bool,
     },
     Hide,
     Quit,
@@ -38,8 +39,29 @@ impl NativePreviewManager {
         Self { sender: tx }
     }
 
-    pub fn show(&self, img: Arc<DynamicImage>, path: std::path::PathBuf, rotation: u32, flip_h: bool, cell_rect: TuiRect, term_cols: u16, term_rows: u16, background: u32) {
-        let _ = self.sender.send(PreviewCmd::ShowImage { img, path, rotation, flip_h, cell_rect, term_cols, term_rows, background });
+    pub fn show(
+        &self,
+        img: Arc<DynamicImage>,
+        path: std::path::PathBuf,
+        rotation: u32,
+        flip_h: bool,
+        cell_rect: TuiRect,
+        term_cols: u16,
+        term_rows: u16,
+        background: u32,
+        ultra_fast: bool,
+    ) {
+        let _ = self.sender.send(PreviewCmd::ShowImage {
+            img,
+            path,
+            rotation,
+            flip_h,
+            cell_rect,
+            term_cols,
+            term_rows,
+            background,
+            ultra_fast,
+        });
     }
 
     pub fn hide(&self) {
@@ -71,16 +93,16 @@ fn log_debug(msg: &str) {
 fn get_ancestor_pids(start_pid: u32) -> Vec<u32> {
     let mut ancestors = Vec::new();
     let mut current = start_pid;
-    
+
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snapshot == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
             return ancestors;
         }
-        
+
         let mut entry: PROCESSENTRY32W = std::mem::zeroed();
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-        
+
         let mut parent_map = HashMap::new();
         if Process32FirstW(snapshot, &mut entry) != 0 {
             loop {
@@ -91,7 +113,7 @@ fn get_ancestor_pids(start_pid: u32) -> Vec<u32> {
             }
         }
         windows_sys::Win32::Foundation::CloseHandle(snapshot);
-        
+
         while let Some(&parent) = parent_map.get(&current) {
             if parent == 0 || parent == current {
                 break;
@@ -100,7 +122,7 @@ fn get_ancestor_pids(start_pid: u32) -> Vec<u32> {
             current = parent;
         }
     }
-    
+
     ancestors
 }
 
@@ -124,7 +146,9 @@ fn find_terminal_window() -> HWND {
     }
 
     let mut console_pid = 0;
-    unsafe { GetWindowThreadProcessId(console_hwnd, &mut console_pid); }
+    unsafe {
+        GetWindowThreadProcessId(console_hwnd, &mut console_pid);
+    }
 
     let mut class_buf = [0u16; 256];
     let class_len = unsafe { GetClassNameW(console_hwnd, class_buf.as_mut_ptr(), 256) };
@@ -194,7 +218,7 @@ unsafe extern "system" fn enum_child_proc(hwnd: HWND, lparam: LPARAM) -> i32 {
     let mut class_buf = [0u16; 256];
     let class_len = GetClassNameW(hwnd, class_buf.as_mut_ptr(), 256);
     let class_name = String::from_utf16_lossy(&class_buf[..class_len as usize]);
-    
+
     if class_name == (*data).target_class {
         (*data).found_hwnd = hwnd;
         return 0; // stop enumeration
@@ -222,7 +246,12 @@ struct WindowState {
     background: u32,
 }
 
-unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match msg {
         WM_NCCREATE => {
             let cs = lparam as *const CREATESTRUCTW;
@@ -235,13 +264,18 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_PAINT => {
             let mut ps = std::mem::zeroed();
             let hdc = BeginPaint(hwnd, &mut ps);
-            
+
             let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Mutex<WindowState>;
             if !state_ptr.is_null() {
                 if let Ok(state) = (*state_ptr).try_lock() {
-                    let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                    let mut rect = RECT {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    };
                     GetClientRect(hwnd, &mut rect);
-                    
+
                     let brush = CreateSolidBrush(state.background);
                     FillRect(hdc, &rect, brush);
                     DeleteObject(brush);
@@ -254,7 +288,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         bi.bmiHeader.biPlanes = 1;
                         bi.bmiHeader.biBitCount = 32;
                         bi.bmiHeader.biCompression = BI_RGB as u32;
-                        
+
                         // Center within the popup window
                         let win_w = rect.right - rect.left;
                         let win_h = rect.bottom - rect.top;
@@ -263,12 +297,18 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
 
                         StretchDIBits(
                             hdc,
-                            cx, cy, state.img_w as i32, state.img_h as i32,
-                            0, 0, state.img_w as i32, state.img_h as i32,
+                            cx,
+                            cy,
+                            state.img_w as i32,
+                            state.img_h as i32,
+                            0,
+                            0,
+                            state.img_w as i32,
+                            state.img_h as i32,
                             state.img_bgra.as_ptr() as *const _,
                             &bi,
                             DIB_RGB_COLORS,
-                            SRCCOPY
+                            SRCCOPY,
                         );
                     }
                 }
@@ -276,9 +316,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             EndPaint(hwnd, &ps);
             0
         }
-        WM_DESTROY => {
-            0
-        }
+        WM_DESTROY => 0,
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
@@ -309,7 +347,10 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
             class_name.as_ptr(),
             std::ptr::null(),
             WS_POPUP,
-            0, 0, 0, 0,
+            0,
+            0,
+            0,
+            0,
             term_hwnd, // Owned window of Windows Terminal/conhost
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -340,12 +381,18 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
         // pointer identity there caused the overlay to wrongly think a
         // brand-new preview was "the same image" and skip repainting.
         let mut last_key: Option<(std::path::PathBuf, u32, bool, u32)> = None;
-        let mut last_cell_rect: TuiRect = TuiRect { x: 0, y: 0, width: 0, height: 0 };
+        let mut last_cell_rect: TuiRect = TuiRect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
         let mut last_term_cols: u16 = 0;
         let mut last_term_rows: u16 = 0;
         let mut last_applied_rect: (i32, i32, i32, i32) = (i32::MIN, 0, 0, 0);
         let mut last_shown: Option<(Arc<DynamicImage>, TuiRect, u16, u16)> = None;
         let mut is_visible = false;
+        let mut ultra_fast = false;
         let mut last_resync_at = std::time::Instant::now();
         const RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
 
@@ -375,9 +422,18 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
                 // window. This is position-only: no image decode, no resize.
                 if let Some((img, cell_rect, cols, rows)) = last_shown.clone() {
                     reposition_overlay(
-                        hwnd, &img, cell_rect, cols, rows,
-                        &mut cached_term_hwnd, &mut cached_bridge, &mut term_cache_at, TERM_CACHE_TTL,
-                        &mut last_applied_rect, state_ptr, false,
+                        hwnd,
+                        &img,
+                        cell_rect,
+                        cols,
+                        rows,
+                        &mut cached_term_hwnd,
+                        &mut cached_bridge,
+                        &mut term_cache_at,
+                        TERM_CACHE_TTL,
+                        &mut last_applied_rect,
+                        state_ptr,
+                        false,
                     );
                 }
                 last_resync_at = std::time::Instant::now();
@@ -385,7 +441,18 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
 
             if let Some(cmd) = latest_cmd {
                 match cmd {
-                    PreviewCmd::ShowImage { img, path, rotation, flip_h, cell_rect, term_cols, term_rows, background } => {
+                    PreviewCmd::ShowImage {
+                        img,
+                        path,
+                        rotation,
+                        flip_h,
+                        cell_rect,
+                        term_cols,
+                        term_rows,
+                        background,
+                        ultra_fast: requested_ultra,
+                    } => {
+                        ultra_fast = requested_ultra;
                         let key = (path, rotation, flip_h, background);
                         let unchanged = Some(&key) == last_key.as_ref()
                             && cell_rect == last_cell_rect
@@ -402,9 +469,18 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
                             last_term_rows = term_rows;
 
                             reposition_overlay(
-                                hwnd, &img, cell_rect, term_cols, term_rows,
-                                &mut cached_term_hwnd, &mut cached_bridge, &mut term_cache_at, TERM_CACHE_TTL,
-                                &mut last_applied_rect, state_ptr, true,
+                                hwnd,
+                                &img,
+                                cell_rect,
+                                term_cols,
+                                term_rows,
+                                &mut cached_term_hwnd,
+                                &mut cached_bridge,
+                                &mut term_cache_at,
+                                TERM_CACHE_TTL,
+                                &mut last_applied_rect,
+                                state_ptr,
+                                true,
                             );
                             is_visible = true;
                             last_shown = Some((img, cell_rect, term_cols, term_rows));
@@ -413,6 +489,7 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
                         }
                     }
                     PreviewCmd::Hide => {
+                        ultra_fast = false;
                         if is_visible {
                             ShowWindow(hwnd, SW_HIDE);
                             is_visible = false;
@@ -428,7 +505,11 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
                     }
                 }
             }
-            thread::sleep(std::time::Duration::from_millis(16));
+            if ultra_fast {
+                thread::yield_now();
+            } else {
+                thread::sleep(std::time::Duration::from_millis(16));
+            }
         }
     }
 }
@@ -470,7 +551,10 @@ unsafe fn reposition_overlay(
         let term_class = String::from_utf16_lossy(&class_buf[..class_len as usize]);
 
         *cached_bridge = Some(if term_class == "CASCADIA_HOSTING_WINDOW_CLASS" {
-            let bridge = find_child_window_by_class(*cached_term_hwnd, "Windows.UI.Composition.DesktopWindowContentBridge");
+            let bridge = find_child_window_by_class(
+                *cached_term_hwnd,
+                "Windows.UI.Composition.DesktopWindowContentBridge",
+            );
             if !bridge.is_null() {
                 let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(*cached_term_hwnd);
                 let pad = (8.0f32 * (dpi as f32) / 96.0f32).round() as i32;
@@ -483,7 +567,9 @@ unsafe fn reposition_overlay(
         });
     }
 
-    let Some((bridge_hwnd, padding)) = *cached_bridge else { return; };
+    let Some((bridge_hwnd, padding)) = *cached_bridge else {
+        return;
+    };
 
     let mut client_rect: RECT = std::mem::zeroed();
     GetClientRect(bridge_hwnd, &mut client_rect);
@@ -511,14 +597,30 @@ unsafe fn reposition_overlay(
         // Periodic position-only resync: move the window if it drifted
         // (e.g. the terminal was dragged), but never touch image content.
         if rect_changed {
-            SetWindowPos(hwnd, std::ptr::null_mut(), px, py, pw, ph, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                px,
+                py,
+                pw,
+                ph,
+                SWP_SHOWWINDOW | SWP_NOACTIVATE,
+            );
             *last_applied_rect = (px, py, pw, ph);
         }
         return;
     }
 
     if rect_changed {
-        SetWindowPos(hwnd, std::ptr::null_mut(), px, py, pw, ph, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            px,
+            py,
+            pw,
+            ph,
+            SWP_SHOWWINDOW | SWP_NOACTIVATE,
+        );
         *last_applied_rect = (px, py, pw, ph);
     } else {
         // Window is already exactly where it needs to be — still make sure
@@ -541,7 +643,11 @@ unsafe fn reposition_overlay(
     // (Lanczos3), so it only ever runs when the image or its target size
     // actually changed, not on every redraw tick.
     let resized = img.resize_exact(fw, fh, image::imageops::FilterType::Lanczos3);
-    let bgra: Vec<u8> = resized.to_rgba8().pixels().flat_map(|p| [p[2], p[1], p[0], 255]).collect();
+    let bgra: Vec<u8> = resized
+        .to_rgba8()
+        .pixels()
+        .flat_map(|p| [p[2], p[1], p[0], 255])
+        .collect();
 
     if let Ok(mut state) = (*state_ptr).lock() {
         state.img_bgra = bgra;
