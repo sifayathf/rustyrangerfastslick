@@ -11,6 +11,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame,
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 // Full-cell Powerline caps used by the original oval implementation. Standard
 // circle halves (◗/◖) are much shorter than a terminal row and look like dots.
@@ -684,6 +685,7 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
             match app.font_face.as_str() {
                 "Cascadia Code" => "Cascadia".to_string(),
                 "Lucida Console" => "Lucida".to_string(),
+                "Nirmala UI" => "Tamil".to_string(),
                 face => face.to_string(),
             },
             crate::state::ToggleAction::FontFamily,
@@ -770,13 +772,16 @@ fn push_line(
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    if s.graphemes(true).count() <= max {
         return s.to_string();
     }
     if max <= 3 {
         return ".".repeat(max.max(1));
     }
-    let mut out: String = s.chars().take(max.saturating_sub(3)).collect();
+    let mut out = s
+        .graphemes(true)
+        .take(max.saturating_sub(3))
+        .collect::<String>();
     out.push_str("...");
     out
 }
@@ -1966,6 +1971,11 @@ fn draw_preview_pane(
     let C_OK = t.ok;
     let C_FOLDER = t.folder;
 
+    // Replace every cell in the preview region before drawing new content.
+    // This is important for complex scripts whose combining glyphs may
+    // otherwise survive a shorter replacement line in the terminal buffer.
+    f.render_widget(Clear, area);
+
     if level.files.is_empty() {
         app.native_preview.hide();
         f.render_widget(
@@ -2349,7 +2359,7 @@ fn draw_preview_pane(
                     Style::default().fg(C_TEXT).add_modifier(Modifier::BOLD),
                 ),
             ])];
-            let mut meta_str = if matches!(ext.as_str(), "PPT" | "PPTX")
+            let mut meta_str = if matches!(ext.as_str(), "PPT" | "PPTX" | "ODP")
                 && app.office_mode == crate::state::OfficeRenderMode::Full
             {
                 match preview::presentation_slide_count(&selected.path) {
@@ -2366,6 +2376,16 @@ fn draw_preview_pane(
                         app.pptx_slide_index + 1,
                         size_str
                     ),
+                }
+            } else if ext == "PDF" && app.pdf_mode == crate::state::PdfRenderMode::Visual {
+                match preview::pdf_page_count(&selected.path) {
+                    Some(count) => format!(
+                        "PDF Page {}/{}  |  {}",
+                        app.pptx_slide_index.saturating_add(1).min(count),
+                        count,
+                        size_str,
+                    ),
+                    None => format!("PDF Page {}  |  {}", app.pptx_slide_index + 1, size_str,),
                 }
             } else {
                 format!("{} Image  |  {}", ext, size_str)
@@ -2633,8 +2653,8 @@ fn file_icon(ext: &str) -> (&'static str, Color) {
         "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "tiff" | "ico" | "svg" => {
             (set.image, IMAGE)
         }
-        "mp4" | "m4v" | "mkv" | "avi" | "mov" | "webm" | "flv" | "wmv" | "mpg" | "mpeg"
-        | "mts" | "m2ts" | "3gp" | "vob" | "ogv" => (set.video, MEDIA),
+        "mp4" | "m4v" | "mkv" | "avi" | "mov" | "webm" | "flv" | "wmv" | "mpg" | "mpeg" | "mts"
+        | "m2ts" | "3gp" | "vob" | "ogv" => (set.video, MEDIA),
         "mp3" | "flac" | "wav" | "ogg" | "aac" | "m4a" | "opus" => (set.audio, MEDIA),
 
         // Binaries / Executables

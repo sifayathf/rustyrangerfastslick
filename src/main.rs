@@ -177,6 +177,13 @@ fn main() -> anyhow::Result<()> {
 
     #[cfg(windows)]
     unsafe {
+        // Keep the console transport in UTF-8 even when Windows launches the
+        // executable through legacy conhost. This prevents Tamil and other
+        // complex-script text from being converted through an ANSI code page
+        // before Windows Terminal/font fallback can shape it.
+        windows_sys::Win32::System::Console::SetConsoleCP(65001);
+        windows_sys::Win32::System::Console::SetConsoleOutputCP(65001);
+
         windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
             windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
         );
@@ -222,9 +229,40 @@ fn main() -> anyhow::Result<()> {
     terminal.clear()?;
 
     let mut app = AppState::new()?;
+    let mut previous_frame_signature = None;
 
     loop {
         app.maybe_refresh_drives();
+
+        // Ratatui normally emits only changed terminal cells. Indic scripts
+        // use zero-width combining marks, and some terminal renderers can
+        // leave an old mark behind when a preview changes in-place. Force a
+        // clean frame only when preview-affecting state changes; ordinary
+        // idle/hover frames retain the fast diff renderer.
+        let frame_signature = (
+            (
+                app.selected_entry_path(),
+                app.preview_scroll,
+                app.pptx_slide_index,
+                app.image_rotation,
+                app.image_flip_h,
+                app.image_zoom.to_bits(),
+                app.office_mode,
+            ),
+            (
+                app.pdf_mode,
+                app.theme_mode,
+                app.layout_mode,
+                app.mode.clone(),
+                app.edit_cursor_row,
+                app.edit_cursor_col,
+                app.edit_buffer.get(app.edit_cursor_row).cloned(),
+            ),
+        );
+        if previous_frame_signature.as_ref() != Some(&frame_signature) {
+            terminal.clear()?;
+            previous_frame_signature = Some(frame_signature);
+        }
         terminal.draw(|f| ui::draw(f, &app))?;
 
         if app.handle_events()? {

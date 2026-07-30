@@ -12,7 +12,9 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
-use std::{fs, io::Read, path::PathBuf, process::Command, sync::Arc};
+use std::{borrow::Cow, fs, io::Read, path::PathBuf, process::Command, sync::Arc};
+use unicode_normalization::UnicodeNormalization;
+use unicode_segmentation::UnicodeSegmentation;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -35,6 +37,26 @@ pub enum PreviewContent {
     // document on every scroll tick.
     Code(Arc<Vec<Line<'static>>>),
     ImageFallback(ImageFallbackInfo),
+}
+
+fn normalize_preview_content(content: PreviewContent) -> PreviewContent {
+    fn normalize_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+        for line in &mut lines {
+            for span in &mut line.spans {
+                span.content = Cow::Owned(span.content.as_ref().nfc().collect::<String>());
+            }
+        }
+        lines
+    }
+
+    match content {
+        PreviewContent::Text(text) => PreviewContent::Text(text.nfc().collect()),
+        PreviewContent::Highlighted(lines) => PreviewContent::Highlighted(normalize_lines(lines)),
+        PreviewContent::Code(lines) => {
+            PreviewContent::Code(Arc::new(normalize_lines(lines.as_ref().clone())))
+        }
+        image @ PreviewContent::ImageFallback(_) => image,
+    }
 }
 
 // ── Syntax-highlight color palette (Catppuccin Mocha) ────────────────────────
@@ -174,18 +196,18 @@ pub fn render(
     let visual_requested = (office_full
         && matches!(
             ext.as_str(),
-            "doc" | "docx" | "xls" | "xlsx" | "ods" | "ppt" | "pptx"
+            "doc" | "docx" | "xls" | "xlsx" | "ods" | "ppt" | "pptx" | "odp"
         ))
         || (pdf_visual && ext == "pdf")
         || is_video;
     let ready_visual_path = if office_full
         && matches!(
             ext.as_str(),
-            "doc" | "docx" | "xls" | "xlsx" | "ods" | "ppt" | "pptx"
+            "doc" | "docx" | "xls" | "xlsx" | "ods" | "ppt" | "pptx" | "odp"
         ) {
         Some(get_office_cache_path(p, slide_idx))
     } else if pdf_visual && ext == "pdf" {
-        Some(get_pdf_cache_path(p, 0))
+        Some(get_pdf_cache_path(p, slide_idx))
     } else if is_video {
         Some(get_video_cache_path(p))
     } else {
@@ -210,7 +232,7 @@ pub fn render(
         }
     }
 
-    let content = match ext.as_str() {
+    let content = normalize_preview_content(match ext.as_str() {
         "jpg" | "jpeg" | "png" | "bmp" | "gif" | "webp" | "tiff" | "tif" | "ico" => {
             render_image(p, rotation, flip_h)
         }
@@ -218,14 +240,14 @@ pub fn render(
         "mp3" | "flac" | "wav" | "ogg" | "aac" | "m4a" | "opus" | "wma" => render_audio(p),
         "docx" | "doc" => render_docx(p, rotation, flip_h, office_mode),
         "xlsx" | "xls" | "ods" => render_excel(p, rotation, flip_h, office_mode),
-        "pptx" | "ppt" => render_pptx(p, rotation, flip_h, office_mode, slide_idx),
-        "pdf" => render_pdf(p, pdf_mode),
+        "pptx" | "ppt" | "odp" => render_pptx(p, rotation, flip_h, office_mode, slide_idx),
+        "pdf" => render_pdf(p, pdf_mode, slide_idx),
         "rtf" => render_rtf(p),
         "csv" | "tsv" => render_csv(p),
         "ipynb" => render_notebook(p),
         "zip" | "7z" | "tar" | "gz" | "bz2" | "xz" | "rar" | "tgz" => render_archive(p),
         _ => text_preview(p),
-    };
+    });
     *PREVIEW_CACHE.lock() = Some(PreviewCacheEntry {
         path: p.clone(),
         modified,
@@ -254,7 +276,7 @@ pub fn is_visual_preview(
     ) || (is_video_extension(&ext) && path.is_some_and(|path| get_video_cache_path(path).exists()))
         || (matches!(
             ext.as_str(),
-            "doc" | "docx" | "xls" | "xlsx" | "ods" | "ppt" | "pptx"
+            "doc" | "docx" | "xls" | "xlsx" | "ods" | "ppt" | "pptx" | "odp"
         ) && office_mode == crate::state::OfficeRenderMode::Full
             && path.is_some_and(|path| {
                 get_office_cache_path(path, 0).exists()
@@ -288,11 +310,23 @@ fn is_video_extension(ext: &str) -> bool {
 }
 
 pub fn presentation_slide_count(path: &PathBuf) -> Option<usize> {
-    if path
+    let extension = path
         .extension()
         .and_then(|value| value.to_str())
-        .is_none_or(|value| !value.eq_ignore_ascii_case("pptx"))
-    {
+        .unwrap_or_default();
+    if extension.eq_ignore_ascii_case("odp") {
+        let file = fs::File::open(path).ok()?;
+        let mut archive = zip::ZipArchive::new(file).ok()?;
+        let mut content = String::new();
+        archive
+            .by_name("content.xml")
+            .ok()?
+            .read_to_string(&mut content)
+            .ok()?;
+        let count = content.matches("<draw:page ").count();
+        return (count > 0).then_some(count);
+    }
+    if !extension.eq_ignore_ascii_case("pptx") {
         return None;
     }
     let file = fs::File::open(path).ok()?;
@@ -316,6 +350,11 @@ pub fn presentation_slide_count(path: &PathBuf) -> Option<usize> {
     (count > 0).then_some(count)
 }
 
+pub fn pdf_page_count(path: &PathBuf) -> Option<usize> {
+    let count = lopdf::Document::load(path).ok()?.get_pages().len();
+    (count > 0).then_some(count)
+}
+
 // ── Metadata header ───────────────────────────────────────────────────────────
 
 pub fn meta_header(_p: &PathBuf) -> Vec<Line<'static>> {
@@ -327,7 +366,7 @@ pub fn meta_header(_p: &PathBuf) -> Vec<Line<'static>> {
 /// string contains any multi-byte character within the first N bytes — this
 /// doesn't.
 fn safe_truncate(s: &str, max_chars: usize) -> &str {
-    match s.char_indices().nth(max_chars) {
+    match s.grapheme_indices(true).nth(max_chars) {
         Some((byte_idx, _)) => &s[..byte_idx],
         None => s,
     }
@@ -370,14 +409,14 @@ fn highlight_document_line(line: &str) -> Line<'static> {
     // 1. Check for headings:
     // If the line is relatively short, doesn't end with a period/comma/colon, and has letters.
     // Also, if it has a high ratio of uppercase characters or is a section title.
-    let is_likely_heading = trimmed.len() < 50
+    let char_count = trimmed.chars().count().max(1);
+    let is_likely_heading = char_count < 50
         && !trimmed.ends_with('.')
         && !trimmed.ends_with(',')
         && !trimmed.contains(':')
         && trimmed.chars().any(|c| c.is_alphabetic())
-        && (trimmed.chars().filter(|c| c.is_uppercase()).count() as f32 / trimmed.len() as f32
-            > 0.2
-            || trimmed.len() < 25);
+        && (trimmed.chars().filter(|c| c.is_uppercase()).count() as f32 / char_count as f32 > 0.2
+            || char_count < 25);
 
     if is_likely_heading {
         return Line::from(Span::styled(
@@ -491,7 +530,7 @@ pub fn expand_editor_tabs(line: &str) -> String {
             column += spaces;
         } else {
             result.push(ch);
-            column += 1;
+            column += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
         }
     }
     result
@@ -1683,9 +1722,10 @@ fn get_pdf_cache_path(p: &PathBuf, page_idx: usize) -> PathBuf {
     let mut hasher = Sha256::new();
     hasher.update(p.to_string_lossy().as_bytes());
     if let Ok(meta) = fs::metadata(p) {
+        hasher.update(meta.len().to_le_bytes());
         if let Ok(modified) = meta.modified() {
             if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
-                hasher.update(duration.as_secs().to_le_bytes());
+                hasher.update(duration.as_nanos().to_le_bytes());
             }
         }
     }
@@ -1722,13 +1762,18 @@ fn try_render_pdf_visual(p: &PathBuf, page_idx: usize) -> Result<Option<PreviewC
                 .lock()
                 .insert(cache_path, std::time::Instant::now());
         }
+        *PREVIEW_CACHE.lock() = None;
     });
     Ok(None)
 }
 
-fn render_pdf(p: &PathBuf, pdf_mode: crate::state::PdfRenderMode) -> PreviewContent {
+fn render_pdf(
+    p: &PathBuf,
+    pdf_mode: crate::state::PdfRenderMode,
+    page_idx: usize,
+) -> PreviewContent {
     if pdf_mode == crate::state::PdfRenderMode::Visual {
-        match try_render_pdf_visual(p, 0) {
+        match try_render_pdf_visual(p, page_idx) {
             Ok(Some(content)) => return content,
             Ok(None) => {
                 return PreviewContent::Highlighted(vec![
@@ -1829,9 +1874,10 @@ fn get_office_cache_path(p: &PathBuf, page_idx: usize) -> PathBuf {
     let mut hasher = Sha256::new();
     hasher.update(p.to_string_lossy().as_bytes());
     if let Ok(meta) = fs::metadata(p) {
+        hasher.update(meta.len().to_le_bytes());
         if let Ok(mtime) = meta.modified() {
             if let Ok(d) = mtime.duration_since(std::time::UNIX_EPOCH) {
-                hasher.update(d.as_secs().to_string().as_bytes());
+                hasher.update(d.as_nanos().to_le_bytes());
             }
         }
     }
@@ -1884,6 +1930,117 @@ fn try_render_embedded_office_thumbnail(
     None
 }
 
+fn run_command_with_timeout(command: &mut Command, timeout: std::time::Duration) -> bool {
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+fn office_suite_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(configured) = std::env::var("RUSTY_RANGER_OFFICE") {
+        candidates.push(PathBuf::from(configured));
+    }
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(dir) = executable.parent() {
+            candidates
+                .push(dir.join("LibreOfficePortable\\App\\libreoffice\\program\\soffice.exe"));
+            candidates.push(dir.join("OpenOfficePortable\\App\\openoffice\\program\\soffice.exe"));
+        }
+    }
+    for variable in ["ProgramW6432", "PROGRAMFILES", "PROGRAMFILES(X86)"] {
+        if let Ok(root) = std::env::var(variable) {
+            let root = PathBuf::from(root);
+            candidates.push(root.join("LibreOffice\\program\\soffice.exe"));
+            candidates.push(root.join("OpenOffice 4\\program\\soffice.exe"));
+            candidates.push(root.join("Apache OpenOffice 4\\program\\soffice.exe"));
+        }
+    }
+    candidates.extend([
+        PathBuf::from("C:\\Program Files\\LibreOffice\\program\\soffice.exe"),
+        PathBuf::from("C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe"),
+        PathBuf::from("C:\\Program Files\\OpenOffice 4\\program\\soffice.exe"),
+        PathBuf::from("C:\\Program Files (x86)\\OpenOffice 4\\program\\soffice.exe"),
+        PathBuf::from("soffice"),
+        PathBuf::from("libreoffice"),
+    ]);
+    candidates.dedup();
+    candidates
+}
+
+fn convert_with_office_suite(
+    source: &std::path::Path,
+    work_dir: &std::path::Path,
+    format: &str,
+) -> Option<PathBuf> {
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos()
+    );
+    let output_dir = work_dir.join(format!("office-output-{unique}"));
+    let profile_dir = work_dir.join(format!("office-profile-{unique}"));
+    fs::create_dir_all(&output_dir).ok()?;
+    fs::create_dir_all(&profile_dir).ok()?;
+    let profile_uri = format!(
+        "file:///{}",
+        profile_dir.to_string_lossy().replace('\\', "/")
+    );
+
+    for candidate in office_suite_candidates() {
+        let mut command = Command::new(candidate);
+        command
+            .arg("--headless")
+            .arg("--nologo")
+            .arg("--nodefault")
+            .arg("--nolockcheck")
+            .arg("--nofirststartwizard")
+            .arg("--norestore")
+            .arg(format!("-env:UserInstallation={profile_uri}"))
+            .args(["--convert-to", format, "--outdir"])
+            .arg(&output_dir)
+            .arg(source)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        if !run_command_with_timeout(&mut command, std::time::Duration::from_secs(30)) {
+            continue;
+        }
+        let mut converted = fs::read_dir(&output_dir)
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case(format))
+            })
+            .collect::<Vec<_>>();
+        converted.sort_by_key(|path| fs::metadata(path).map(|meta| meta.len()).unwrap_or(0));
+        if let Some(path) = converted.pop() {
+            return Some(path);
+        }
+    }
+    None
+}
+
 fn render_office_pdf_page(
     pdf_path: &std::path::Path,
     png_path: &std::path::Path,
@@ -1891,17 +2048,30 @@ fn render_office_pdf_page(
 ) -> bool {
     let output_prefix = png_path.with_extension("");
     let page_number = page_idx.saturating_add(1).to_string();
-    let mut candidates = vec![
-        PathBuf::from("pdftoppm"),
-        PathBuf::from("C:\\Program Files\\poppler\\Library\\bin\\pdftoppm.exe"),
-        PathBuf::from("C:\\Program Files\\poppler\\bin\\pdftoppm.exe"),
-        PathBuf::from("C:\\ProgramData\\chocolatey\\bin\\pdftoppm.exe"),
+    let mut poppler_candidates = vec![
+        (PathBuf::from("pdftoppm"), PathBuf::from("pdftocairo")),
+        (
+            PathBuf::from("C:\\Program Files\\poppler\\Library\\bin\\pdftoppm.exe"),
+            PathBuf::from("C:\\Program Files\\poppler\\Library\\bin\\pdftocairo.exe"),
+        ),
+        (
+            PathBuf::from("C:\\Program Files\\poppler\\bin\\pdftoppm.exe"),
+            PathBuf::from("C:\\Program Files\\poppler\\bin\\pdftocairo.exe"),
+        ),
+        (
+            PathBuf::from("C:\\ProgramData\\chocolatey\\bin\\pdftoppm.exe"),
+            PathBuf::from("C:\\ProgramData\\chocolatey\\bin\\pdftocairo.exe"),
+        ),
     ];
     if let Some(home) = dirs::home_dir() {
-        candidates.push(home.join(".cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\native\\poppler\\Library\\bin\\pdftoppm.exe"));
+        let bin = home.join(
+            ".cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\native\\poppler\\Library\\bin",
+        );
+        poppler_candidates.push((bin.join("pdftoppm.exe"), bin.join("pdftocairo.exe")));
     }
-    for candidate in candidates {
-        let status = Command::new(&candidate)
+    for (pdftoppm, pdftocairo) in poppler_candidates {
+        let mut command = Command::new(&pdftoppm);
+        command
             .arg("-f")
             .arg(&page_number)
             .arg("-l")
@@ -1913,10 +2083,63 @@ fn render_office_pdf_page(
             .arg(pdf_path)
             .arg(&output_prefix)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        if status.map_or(false, |value| value.success()) && png_path.exists() {
+            .stderr(std::process::Stdio::null());
+        if run_command_with_timeout(&mut command, std::time::Duration::from_secs(20))
+            && png_path.exists()
+        {
             return true;
+        }
+
+        let mut command = Command::new(&pdftocairo);
+        command
+            .arg("-f")
+            .arg(&page_number)
+            .arg("-l")
+            .arg(&page_number)
+            .arg("-singlefile")
+            .arg("-png")
+            .arg("-r")
+            .arg("144")
+            .arg(pdf_path)
+            .arg(&output_prefix)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if run_command_with_timeout(&mut command, std::time::Duration::from_secs(20))
+            && png_path.exists()
+        {
+            return true;
+        }
+    }
+
+    for mutool in [
+        PathBuf::from("mutool"),
+        PathBuf::from("C:\\Program Files\\MuPDF\\mutool.exe"),
+        PathBuf::from("C:\\ProgramData\\chocolatey\\bin\\mutool.exe"),
+    ] {
+        let mut command = Command::new(mutool);
+        command
+            .args(["draw", "-q", "-F", "png", "-r", "144", "-o"])
+            .arg(png_path)
+            .arg(pdf_path)
+            .arg(&page_number)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if run_command_with_timeout(&mut command, std::time::Duration::from_secs(20))
+            && png_path.exists()
+        {
+            return true;
+        }
+    }
+
+    // LibreOffice Draw and Apache OpenOffice are the portable final
+    // fallback. Both preserve embedded Tamil fonts while exporting the first
+    // PDF page to a bitmap on systems without Poppler/MuPDF.
+    let work_dir = png_path.with_extension("office-pdf-work");
+    if page_idx == 0 {
+        if let Some(converted) = convert_with_office_suite(pdf_path, &work_dir, "png") {
+            if fs::copy(converted, png_path).is_ok() && png_path.exists() {
+                return true;
+            }
         }
     }
     false
@@ -1949,6 +2172,7 @@ fn try_render_office_exact(
     std::thread::spawn(move || {
         let _ = generate_office_exact_sync(&source, rotation, flip_h, page_idx);
         VISUAL_RENDER_PENDING.lock().remove(&cache_path);
+        *PREVIEW_CACHE.lock() = None;
     });
     None
 }
@@ -2001,7 +2225,15 @@ fn generate_office_exact_sync(
     let _ = fs::create_dir_all(&work_dir);
     let pdf_path = work_dir.join("document.pdf");
 
-    if ext == "ppt" || ext == "pptx" {
+    // Full mode deliberately prefers LibreOffice / Apache OpenOffice. It is
+    // headless, works without a signed-in desktop Office session, preserves
+    // document fonts, and handles PPT/PPTX/DOC/XLS consistently. Microsoft
+    // Office COM remains a compatibility fallback.
+    if let Some(converted_pdf) = convert_with_office_suite(p, &work_dir, "pdf") {
+        generated = render_office_pdf_page(&converted_pdf, &cache_path, page_idx);
+    }
+
+    if !generated && (ext == "ppt" || ext == "pptx") {
         // Keep the COM invocation aligned with the proven main-branch
         // implementation; slide collections are one-based.
         let script = format!(
@@ -2022,7 +2254,8 @@ fn generate_office_exact_sync(
         );
         let ps_path = work_dir.join("powerpoint_export.ps1");
         if fs::write(&ps_path, script).is_ok() {
-            let status = Command::new("powershell")
+            let mut command = Command::new("powershell");
+            command
                 .args([
                     "-NoProfile",
                     "-ExecutionPolicy",
@@ -2031,9 +2264,10 @@ fn generate_office_exact_sync(
                     ps_path.to_str().unwrap(),
                 ])
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            if status.map_or(false, |s| s.success()) && cache_path.exists() {
+                .stderr(std::process::Stdio::null());
+            if run_command_with_timeout(&mut command, std::time::Duration::from_secs(35))
+                && cache_path.exists()
+            {
                 generated = true;
             }
         }
@@ -2063,7 +2297,8 @@ fn generate_office_exact_sync(
         };
         let ps_path = work_dir.join("office_export.ps1");
         if fs::write(&ps_path, script).is_ok() {
-            let _ = Command::new("powershell")
+            let mut command = Command::new("powershell");
+            command
                 .args([
                     "-NoProfile",
                     "-ExecutionPolicy",
@@ -2072,48 +2307,10 @@ fn generate_office_exact_sync(
                     ps_path.to_str().unwrap(),
                 ])
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+                .stderr(std::process::Stdio::null());
+            let _ = run_command_with_timeout(&mut command, std::time::Duration::from_secs(35));
             if pdf_path.exists() {
                 generated = render_office_pdf_page(&pdf_path, &cache_path, page_idx);
-            }
-        }
-    }
-
-    if !generated {
-        // LibreOffice reliably exports Office documents to PDF (not directly
-        // to PNG). Rasterize the first PDF page in a second step.
-        let soffice_paths = [
-            "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
-            "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
-            "soffice",
-        ];
-        for soffice in soffice_paths {
-            let status = Command::new(soffice)
-                .args([
-                    "--headless",
-                    "--convert-to",
-                    "pdf",
-                    "--outdir",
-                    work_dir.to_str().unwrap(),
-                    p.to_str().unwrap(),
-                ])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            if status.map_or(false, |s| s.success()) {
-                let base_name = p
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                let converted_pdf = work_dir.join(format!("{}.pdf", base_name));
-                if converted_pdf.exists()
-                    && render_office_pdf_page(&converted_pdf, &cache_path, page_idx)
-                {
-                    generated = true;
-                    break;
-                }
             }
         }
     }
@@ -2138,10 +2335,10 @@ fn render_docx(
     office_mode: crate::state::OfficeRenderMode,
 ) -> PreviewContent {
     if office_mode == crate::state::OfficeRenderMode::Full {
-        if let Some(content) = try_render_embedded_office_thumbnail(p, rotation, flip_h) {
+        if let Some(content) = try_render_office_exact(p, rotation, flip_h, 0) {
             return content;
         }
-        if let Some(content) = try_render_office_exact(p, rotation, flip_h, 0) {
+        if let Some(content) = try_render_embedded_office_thumbnail(p, rotation, flip_h) {
             return content;
         }
     }
@@ -2327,13 +2524,13 @@ fn render_pptx(
     slide_idx: usize,
 ) -> PreviewContent {
     if office_mode == crate::state::OfficeRenderMode::Full {
+        if let Some(content) = try_render_office_exact(p, rotation, flip_h, slide_idx) {
+            return content;
+        }
         if slide_idx == 0 {
             if let Some(content) = try_render_embedded_office_thumbnail(p, rotation, flip_h) {
                 return content;
             }
-        }
-        if let Some(content) = try_render_office_exact(p, rotation, flip_h, slide_idx) {
-            return content;
         }
         if let Some(content) = try_render_pptx_slide_media(p, rotation, flip_h, slide_idx) {
             return content;
@@ -2474,10 +2671,10 @@ fn render_excel(
     office_mode: crate::state::OfficeRenderMode,
 ) -> PreviewContent {
     if office_mode == crate::state::OfficeRenderMode::Full {
-        if let Some(content) = try_render_embedded_office_thumbnail(p, rotation, flip_h) {
+        if let Some(content) = try_render_office_exact(p, rotation, flip_h, 0) {
             return content;
         }
-        if let Some(content) = try_render_office_exact(p, rotation, flip_h, 0) {
+        if let Some(content) = try_render_embedded_office_thumbnail(p, rotation, flip_h) {
             return content;
         }
     }
@@ -3454,6 +3651,63 @@ mod tests {
                 "../media/image2.jpeg".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn preview_text_is_normalized_for_tamil_combining_marks() {
+        use unicode_normalization::UnicodeNormalization;
+
+        let decomposed = "\u{0B95}\u{0BC6}\u{0BBE}";
+        let expected = decomposed.nfc().collect::<String>();
+        let content = normalize_preview_content(PreviewContent::Highlighted(vec![Line::from(
+            Span::raw(decomposed.to_string()),
+        )]));
+
+        match content {
+            PreviewContent::Highlighted(lines) => {
+                assert_eq!(lines[0].spans[0].content.as_ref(), expected);
+            }
+            _ => panic!("Tamil text must remain a highlighted text preview"),
+        }
+    }
+
+    #[test]
+    fn tamil_graphemes_are_never_truncated_between_combining_marks() {
+        use unicode_segmentation::UnicodeSegmentation;
+
+        let text = "கொடுத்தல்";
+        let first = safe_truncate(text, 1);
+        assert!(text.starts_with(first));
+        assert_eq!(first.graphemes(true).count(), 1);
+    }
+
+    #[test]
+    fn visual_cache_key_changes_when_source_size_changes() {
+        let path = std::env::temp_dir().join(format!(
+            "rusty-ranger-visual-cache-key-{}-{}.pdf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, b"a").unwrap();
+        let first_pdf = get_pdf_cache_path(&path, 0);
+        let first_office = get_office_cache_path(&path, 0);
+        fs::write(&path, b"same-second-update").unwrap();
+        assert_ne!(first_pdf, get_pdf_cache_path(&path, 0));
+        assert_ne!(first_office, get_office_cache_path(&path, 0));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn office_candidates_include_libreoffice_and_openoffice() {
+        let candidates = office_suite_candidates()
+            .iter()
+            .map(|path| path.to_string_lossy().to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        assert!(candidates.iter().any(|path| path.contains("libreoffice")));
+        assert!(candidates.iter().any(|path| path.contains("openoffice")));
     }
 
     #[test]

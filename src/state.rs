@@ -1367,16 +1367,23 @@ impl AppState {
                     .unwrap_or("")
                     .to_ascii_lowercase();
 
-                // A visual PowerPoint preview is paged content, not a scrollable
-                // text block. Advancing the shared text offset only moved its
-                // metadata header while the native image stayed fixed.
-                if matches!(ext.as_str(), "ppt" | "pptx")
-                    && self.office_mode == OfficeRenderMode::Full
-                {
+                // Visual presentations and PDFs are paged content, not
+                // scrollable text blocks. The wheel requests the adjacent
+                // rendered page instead of moving a metadata header.
+                let visual_presentation = matches!(ext.as_str(), "ppt" | "pptx" | "odp")
+                    && self.office_mode == OfficeRenderMode::Full;
+                let visual_pdf = ext == "pdf" && self.pdf_mode == PdfRenderMode::Visual;
+                if visual_presentation || visual_pdf {
                     if down {
                         let last = selected
                             .as_ref()
-                            .and_then(|path| crate::preview::presentation_slide_count(path))
+                            .and_then(|path| {
+                                if visual_pdf {
+                                    crate::preview::pdf_page_count(path)
+                                } else {
+                                    crate::preview::presentation_slide_count(path)
+                                }
+                            })
                             .map(|count| count.saturating_sub(1));
                         self.pptx_slide_index = match last {
                             Some(last) => self.pptx_slide_index.saturating_add(steps).min(last),
@@ -2646,7 +2653,8 @@ impl AppState {
                 );
             }
             ToggleAction::FontFamily => {
-                const FACES: [&str; 3] = ["Cascadia Code", "Consolas", "Lucida Console"];
+                const FACES: [&str; 4] =
+                    ["Cascadia Code", "Nirmala UI", "Consolas", "Lucida Console"];
                 let current = FACES
                     .iter()
                     .position(|value| *value == self.font_face)
@@ -2654,10 +2662,7 @@ impl AppState {
                 self.font_face = FACES[(current + 1) % FACES.len()].to_string();
                 self.persist_user_settings();
                 self.set_notice(
-                    format!(
-                        "Terminal font: {} (applies on next launch)",
-                        self.font_face
-                    ),
+                    format!("Terminal font: {} (applies on next launch)", self.font_face),
                     false,
                 );
             }

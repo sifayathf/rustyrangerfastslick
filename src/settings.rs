@@ -48,7 +48,12 @@ pub fn load() -> UserSettings {
     settings.font_face = value
         .get("font_face")
         .and_then(serde_json::Value::as_str)
-        .filter(|face| matches!(*face, "Cascadia Code" | "Consolas" | "Lucida Console"))
+        .filter(|face| {
+            matches!(
+                *face,
+                "Cascadia Code" | "Consolas" | "Lucida Console" | "Nirmala UI"
+            )
+        })
         .unwrap_or(&settings.font_face)
         .to_string();
     settings.font_size = value
