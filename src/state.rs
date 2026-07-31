@@ -199,6 +199,27 @@ fn system_double_click_interval() -> Duration {
     Duration::from_millis(500)
 }
 
+/// Terminal mouse events can arrive noticeably later than native window messages,
+/// especially when a redraw falls between the two button presses. Honour the OS
+/// preference while allowing enough headroom for that delivery latency.
+fn primary_double_click_interval() -> Duration {
+    system_double_click_interval().max(Duration::from_millis(750))
+}
+
+fn is_repeated_primary_click(
+    last_click: Option<(Instant, usize, usize)>,
+    now: Instant,
+    pane: usize,
+    file: usize,
+    interval: Duration,
+) -> bool {
+    matches!(last_click,
+        Some((last_time, last_pane, last_file))
+            if last_pane == pane
+                && last_file == file
+                && now.checked_duration_since(last_time).is_some_and(|elapsed| elapsed <= interval))
+}
+
 enum DirectoryWatchEvent {
     Snapshot {
         path: PathBuf,
@@ -1850,8 +1871,9 @@ impl AppState {
     }
 
     /// Shared row hit-testing for left-click selection and right-click.
-    /// `for_context_menu` skips double-click/rename detection since a right
-    /// click should just select, not toggle rename or open.
+    /// A primary click selects and a repeated primary click opens. Rename is
+    /// deliberately reserved for F2 and the context menu so it can never steal
+    /// a slightly delayed double-click.
     fn handle_row_click(
         &mut self,
         geo: &LayoutGeometry,
@@ -1874,7 +1896,6 @@ impl AppState {
                         return false;
                     }
 
-                    let was_active_pane = self.current_level == real_level_idx;
                     self.current_level = real_level_idx;
                     self.levels.truncate(self.current_level + 1);
 
@@ -1883,6 +1904,7 @@ impl AppState {
                     }
 
                     if for_context_menu {
+                        self.last_click = None;
                         // Right-click: select without clobbering an existing multi-selection.
                         let cur = self.current_mut();
                         if !cur.marked.contains(&cur.files[*file_idx].path) {
@@ -1896,50 +1918,35 @@ impl AppState {
                     }
 
                     if mods.contains(KeyModifiers::SHIFT) {
+                        self.last_click = None;
                         self.mark_range(*file_idx);
                         self.reset_image_state();
                         return true;
                     }
                     if mods.contains(KeyModifiers::CONTROL) {
+                        self.last_click = None;
                         self.toggle_mark(*file_idx);
                         self.reset_image_state();
                         return true;
                     }
 
                     let now = Instant::now();
-                    let last_click_val = self.last_click;
-                    let old_selected = self.current().selected;
-                    let had_marks = !self.current().marked.is_empty();
-                    let double_click_ms = system_double_click_interval().as_millis();
-                    let rename_limit_ms = (double_click_ms * 4).max(1_200);
-
-                    let is_double_click = matches!(last_click_val,
-                        Some((last_time, last_pane, last_file))
-                            if last_pane == *pane_idx && last_file == *file_idx
-                                && now.duration_since(last_time).as_millis() <= double_click_ms);
-
-                    // A slower second click on an already-selected, already-active row
-                    // (Explorer-style click-click-pause) starts an inline rename.
-                    let is_slow_rename_click = !is_double_click
-                        && was_active_pane
-                        && !had_marks
-                        && old_selected == *file_idx
-                        && matches!(last_click_val,
-                            Some((last_time, last_pane, last_file))
-                                if last_pane == *pane_idx && last_file == *file_idx
-                                    && now.duration_since(last_time).as_millis() > double_click_ms
-                                    && now.duration_since(last_time).as_millis() < rename_limit_ms);
+                    let is_double_click = is_repeated_primary_click(
+                        self.last_click,
+                        now,
+                        *pane_idx,
+                        *file_idx,
+                        primary_double_click_interval(),
+                    );
 
                     self.clear_marks();
                     self.current_mut().selected = *file_idx;
                     self.current_mut().select_anchor = *file_idx;
 
                     if is_double_click {
+                        let path = self.current().files[*file_idx].path.clone();
                         self.last_click = None;
-                        self.open_selected();
-                    } else if is_slow_rename_click {
-                        self.last_click = None;
-                        self.start_rename();
+                        self.open_path(path);
                     } else {
                         self.last_click = Some((now, *pane_idx, *file_idx));
                         self.reset_image_state();
@@ -1951,6 +1958,7 @@ impl AppState {
         // Only directory-pane background clicks clear marks. Preview, sidebar,
         // breadcrumb, and status clicks must not mutate directory selection.
         if geo.pane_rects.iter().any(|rect| point_in(col, row, rect)) {
+            self.last_click = None;
             self.clear_marks();
         }
         false
@@ -3082,7 +3090,7 @@ impl AppState {
                         if self.layout_mode == LayoutMode::Explorer {
                             "Windows tiles + details preview"
                         } else {
-                            "Miller columns"
+                            "Column view"
                         },
                     ),
                     false,
@@ -4216,6 +4224,43 @@ pub fn list_drives_info() -> Vec<DriveInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_primary_click_opens_only_the_same_row_within_the_window() {
+        let now = Instant::now();
+        let interval = Duration::from_millis(750);
+        let recent = now.checked_sub(Duration::from_millis(700)).unwrap();
+        let stale = now.checked_sub(Duration::from_millis(751)).unwrap();
+
+        assert!(is_repeated_primary_click(
+            Some((recent, 2, 9)),
+            now,
+            2,
+            9,
+            interval
+        ));
+        assert!(!is_repeated_primary_click(
+            Some((stale, 2, 9)),
+            now,
+            2,
+            9,
+            interval
+        ));
+        assert!(!is_repeated_primary_click(
+            Some((recent, 1, 9)),
+            now,
+            2,
+            9,
+            interval
+        ));
+        assert!(!is_repeated_primary_click(
+            Some((recent, 2, 8)),
+            now,
+            2,
+            9,
+            interval
+        ));
+    }
 
     #[test]
     fn rejects_windows_reserved_and_malformed_names() {

@@ -552,7 +552,7 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
             &mut y,
             "▣",
             "View",
-            "Miller",
+            "Columns",
             "Tiles",
             app.layout_mode == LayoutMode::Explorer,
             crate::state::ToggleAction::LayoutMode,

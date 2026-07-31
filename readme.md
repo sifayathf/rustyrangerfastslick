@@ -1,6 +1,6 @@
 # 🤠 rusty-ranger-fast (Windows Edition)
 
-`rusty-ranger-fast` is a Windows-first terminal file manager written in Rust with `ratatui` and `crossterm`. It combines Miller-column navigation with a Windows-style Tiles view, asynchronous file operations, live directory watching, and a multi-format preview engine.
+`rusty-ranger-fast` is a Windows-first terminal file manager written in Rust with `ratatui` and `crossterm`. It combines column navigation with a Windows-style Tiles view, asynchronous file operations, live directory watching, and a multi-format preview engine.
 
 On Windows, decoded images and rendered document pages are displayed in a mouse-transparent native overlay aligned to the exact preview-cell rectangle. Text and code remain in the terminal grid.
 
@@ -9,7 +9,7 @@ On Windows, decoded images and rendered document pages are displayed in a mouse-
 ## ✨ Features
 
 *   **⚡ Responsive Navigation**: Coalesced pointer input, event-driven redraws, asynchronous directory scans and file operations, live file-system watching, and a Blitz profile that defers expensive previews.
-*   **🗂️ Two Views**: Toggle between Miller columns and a responsive Windows-style Tiles grid with icon, name, type, size, modified date, hover, selection, and a details preview.
+*   **🗂️ Two Views**: Toggle between Columns and a responsive Windows-style Tiles grid with icon, name, type, size, modified date, hover, selection, and a details preview.
 *   **🖼️ Rich File Preview Engine**:
     *   **Images**: Supported formats: `jpg`, `jpeg`, `png`, `bmp`, `gif`, `webp`, `tiff`, `ico`. Includes zoom, rotate, and horizontal flip transforms.
     *   **Documents & Code**: Fully syntax-highlighted previews for code/text files with a beautiful **Catppuccin Mocha** palette.
@@ -26,8 +26,8 @@ On Windows, decoded images and rendered document pages are displayed in a mouse-
 ### 1. General Navigation
 | Key | Action |
 | :--- | :--- |
-| `h` / `Left Arrow` | Navigate to the parent in Miller view; move one tile left in Tiles view |
-| `l` / `Right Arrow` | Open a child pane in Miller view; move one tile right in Tiles view |
+| `h` / `Left Arrow` | Navigate to the parent in Columns view; move one tile left in Tiles view |
+| `l` / `Right Arrow` | Open a child pane in Columns view; move one tile right in Tiles view |
 | `Enter` | Open the selected folder or file |
 | `k` / `Up Arrow` | Scroll up in the directory list |
 | `j` / `Down Arrow` | Scroll down in the directory list |

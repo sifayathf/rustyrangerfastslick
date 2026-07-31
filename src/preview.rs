@@ -181,8 +181,8 @@ pub fn cleanup_render_cache() {
             ".rr_ppt_media_",
             "rr-antiword-",
         ]
-            .iter()
-            .any(|prefix| name.starts_with(prefix));
+        .iter()
+        .any(|prefix| name.starts_with(prefix));
         let owned_dir = (name.starts_with("rr_office_") && name.ends_with("_work"))
             || name.ends_with(".office-pdf-work");
         if !owned_file && !owned_dir {
