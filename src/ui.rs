@@ -592,12 +592,6 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
             );
             y += 1;
 
-            let options_rect = Rect {
-                x: inner.x,
-                y,
-                width: inner.width,
-                height: 1,
-            };
             let options = [
                 (
                     "Normal",
@@ -610,60 +604,76 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
                     crate::state::ToggleAction::PreviewFull,
                 ),
                 (
+                    "Showcase",
+                    PreviewMode::Showcase,
+                    crate::state::ToggleAction::PreviewShowcase,
+                ),
+                (
                     "Blitz",
                     PreviewMode::Blitz,
                     crate::state::ToggleAction::PreviewBlitz,
                 ),
             ];
-            let mut spans = vec![Span::raw(" ")];
-            let mut option_x = options_rect.x.saturating_add(1);
-            for (index, (label, mode, action)) in options.into_iter().enumerate() {
-                if index > 0 {
-                    spans.push(Span::raw(" "));
-                    option_x = option_x.saturating_add(1);
+            for row_options in options.chunks(2) {
+                if y >= max_y {
+                    break;
                 }
-                let active = app.preview_mode == mode;
-                let color = if active { C_ACCENT } else { t.sel_bg_inactive };
-                let badge_style = if active {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(color)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(C_MUTED).bg(color)
+                let options_rect = Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
                 };
-                let cap_style = if app.rounded_selection {
-                    Style::default().fg(color).bg(t.bg_panel)
-                } else {
-                    Style::default().bg(color)
-                };
-                let left_cap = if app.rounded_selection {
-                    PILL_LEFT_CAP
-                } else {
-                    " "
-                };
-                let right_cap = if app.rounded_selection {
-                    PILL_RIGHT_CAP
-                } else {
-                    " "
-                };
-                spans.push(Span::styled(left_cap, cap_style));
-                spans.push(Span::styled(label, badge_style));
-                spans.push(Span::styled(right_cap, cap_style));
-                let width = label.width() as u16 + 2;
-                geo.toggle_rects.push((
-                    Rect {
-                        x: option_x,
-                        y,
-                        width,
-                        height: 1,
-                    },
-                    action,
-                ));
-                option_x = option_x.saturating_add(width);
+                let mut spans = vec![Span::raw(" ")];
+                let mut option_x = options_rect.x.saturating_add(1);
+                for (index, (label, mode, action)) in row_options.iter().enumerate() {
+                    if index > 0 {
+                        spans.push(Span::raw(" "));
+                        option_x = option_x.saturating_add(1);
+                    }
+                    let active = app.preview_mode == *mode;
+                    let color = if active { C_ACCENT } else { t.sel_bg_inactive };
+                    let badge_style = if active {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(color)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(C_MUTED).bg(color)
+                    };
+                    let cap_style = if app.rounded_selection {
+                        Style::default().fg(color).bg(t.bg_panel)
+                    } else {
+                        Style::default().bg(color)
+                    };
+                    let left_cap = if app.rounded_selection {
+                        PILL_LEFT_CAP
+                    } else {
+                        " "
+                    };
+                    let right_cap = if app.rounded_selection {
+                        PILL_RIGHT_CAP
+                    } else {
+                        " "
+                    };
+                    spans.push(Span::styled(left_cap, cap_style));
+                    spans.push(Span::styled(*label, badge_style));
+                    spans.push(Span::styled(right_cap, cap_style));
+                    let width = label.width() as u16 + 2;
+                    geo.toggle_rects.push((
+                        Rect {
+                            x: option_x,
+                            y,
+                            width,
+                            height: 1,
+                        },
+                        *action,
+                    ));
+                    option_x = option_x.saturating_add(width);
+                }
+                f.render_widget(Paragraph::new(Line::from(spans)), options_rect);
+                y += 1;
             }
-            f.render_widget(Paragraph::new(Line::from(spans)), options_rect);
-            y += 1;
         }
         if y < max_y {
             let rect = Rect {
@@ -2625,30 +2635,36 @@ fn draw_preview_pane(
     match preview_content {
         PreviewContent::Text(txt) => {
             app.native_preview.hide();
-            let padded: Vec<String> = txt.lines().map(|line| format!("  {}", line)).collect();
-            let para = Paragraph::new(padded.join("\n"))
+            let start = scroll as usize;
+            let visible: String = txt
+                .lines()
+                .skip(start)
+                .take((inner.height as usize).saturating_mul(2).max(1))
+                .map(|line| format!("  {line}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let para = Paragraph::new(visible)
                 .style(Style::default().fg(C_TEXT_SOFT))
-                .wrap(Wrap { trim: false })
-                .scroll((scroll, 0));
+                .wrap(Wrap { trim: false });
             f.render_widget(para, inner);
         }
         PreviewContent::Highlighted(lines) => {
             app.native_preview.hide();
-            let mut padded_lines = Vec::new();
-            for line in theme_preview_lines(lines.clone(), app.theme_mode) {
+            let start = (scroll as usize).min(lines.len());
+            let end = start
+                .saturating_add((inner.height as usize).saturating_mul(2).max(1))
+                .min(lines.len());
+            let mut visible = Vec::with_capacity(end.saturating_sub(start));
+            for line in theme_preview_lines(lines[start..end].to_vec(), app.theme_mode) {
                 let mut spans = line.spans;
                 spans.insert(0, Span::raw("  "));
-                padded_lines.push(Line::from(spans));
+                visible.push(Line::from(spans));
             }
-            let para = Paragraph::new(Text::from(padded_lines))
-                .wrap(Wrap { trim: false })
-                .scroll((scroll, 0));
+            let para = Paragraph::new(Text::from(visible)).wrap(Wrap { trim: false });
             f.render_widget(para, inner);
         }
         PreviewContent::Code(lines) => {
             app.native_preview.hide();
-            // Code is line-addressable, so only style and draw the visible
-            // viewport. The cache still retains every line for instant scroll.
             let start = (scroll as usize).min(lines.len());
             let end = start.saturating_add(inner.height as usize).min(lines.len());
             let visible = lines[start..end].to_vec();
@@ -2657,22 +2673,6 @@ fn draw_preview_pane(
         }
         PreviewContent::Status(info) => {
             app.native_preview.hide();
-            if app.preview_mode == PreviewMode::Normal
-                && info.kind == preview::PreviewStatusKind::Loading
-                && !info.lines.is_empty()
-            {
-                let mut content_lines = Vec::new();
-                for line in theme_preview_lines(info.lines.clone(), app.theme_mode) {
-                    let mut spans = line.spans;
-                    spans.insert(0, Span::raw("  "));
-                    content_lines.push(Line::from(spans));
-                }
-                let para = Paragraph::new(Text::from(content_lines))
-                    .wrap(Wrap { trim: false })
-                    .scroll((scroll, 0));
-                f.render_widget(para, inner);
-                return;
-            }
             let (badge, color) = match info.kind {
                 preview::PreviewStatusKind::Loading => ("RENDERING", C_WARN),
                 preview::PreviewStatusKind::Fallback => ("FALLBACK", C_WARN),
@@ -2680,7 +2680,7 @@ fn draw_preview_pane(
                 preview::PreviewStatusKind::Failed => ("FAILED", t.err),
                 preview::PreviewStatusKind::Info => ("INFO", t.accent2),
             };
-            let mut lines = vec![
+            let mut header = vec![
                 Line::from(vec![
                     Span::raw("  "),
                     Span::styled(
@@ -2705,7 +2705,7 @@ fn draw_preview_pane(
                 let (previous, next) = page_control_rects(inner);
                 geo.slide_prev_rect = Some(previous);
                 geo.slide_next_rect = Some(next);
-                lines.push(Line::from(vec![
+                header.push(Line::from(vec![
                     Span::raw("  "),
                     Span::styled(PAGE_PREV_LABEL, Style::default().fg(t.accent2)),
                     Span::raw("  "),
@@ -2723,33 +2723,45 @@ fn draw_preview_pane(
                 ]));
             }
             if let Some(renderer) = &info.renderer {
-                lines.push(Line::from(vec![
+                header.push(Line::from(vec![
                     Span::raw("  "),
                     Span::styled("Renderer: ", Style::default().fg(C_MUTED)),
                     Span::styled(renderer, Style::default().fg(color)),
                 ]));
             }
             if let Some(action) = &info.action {
-                lines.push(Line::from(vec![
+                header.push(Line::from(vec![
                     Span::raw("  "),
                     Span::styled(action, Style::default().fg(C_MUTED)),
                 ]));
             }
-            lines.push(Line::from(vec![
+            header.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(
                     "─".repeat((inner.width as usize).saturating_sub(4)),
                     Style::default().fg(C_BORDER_LO),
                 ),
             ]));
-            for line in theme_preview_lines(info.lines.clone(), app.theme_mode) {
-                let mut spans = line.spans;
-                spans.insert(0, Span::raw("  "));
-                lines.push(Line::from(spans));
+
+            let start = scroll as usize;
+            let capacity = (inner.height as usize).saturating_mul(2).max(1);
+            let mut visible = Vec::with_capacity(capacity);
+            if start < header.len() {
+                visible.extend(header[start..].iter().take(capacity).cloned());
             }
-            let para = Paragraph::new(Text::from(lines))
-                .wrap(Wrap { trim: false })
-                .scroll((scroll, 0));
+            let remaining = capacity.saturating_sub(visible.len());
+            if remaining > 0 {
+                let body_start = start.saturating_sub(header.len()).min(info.lines.len());
+                let body_end = body_start.saturating_add(remaining).min(info.lines.len());
+                for line in
+                    theme_preview_lines(info.lines[body_start..body_end].to_vec(), app.theme_mode)
+                {
+                    let mut spans = line.spans;
+                    spans.insert(0, Span::raw("  "));
+                    visible.push(Line::from(spans));
+                }
+            }
+            let para = Paragraph::new(Text::from(visible)).wrap(Wrap { trim: false });
             f.render_widget(para, inner);
         }
         PreviewContent::ImageFallback(info) => {

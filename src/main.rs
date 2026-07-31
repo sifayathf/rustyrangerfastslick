@@ -249,17 +249,12 @@ fn main() -> anyhow::Result<()> {
 
     let mut app = AppState::new()?;
     let mut drawn_revision = u64::MAX;
-    let mut last_draw = std::time::Instant::now()
-        .checked_sub(std::time::Duration::from_secs(1))
-        .unwrap_or_else(std::time::Instant::now);
     loop {
         app.tick_background();
         let revision = app.event_revision();
-        if revision != drawn_revision || last_draw.elapsed() >= std::time::Duration::from_millis(50)
-        {
+        if revision != drawn_revision {
             terminal.draw(|f| ui::draw(f, &app))?;
             drawn_revision = revision;
-            last_draw = std::time::Instant::now();
         }
 
         if app.handle_events()? {

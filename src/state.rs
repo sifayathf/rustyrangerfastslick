@@ -165,6 +165,7 @@ pub enum PdfRenderMode {
 pub enum PreviewMode {
     Normal,
     Full,
+    Showcase,
     Blitz,
 }
 
@@ -175,14 +176,14 @@ impl PreviewMode {
 
     pub fn office_policy(self) -> OfficeRenderMode {
         match self {
-            PreviewMode::Full => OfficeRenderMode::Full,
+            PreviewMode::Full | PreviewMode::Showcase => OfficeRenderMode::Full,
             PreviewMode::Normal | PreviewMode::Blitz => OfficeRenderMode::Text,
         }
     }
 
     pub fn pdf_policy(self) -> PdfRenderMode {
         match self {
-            PreviewMode::Full => PdfRenderMode::Visual,
+            PreviewMode::Full | PreviewMode::Showcase => PdfRenderMode::Visual,
             PreviewMode::Normal | PreviewMode::Blitz => PdfRenderMode::Text,
         }
     }
@@ -192,10 +193,10 @@ fn preview_settle_delay(mode: PreviewMode) -> Duration {
     match mode {
         PreviewMode::Normal => Duration::from_millis(80),
         PreviewMode::Full => Duration::from_millis(160),
-        PreviewMode::Blitz => Duration::from_millis(40),
+        PreviewMode::Showcase => Duration::from_millis(120),
+        PreviewMode::Blitz => Duration::ZERO,
     }
 }
-
 #[derive(Clone, Default)]
 pub struct FolderStats {
     pub bytes: u64,
@@ -339,6 +340,7 @@ pub enum ToggleAction {
     LayoutMode,
     PreviewNormal,
     PreviewFull,
+    PreviewShowcase,
     PreviewBlitz,
     EditMode,
     DirPreviewClick,
@@ -576,6 +578,7 @@ pub struct AppState {
     preview_requested: Option<PreviewRequestKey>,
     prepared_preview: Option<(PreviewRequestKey, crate::preview::PreviewContent)>,
     preview_retry_at: Option<Instant>,
+    preview_source_identity: Option<(PathBuf, Option<SystemTime>, u64)>,
 
     // Mouse double-click tracking: (time, pane_idx, file_idx)
     pub last_click: Option<(Instant, usize, usize)>,
@@ -689,6 +692,7 @@ impl AppState {
             },
             preview_mode: match user_settings.preview_mode.as_str() {
                 "full" => PreviewMode::Full,
+                "showcase" => PreviewMode::Showcase,
                 "blitz" => PreviewMode::Blitz,
                 _ => PreviewMode::Normal,
             },
@@ -740,6 +744,7 @@ impl AppState {
             preview_requested: None,
             prepared_preview: None,
             preview_retry_at: None,
+            preview_source_identity: None,
             image_zoom: 1.0,
             image_rotation: 0,
             image_flip_h: false,
@@ -777,20 +782,21 @@ impl AppState {
     }
 
     /// Re-scan drive list at most every 5s (used/free space can change).
-    pub fn maybe_refresh_drives(&mut self) {
+    pub fn maybe_refresh_drives(&mut self) -> bool {
         if self.drives_refreshed_at.elapsed() > Duration::from_secs(5) {
             self.drives = list_drives_info();
             self.drives_refreshed_at = Instant::now();
+            return true;
         }
+        false
     }
-
     /// Poll background services once per frame. Keeping this separate from
     /// input handling lets filesystem and preview work complete even while
     /// the user is not pressing a key.
     pub fn tick_background(&mut self) {
-        self.maybe_refresh_drives();
-        self.refresh_property_scan();
-        self.poll_navigation();
+        let mut changed = self.maybe_refresh_drives();
+        changed |= self.refresh_property_scan();
+        changed |= self.poll_navigation();
         self.sync_directory_watch();
         let mut events = Vec::new();
         let mut watch_disconnected = false;
@@ -812,59 +818,76 @@ impl AppState {
         for event in events {
             match event {
                 DirectoryWatchEvent::Snapshot { path, entries } => {
-                    self.apply_directory_snapshot(&path, entries)
+                    changed |= self.apply_directory_snapshot(&path, entries);
                 }
                 DirectoryWatchEvent::Error { path, message } => {
                     if self.current().path == path {
                         self.set_notice(message, true);
+                        changed = true;
                     }
                 }
             }
         }
-        self.poll_operation();
-        self.poll_preview_worker();
+        changed |= self.poll_operation();
+        changed |= self.poll_preview_worker();
         self.refresh_preview_request();
-    }
-
-    fn current_preview_request_key(&self) -> Option<PreviewRequestKey> {
-        let path = self.selected_file()?;
-        if path.is_dir() {
-            return None;
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|(_, at, is_error)| !*is_error && at.elapsed() >= Duration::from_secs(4))
+        {
+            self.notice = None;
+            changed = true;
         }
-        let metadata = fs::metadata(&path).ok();
+        if changed {
+            self.event_revision = self.event_revision.wrapping_add(1);
+        }
+    }
+    fn current_preview_request_key(&mut self) -> Option<PreviewRequestKey> {
+        let path = self.selected_file()?;
+        let (modified, len) = match self.preview_source_identity.as_ref() {
+            Some((cached_path, modified, len)) if cached_path == &path => (*modified, *len),
+            _ => {
+                let metadata = fs::metadata(&path).ok();
+                let modified = metadata.as_ref().and_then(|value| value.modified().ok());
+                let len = metadata.as_ref().map_or(0, |value| value.len());
+                self.preview_source_identity = Some((path.clone(), modified, len));
+                (modified, len)
+            }
+        };
         Some(PreviewRequestKey {
             path,
-            modified: metadata.as_ref().and_then(|value| value.modified().ok()),
-            len: metadata.as_ref().map_or(0, |value| value.len()),
+            modified,
+            len,
             rotation: self.image_rotation,
             flip_h: self.image_flip_h,
             page_index: self.preview_page_index,
             preview_mode: self.preview_mode,
         })
     }
-
     fn invalidate_preview_pipeline(&mut self, reset_page: bool) {
+        crate::preview::cancel_external_renderers();
         self.preview_generation = self.preview_generation.wrapping_add(1);
         self.preview_requested = None;
         self.prepared_preview = None;
         self.preview_retry_at = None;
+        self.preview_source_identity = None;
         self.preview_page_count = None;
         if reset_page {
             self.preview_page_index = 0;
         }
         self.native_preview.hide();
     }
-
-    fn poll_preview_worker(&mut self) {
+    fn poll_preview_worker(&mut self) -> bool {
         let mut newest = None;
         while let Ok(event) = self.preview_worker.receiver.try_recv() {
             newest = Some(event);
         }
         let Some(event) = newest else {
-            return;
+            return false;
         };
         if event.generation != self.preview_generation {
-            return;
+            return false;
         }
         self.preview_requested = None;
         self.preview_page_count = event.page_count;
@@ -875,7 +898,7 @@ impl AppState {
                 self.preview_generation = self.preview_generation.wrapping_add(1);
                 self.prepared_preview = None;
                 self.preview_retry_at = None;
-                return;
+                return true;
             }
         }
         let loading = matches!(
@@ -885,8 +908,8 @@ impl AppState {
         );
         self.prepared_preview = Some((event.key, event.content));
         self.preview_retry_at = loading.then(|| Instant::now() + Duration::from_millis(300));
+        true
     }
-
     fn refresh_preview_request(&mut self) {
         if self.preview_debounce_active() {
             return;
@@ -973,6 +996,7 @@ impl AppState {
             .map(|count| next.min(count.saturating_sub(1)))
             .unwrap_or(next);
         if next != self.preview_page_index {
+            crate::preview::cancel_external_renderers();
             self.preview_page_index = next;
             self.preview_generation = self.preview_generation.wrapping_add(1);
             self.preview_requested = None;
@@ -983,7 +1007,7 @@ impl AppState {
         }
     }
 
-    fn poll_navigation(&mut self) {
+    fn poll_navigation(&mut self) -> bool {
         let event = self
             .navigation_task
             .as_ref()
@@ -995,13 +1019,13 @@ impl AppState {
                 )),
             });
         let Some(event) = event else {
-            return;
+            return false;
         };
         let Some(task) = self.navigation_task.take() else {
-            return;
+            return false;
         };
         if task.generation != self.navigation_generation {
-            return;
+            return false;
         }
         self.navigation_loading = None;
         match event {
@@ -1010,8 +1034,8 @@ impl AppState {
             }
             NavigationEvent::Error(message) => self.set_notice(message, true),
         }
+        true
     }
-
     fn cancel_navigation(&mut self) {
         self.navigation_generation = self.navigation_generation.wrapping_add(1);
         self.navigation_task = None;
@@ -1101,7 +1125,7 @@ impl AppState {
         self.reset_image_state();
     }
 
-    fn poll_operation(&mut self) {
+    fn poll_operation(&mut self) -> bool {
         let mut events = Vec::new();
         let mut disconnected = false;
         if let Some(task) = self.operation_task.as_ref() {
@@ -1116,6 +1140,7 @@ impl AppState {
                 }
             }
         }
+        let mut changed = !events.is_empty();
         let mut completed = false;
         for event in events {
             match event {
@@ -1129,7 +1154,7 @@ impl AppState {
                     snapshots,
                 } => {
                     for (path, entries) in snapshots {
-                        self.apply_directory_snapshot(&path, entries);
+                        changed |= self.apply_directory_snapshot(&path, entries);
                     }
                     if clear_clipboard {
                         self.clipboard = None;
@@ -1146,9 +1171,10 @@ impl AppState {
             self.operation_task = None;
             self.operation_status = None;
             self.set_notice("File operation stopped unexpectedly", true);
+            changed = true;
         }
+        changed
     }
-
     fn sync_directory_watch(&mut self) {
         let path = self.current().path.clone();
         let replace = self
@@ -1165,7 +1191,11 @@ impl AppState {
         self.directory_watch = Some(start_directory_watch(path));
     }
 
-    fn apply_directory_snapshot(&mut self, path: &std::path::Path, mut entries: Vec<DirEntryInfo>) {
+    fn apply_directory_snapshot(
+        &mut self,
+        path: &std::path::Path,
+        mut entries: Vec<DirEntryInfo>,
+    ) -> bool {
         sort_dir_entries(&mut entries, self.sort_mode, self.sort_descending);
         DIR_CACHE.lock().insert(
             path.to_path_buf(),
@@ -1175,6 +1205,7 @@ impl AppState {
             },
         );
 
+        let mut changed = false;
         for level in self.levels.iter_mut().filter(|level| level.path == path) {
             if directory_fingerprint(&level.files) == directory_fingerprint(&entries) {
                 continue;
@@ -1193,10 +1224,16 @@ impl AppState {
                 .unwrap_or_else(|| level.selected.min(level.files.len().saturating_sub(1)));
             level.select_anchor = level.selected;
             level.scroll = level.scroll.min(level.files.len().saturating_sub(1));
-            crate::preview::invalidate_cached_dir(Some(path));
+            changed = true;
         }
+        if changed {
+            crate::preview::invalidate_cached_dir(Some(path));
+            if self.current().path == path {
+                self.invalidate_preview_pipeline(true);
+            }
+        }
+        changed
     }
-
     pub fn set_notice(&mut self, msg: impl Into<String>, is_error: bool) {
         self.notice = Some((msg.into(), Instant::now(), is_error));
     }
@@ -1243,19 +1280,21 @@ impl AppState {
         self.mode = AppMode::Normal;
     }
 
-    fn refresh_property_scan(&mut self) {
+    fn refresh_property_scan(&mut self) -> bool {
+        let mut changed = false;
         let mut finished = false;
         if let Some(scan) = self.property_scan.as_ref() {
             while let Ok(stats) = scan.receiver.try_recv() {
                 finished = stats.complete;
                 self.properties_stats = Some(stats);
+                changed = true;
             }
         }
         if finished {
             self.property_scan = None;
         }
+        changed
     }
-
     /// Navigate the active pane directly to an arbitrary directory path
     /// (used by sidebar clicks, breadcrumb clicks, and drive navigation).
     pub fn navigate_to(&mut self, path: &std::path::Path) {
@@ -1315,11 +1354,7 @@ impl AppState {
         let next_event = if let Some(pending) = self.pending_event.take() {
             pending
         } else {
-            let input_wait = if self.preview_mode.is_blitz() {
-                Duration::from_millis(1)
-            } else {
-                Duration::from_millis(16)
-            };
+            let input_wait = Duration::from_millis(16);
             if !event::poll(input_wait)? {
                 return Ok(false);
             }
@@ -3356,6 +3391,7 @@ impl AppState {
             preview_mode: match self.preview_mode {
                 PreviewMode::Normal => "normal",
                 PreviewMode::Full => "full",
+                PreviewMode::Showcase => "showcase",
                 PreviewMode::Blitz => "blitz",
             }
             .to_string(),
@@ -3406,10 +3442,12 @@ impl AppState {
             }
             ToggleAction::PreviewNormal
             | ToggleAction::PreviewFull
+            | ToggleAction::PreviewShowcase
             | ToggleAction::PreviewBlitz => {
                 self.preview_mode = match action {
                     ToggleAction::PreviewNormal => PreviewMode::Normal,
                     ToggleAction::PreviewFull => PreviewMode::Full,
+                    ToggleAction::PreviewShowcase => PreviewMode::Showcase,
                     ToggleAction::PreviewBlitz => PreviewMode::Blitz,
                     _ => unreachable!(),
                 };
@@ -3420,9 +3458,12 @@ impl AppState {
                     format!(
                         "Preview mode: {}",
                         match self.preview_mode {
-                            PreviewMode::Normal => "Normal — responsive staged previews",
-                            PreviewMode::Full => "Full — complete page and slide rendering",
-                            PreviewMode::Blitz => "Blitz — cached and lightweight previews",
+                            PreviewMode::Normal => "Normal — responsive text and media previews",
+                            PreviewMode::Full => "Full — exact single-page rendering",
+                            PreviewMode::Showcase => {
+                                "Showcase — consistent visual document presentation"
+                            }
+                            PreviewMode::Blitz => "Blitz — instant cached and lightweight previews",
                         }
                     ),
                     false,
@@ -3984,7 +4025,7 @@ fn start_directory_watch(path: PathBuf) -> DirectoryWatch {
                 .and_then(|meta| meta.modified())
                 .ok();
             let must_scan = directory_modified != last_directory_modified
-                || last_full_scan.elapsed() >= Duration::from_secs(2);
+                || last_full_scan.elapsed() >= Duration::from_secs(10);
             if must_scan {
                 last_directory_modified = directory_modified;
                 last_full_scan = Instant::now();
@@ -4026,7 +4067,7 @@ fn start_directory_watch(path: PathBuf) -> DirectoryWatch {
                 if worker_cancel.load(Ordering::Acquire) {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(25));
+                std::thread::sleep(Duration::from_millis(50));
             }
         }
     });
@@ -4517,13 +4558,19 @@ mod tests {
             Duration::from_millis(160)
         );
         assert_eq!(
-            preview_settle_delay(PreviewMode::Blitz),
-            Duration::from_millis(40)
+            preview_settle_delay(PreviewMode::Showcase),
+            Duration::from_millis(120)
         );
+        assert_eq!(preview_settle_delay(PreviewMode::Blitz), Duration::ZERO);
         assert_eq!(PreviewMode::Normal.office_policy(), OfficeRenderMode::Text);
         assert_eq!(PreviewMode::Normal.pdf_policy(), PdfRenderMode::Text);
         assert_eq!(PreviewMode::Full.office_policy(), OfficeRenderMode::Full);
         assert_eq!(PreviewMode::Full.pdf_policy(), PdfRenderMode::Visual);
+        assert_eq!(
+            PreviewMode::Showcase.office_policy(),
+            OfficeRenderMode::Full
+        );
+        assert_eq!(PreviewMode::Showcase.pdf_policy(), PdfRenderMode::Visual);
         assert_eq!(PreviewMode::Blitz.office_policy(), OfficeRenderMode::Text);
         assert_eq!(PreviewMode::Blitz.pdf_policy(), PdfRenderMode::Text);
     }

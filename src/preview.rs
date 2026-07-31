@@ -13,7 +13,17 @@ use ratatui::{
     text::{Line, Span},
 };
 use std::{
-    borrow::Cow, collections::VecDeque, fs, io::Read, path::PathBuf, process::Command, sync::Arc,
+    borrow::Cow,
+    cell::Cell,
+    collections::VecDeque,
+    fs,
+    io::Read,
+    path::PathBuf,
+    process::Command,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
 };
 use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
@@ -89,23 +99,6 @@ fn normalize_preview_content(content: PreviewContent) -> PreviewContent {
     }
 }
 
-fn lightweight_lines(content: PreviewContent) -> Vec<Line<'static>> {
-    match content {
-        PreviewContent::Text(text) => text
-            .lines()
-            .map(|line| Line::from(line.to_string()))
-            .collect(),
-        PreviewContent::Highlighted(lines) => lines,
-        PreviewContent::Code(lines) => lines.as_ref().clone(),
-        PreviewContent::Status(info) => info.lines,
-        PreviewContent::ImageFallback(info) => vec![Line::from(Span::styled(
-            info.caption
-                .unwrap_or_else(|| "Cached visual preview".to_string()),
-            Style::default().fg(SH_CMT),
-        ))],
-    }
-}
-
 fn preview_status(
     kind: PreviewStatusKind,
     title: impl Into<String>,
@@ -161,7 +154,48 @@ static VISUAL_RENDER_PENDING: Lazy<Mutex<std::collections::HashSet<PathBuf>>> =
     Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
 static OFFICE_CONVERSION_PENDING: Lazy<Mutex<std::collections::HashSet<PathBuf>>> =
     Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
+static EXTERNAL_RENDER_ACTIVE: AtomicBool = AtomicBool::new(false);
+static EXTERNAL_RENDER_EPOCH: AtomicU64 = AtomicU64::new(0);
 
+thread_local! {
+    static EXTERNAL_RENDER_JOB_EPOCH: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+struct ExternalRenderPermit {
+    epoch: u64,
+}
+
+impl Drop for ExternalRenderPermit {
+    fn drop(&mut self) {
+        EXTERNAL_RENDER_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+fn try_acquire_external_renderer() -> Option<ExternalRenderPermit> {
+    let epoch = EXTERNAL_RENDER_EPOCH.load(Ordering::Acquire);
+    EXTERNAL_RENDER_ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| ExternalRenderPermit { epoch })
+}
+
+fn run_external_render_job<R>(permit: &ExternalRenderPermit, job: impl FnOnce() -> R) -> R {
+    EXTERNAL_RENDER_JOB_EPOCH.with(|slot| slot.set(Some(permit.epoch)));
+    let result = job();
+    EXTERNAL_RENDER_JOB_EPOCH.with(|slot| slot.set(None));
+    result
+}
+
+fn external_render_cancelled() -> bool {
+    EXTERNAL_RENDER_JOB_EPOCH.with(|slot| {
+        slot.get()
+            .is_some_and(|epoch| epoch != EXTERNAL_RENDER_EPOCH.load(Ordering::Acquire))
+    })
+}
+
+pub fn cancel_external_renderers() {
+    EXTERNAL_RENDER_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct PreviewCacheKey {
     path: PathBuf,
@@ -386,13 +420,14 @@ pub fn render(
         ext.as_str(),
         "doc" | "docx" | "odt" | "xls" | "xlsx" | "ods" | "ppt" | "pptx" | "odp"
     );
-    let normal_rich = preview_mode == crate::state::PreviewMode::Normal
-        && (is_office || ext == "pdf" || is_video);
-    let visual_requested = !blitz
-        && (normal_rich || (office_full && is_office) || (pdf_visual && ext == "pdf") || is_video);
-    let ready_visual_path = if (office_full || blitz || normal_rich) && is_office {
+    let visual_requested =
+        matches!(
+            preview_mode,
+            crate::state::PreviewMode::Full | crate::state::PreviewMode::Showcase
+        ) && ((office_full && is_office) || (pdf_visual && ext == "pdf") || is_video);
+    let ready_visual_path = if is_office {
         Some(get_office_cache_path(p, slide_idx))
-    } else if (pdf_visual || blitz || normal_rich) && ext == "pdf" {
+    } else if ext == "pdf" {
         Some(get_pdf_cache_path(p, slide_idx))
     } else if is_video {
         Some(get_video_cache_path(p))
@@ -429,7 +464,9 @@ pub fn render(
         }
     }
 
-    if blitz && is_blitz_expensive(p, &ext) {
+    if (blitz && is_blitz_expensive(p, &ext))
+        || (preview_mode == crate::state::PreviewMode::Normal && is_video)
+    {
         if let Some(path) = ready_visual_path.as_ref().filter(|path| path.exists()) {
             let content = render_image_with_caption(path, rotation, flip_h, "Cached preview");
             cache_preview(cache_key, content.clone());
@@ -483,37 +520,6 @@ pub fn render(
         return content;
     }
 
-    // Normal mode keeps navigation responsive by showing extracted text now
-    // while the exact page/slide is prepared by the visual renderer. Full mode
-    // continues to show an explicit loading state instead.
-    let normal_visual_loading = if preview_mode == crate::state::PreviewMode::Normal
-        && is_office
-        && office_mode == crate::state::OfficeRenderMode::Text
-    {
-        match try_render_office_exact(p, rotation, flip_h, slide_idx) {
-            ExactOfficePreview::Ready(content) => {
-                cache_preview(cache_key, content.clone());
-                return content;
-            }
-            ExactOfficePreview::Loading => true,
-            ExactOfficePreview::Failed(_) => false,
-        }
-    } else if preview_mode == crate::state::PreviewMode::Normal
-        && ext == "pdf"
-        && pdf_mode == crate::state::PdfRenderMode::Text
-    {
-        match try_render_pdf_visual(p, slide_idx) {
-            Ok(Some(content)) => {
-                cache_preview(cache_key, content.clone());
-                return content;
-            }
-            Ok(None) => true,
-            Err(_) => false,
-        }
-    } else {
-        false
-    };
-
     let content = normalize_preview_content(render_uncached(
         p,
         &ext,
@@ -523,26 +529,9 @@ pub fn render(
         pdf_mode,
         slide_idx,
     ));
-    let content = if normal_visual_loading {
-        preview_status(
-            PreviewStatusKind::Loading,
-            "Rendering rich preview…",
-            "Lightweight content is available below while the visual page is prepared.",
-            Some(if ext == "pdf" {
-                "Poppler/MuPDF"
-            } else {
-                "LibreOffice/OpenOffice → Microsoft Office"
-            }),
-            Some("Navigation remains active; Full mode waits for the complete rendered page."),
-            lightweight_lines(content),
-        )
-    } else {
-        content
-    };
     cache_preview(cache_key, content.clone());
     content
 }
-
 fn render_uncached(
     p: &PathBuf,
     ext: &str,
@@ -1984,21 +1973,31 @@ fn render_video(p: &PathBuf) -> PreviewContent {
         .is_some_and(|failed_at| failed_at.elapsed() < std::time::Duration::from_secs(30));
     let mut pending = false;
     if !failed_recently {
-        let mut renders = VISUAL_RENDER_PENDING.lock();
-        if renders.insert(cache_path.clone()) {
-            pending = true;
-            let source = p.clone();
-            std::thread::spawn(move || {
-                if generate_video_thumbnail(&source, &cache_path) {
-                    VIDEO_RENDER_FAILURES.lock().remove(&cache_path);
-                } else {
-                    VIDEO_RENDER_FAILURES
-                        .lock()
-                        .insert(cache_path.clone(), std::time::Instant::now());
-                }
+        let inserted = VISUAL_RENDER_PENDING.lock().insert(cache_path.clone());
+        if inserted {
+            if let Some(permit) = try_acquire_external_renderer() {
+                pending = true;
+                let source = p.clone();
+                std::thread::spawn(move || {
+                    let _permit = permit;
+                    let (generated, cancelled) = run_external_render_job(&_permit, || {
+                        let generated = generate_video_thumbnail(&source, &cache_path);
+                        (generated, external_render_cancelled())
+                    });
+                    if generated {
+                        VIDEO_RENDER_FAILURES.lock().remove(&cache_path);
+                    } else if !cancelled {
+                        VIDEO_RENDER_FAILURES
+                            .lock()
+                            .insert(cache_path.clone(), std::time::Instant::now());
+                    }
+                    VISUAL_RENDER_PENDING.lock().remove(&cache_path);
+                    invalidate_preview_path(&source);
+                });
+            } else {
                 VISUAL_RENDER_PENDING.lock().remove(&cache_path);
-                invalidate_preview_path(&source);
-            });
+                pending = true;
+            }
         } else {
             pending = true;
         }
@@ -2024,7 +2023,6 @@ fn render_video(p: &PathBuf) -> PreviewContent {
         )
     }
 }
-
 // ── Audio ─────────────────────────────────────────────────────────────────────
 
 fn render_audio(p: &PathBuf) -> PreviewContent {
@@ -2218,13 +2216,21 @@ fn try_render_pdf_visual(
             return Ok(None);
         }
     }
+    let Some(permit) = try_acquire_external_renderer() else {
+        VISUAL_RENDER_PENDING.lock().remove(&cache_path);
+        return Ok(None);
+    };
     let source = p.to_path_buf();
     std::thread::spawn(move || {
-        let generated = render_office_pdf_page(&source, &cache_path, page_idx);
+        let _permit = permit;
+        let (generated, cancelled) = run_external_render_job(&_permit, || {
+            let generated = render_office_pdf_page(&source, &cache_path, page_idx);
+            (generated, external_render_cancelled())
+        });
         VISUAL_RENDER_PENDING.lock().remove(&cache_path);
         if generated {
             OFFICE_RENDER_FAILURES.lock().remove(&cache_path);
-        } else {
+        } else if !cancelled {
             record_render_failure(
                 cache_path,
                 "Poppler, MuPDF, and LibreOffice/OpenOffice could not rasterize this page.",
@@ -2234,7 +2240,6 @@ fn try_render_pdf_visual(
     });
     Ok(None)
 }
-
 fn render_pdf(
     p: &PathBuf,
     pdf_mode: crate::state::PdfRenderMode,
@@ -2404,13 +2409,21 @@ fn try_render_embedded_office_thumbnail(
 }
 
 fn run_command_with_timeout(command: &mut Command, timeout: std::time::Duration) -> bool {
+    if external_render_cancelled() {
+        return false;
+    }
     let Ok(mut child) = command.spawn() else {
         return false;
     };
     let started = std::time::Instant::now();
     loop {
+        if external_render_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
         match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
+            Ok(Some(status)) => return status.success() && !external_render_cancelled(),
             Ok(None) if started.elapsed() < timeout => {
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
@@ -2422,7 +2435,6 @@ fn run_command_with_timeout(command: &mut Command, timeout: std::time::Duration)
         }
     }
 }
-
 fn office_suite_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(configured) = std::env::var("RUSTY_RANGER_OFFICE") {
@@ -2530,6 +2542,10 @@ fn temporary_render_path(target: &std::path::Path) -> PathBuf {
 }
 
 fn publish_rendered_image(source: &std::path::Path, destination: &std::path::Path) -> bool {
+    if external_render_cancelled() {
+        let _ = fs::remove_file(source);
+        return false;
+    }
     if image::open(source).is_err() {
         let _ = fs::remove_file(source);
         return false;
@@ -2545,6 +2561,9 @@ fn publish_rendered_image(source: &std::path::Path, destination: &std::path::Pat
 }
 
 fn publish_cache_file(source: &std::path::Path, destination: &std::path::Path) -> bool {
+    if external_render_cancelled() {
+        return false;
+    }
     if destination.exists() {
         return fs::metadata(destination).is_ok_and(|metadata| metadata.len() > 0);
     }
@@ -2713,15 +2732,21 @@ fn try_render_office_exact(
             return ExactOfficePreview::Loading;
         }
     }
+    let Some(permit) = try_acquire_external_renderer() else {
+        VISUAL_RENDER_PENDING.lock().remove(&cache_path);
+        return ExactOfficePreview::Loading;
+    };
     let source = p.to_path_buf();
     std::thread::spawn(move || {
-        let _ = generate_office_exact_sync(&source, rotation, flip_h, page_idx);
+        let _permit = permit;
+        let _ = run_external_render_job(&_permit, || {
+            generate_office_exact_sync(&source, rotation, flip_h, page_idx)
+        });
         VISUAL_RENDER_PENDING.lock().remove(&cache_path);
         invalidate_preview_path(&source);
     });
     ExactOfficePreview::Loading
 }
-
 fn generate_office_exact_sync(
     p: &std::path::Path,
     rotation: u32,
@@ -2878,10 +2903,12 @@ fn generate_office_exact_sync(
             "Full visual · complete rendered page",
         ))
     } else {
-        record_render_failure(
-            cache_path,
-            "LibreOffice/OpenOffice and Microsoft Office automation could not convert this file, or no PDF rasterizer is installed. The document may also be protected or corrupt.",
-        );
+        if !external_render_cancelled() {
+            record_render_failure(
+                cache_path,
+                "LibreOffice/OpenOffice and Microsoft Office automation could not convert this file, or no PDF rasterizer is installed. The document may also be protected or corrupt.",
+            );
+        }
         None
     };
     let _ = fs::remove_dir_all(work_dir);

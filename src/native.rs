@@ -450,7 +450,6 @@ fn native_window_thread(rx: Receiver<PreviewCmd>, newest_generation: Arc<AtomicU
         let mut last_applied_rect: (i32, i32, i32, i32) = (i32::MIN, 0, 0, 0);
         let mut last_shown: Option<(Arc<DynamicImage>, f32, TuiRect, u16, u16, bool)> = None;
         let mut is_visible = false;
-        let mut fast_scaling = false;
         let mut last_resync_at = std::time::Instant::now();
         const RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
 
@@ -517,7 +516,6 @@ fn native_window_thread(rx: Receiver<PreviewCmd>, newest_generation: Arc<AtomicU
                         if generation < newest_generation.load(Ordering::Acquire) {
                             continue;
                         }
-                        fast_scaling = requested_fast_scaling;
                         let zoom = zoom.clamp(0.1, 8.0);
                         let key = (path, rotation, flip_h, zoom.to_bits(), background);
                         let unchanged = Some(&key) == last_key.as_ref()
@@ -574,7 +572,6 @@ fn native_window_thread(rx: Receiver<PreviewCmd>, newest_generation: Arc<AtomicU
                         if generation < newest_generation.load(Ordering::Acquire) {
                             continue;
                         }
-                        fast_scaling = false;
                         if is_visible {
                             ShowWindow(hwnd, SW_HIDE);
                             is_visible = false;
@@ -591,13 +588,8 @@ fn native_window_thread(rx: Receiver<PreviewCmd>, newest_generation: Arc<AtomicU
                     }
                 }
             }
-            if fast_scaling {
-                // A one-millisecond wait is below a display frame while
-                // avoiding the 100% CPU busy-spin caused by yield_now().
-                thread::sleep(std::time::Duration::from_millis(1));
-            } else {
-                thread::sleep(std::time::Duration::from_millis(16));
-            }
+            // Command-driven and capped at one terminal frame; Blitz no longer spins at 1 ms.
+            thread::sleep(std::time::Duration::from_millis(16));
         }
     }
 }

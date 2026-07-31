@@ -144,7 +144,7 @@ fn preview_mode_setting(value: &serde_json::Value) -> String {
     value
         .get("preview_mode")
         .and_then(serde_json::Value::as_str)
-        .filter(|mode| matches!(*mode, "normal" | "full" | "blitz"))
+        .filter(|mode| matches!(*mode, "normal" | "full" | "showcase" | "blitz"))
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| {
             // Migrate the previous two-state setting without breaking an
@@ -266,6 +266,12 @@ mod tests {
                 "preview_mode": "full"
             })),
             "full"
+        );
+        assert_eq!(
+            preview_mode_setting(&serde_json::json!({
+                "preview_mode": "showcase"
+            })),
+            "showcase"
         );
     }
 
