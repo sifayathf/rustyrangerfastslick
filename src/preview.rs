@@ -89,6 +89,23 @@ fn normalize_preview_content(content: PreviewContent) -> PreviewContent {
     }
 }
 
+fn lightweight_lines(content: PreviewContent) -> Vec<Line<'static>> {
+    match content {
+        PreviewContent::Text(text) => text
+            .lines()
+            .map(|line| Line::from(line.to_string()))
+            .collect(),
+        PreviewContent::Highlighted(lines) => lines,
+        PreviewContent::Code(lines) => lines.as_ref().clone(),
+        PreviewContent::Status(info) => info.lines,
+        PreviewContent::ImageFallback(info) => vec![Line::from(Span::styled(
+            info.caption
+                .unwrap_or_else(|| "Cached visual preview".to_string()),
+            Style::default().fg(SH_CMT),
+        ))],
+    }
+}
+
 fn preview_status(
     kind: PreviewStatusKind,
     title: impl Into<String>,
@@ -142,6 +159,8 @@ static VIDEO_RENDER_FAILURES: Lazy<Mutex<std::collections::HashMap<PathBuf, std:
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 static VISUAL_RENDER_PENDING: Lazy<Mutex<std::collections::HashSet<PathBuf>>> =
     Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
+static OFFICE_CONVERSION_PENDING: Lazy<Mutex<std::collections::HashSet<PathBuf>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct PreviewCacheKey {
@@ -154,7 +173,7 @@ struct PreviewCacheKey {
     office_full: bool,
     pdf_visual: bool,
     slide_idx: usize,
-    blitz: bool,
+    preview_mode: crate::state::PreviewMode,
 }
 
 const RENDER_CACHE_VERSION: &[u8] = b"rusty-ranger-render-v3";
@@ -334,7 +353,7 @@ pub fn render(
     office_mode: crate::state::OfficeRenderMode,
     pdf_mode: crate::state::PdfRenderMode,
     slide_idx: usize,
-    blitz: bool,
+    preview_mode: crate::state::PreviewMode,
 ) -> PreviewContent {
     if p.is_dir() {
         return PreviewContent::Text(String::new());
@@ -350,6 +369,17 @@ pub fn render(
     let modified = metadata.as_ref().and_then(|value| value.modified().ok());
     let created = metadata.as_ref().and_then(|value| value.created().ok());
     let len = metadata.as_ref().map_or(0, |value| value.len());
+    let office_mode = if preview_mode == crate::state::PreviewMode::Full {
+        crate::state::OfficeRenderMode::Full
+    } else {
+        office_mode
+    };
+    let pdf_mode = if preview_mode == crate::state::PreviewMode::Full {
+        crate::state::PdfRenderMode::Visual
+    } else {
+        pdf_mode
+    };
+    let blitz = preview_mode == crate::state::PreviewMode::Blitz;
     let office_full = office_mode == crate::state::OfficeRenderMode::Full;
     let pdf_visual = pdf_mode == crate::state::PdfRenderMode::Visual;
     let cache_key = PreviewCacheKey {
@@ -362,24 +392,20 @@ pub fn render(
         office_full,
         pdf_visual,
         slide_idx,
-        blitz,
+        preview_mode,
     };
     let is_video = is_video_source(p, &ext);
+    let is_office = matches!(
+        ext.as_str(),
+        "doc" | "docx" | "odt" | "xls" | "xlsx" | "ods" | "ppt" | "pptx" | "odp"
+    );
+    let normal_rich = preview_mode == crate::state::PreviewMode::Normal
+        && (is_office || ext == "pdf" || is_video);
     let visual_requested = !blitz
-        && ((office_full
-            && matches!(
-                ext.as_str(),
-                "doc" | "docx" | "odt" | "xls" | "xlsx" | "ods" | "ppt" | "pptx" | "odp"
-            ))
-            || (pdf_visual && ext == "pdf")
-            || is_video);
-    let ready_visual_path = if office_full
-        && matches!(
-            ext.as_str(),
-            "doc" | "docx" | "odt" | "xls" | "xlsx" | "ods" | "ppt" | "pptx" | "odp"
-        ) {
+        && (normal_rich || (office_full && is_office) || (pdf_visual && ext == "pdf") || is_video);
+    let ready_visual_path = if (office_full || blitz || normal_rich) && is_office {
         Some(get_office_cache_path(p, slide_idx))
-    } else if pdf_visual && ext == "pdf" {
+    } else if (pdf_visual || blitz || normal_rich) && ext == "pdf" {
         Some(get_pdf_cache_path(p, slide_idx))
     } else if is_video {
         Some(get_video_cache_path(p))
@@ -410,17 +436,89 @@ pub fn render(
     }
 
     if blitz && is_blitz_expensive(p, &ext) {
+        if let Some(path) = ready_visual_path.as_ref().filter(|path| path.exists()) {
+            let content =
+                render_image_with_caption(path, rotation, flip_h, "Cached visual preview · Blitz");
+            cache_preview(cache_key, content.clone());
+            return content;
+        }
+        if ext == "pptx" {
+            if let Some(content) = try_render_pptx_slide_media(p, rotation, flip_h, slide_idx) {
+                cache_preview(cache_key, content.clone());
+                return content;
+            }
+        }
+        if slide_idx == 0
+            && matches!(
+                ext.as_str(),
+                "docx" | "odt" | "xlsx" | "ods" | "pptx" | "odp"
+            )
+        {
+            if let Some(content) = try_render_embedded_office_thumbnail(p, rotation, flip_h) {
+                cache_preview(cache_key, content.clone());
+                return content;
+            }
+        }
+        let modified_label = modified
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|value| format!("Modified timestamp: {}", value.as_secs()))
+            .unwrap_or_else(|| "Modified timestamp unavailable".to_string());
         let content = preview_status(
             PreviewStatusKind::Info,
-            "Blitz preview deferred",
-            "Rich parsing and external conversion are paused while Blitz mode is active.",
+            "Blitz lightweight preview",
+            format!(
+                "{} · {} · rich conversion paused during rapid navigation",
+                p.file_name().unwrap_or_default().to_string_lossy(),
+                human_size(len)
+            ),
             Some("Blitz"),
-            Some("Press Enter or Space to open the file, or disable Blitz for an in-app preview."),
-            Vec::new(),
+            Some("Cached visual previews appear immediately. Switch to Normal or Full for uncached rich rendering."),
+            vec![
+                Line::from(Span::styled(
+                    format!("Type: {}", ext.to_ascii_uppercase()),
+                    Style::default().fg(SH_FN),
+                )),
+                Line::from(Span::styled(modified_label, Style::default().fg(SH_CMT))),
+                Line::from(Span::styled(
+                    "Enter opens the file externally",
+                    Style::default().fg(SH_FG),
+                )),
+            ],
         );
         cache_preview(cache_key, content.clone());
         return content;
     }
+
+    // Normal mode keeps navigation responsive by showing extracted text now
+    // while the exact page/slide is prepared by the visual renderer. Full mode
+    // continues to show an explicit loading state instead.
+    let normal_visual_loading = if preview_mode == crate::state::PreviewMode::Normal
+        && is_office
+        && office_mode == crate::state::OfficeRenderMode::Text
+    {
+        match try_render_office_exact(p, rotation, flip_h, slide_idx) {
+            ExactOfficePreview::Ready(content) => {
+                cache_preview(cache_key, content.clone());
+                return content;
+            }
+            ExactOfficePreview::Loading => true,
+            ExactOfficePreview::Failed(_) => false,
+        }
+    } else if preview_mode == crate::state::PreviewMode::Normal
+        && ext == "pdf"
+        && pdf_mode == crate::state::PdfRenderMode::Text
+    {
+        match try_render_pdf_visual(p, slide_idx) {
+            Ok(Some(content)) => {
+                cache_preview(cache_key, content.clone());
+                return content;
+            }
+            Ok(None) => true,
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
 
     if len >= ASYNC_PREVIEW_THRESHOLD && !visual_requested && should_parse_in_background(&ext) {
         let mut pending = PREVIEW_PARSE_PENDING.lock();
@@ -469,6 +567,22 @@ pub fn render(
         pdf_mode,
         slide_idx,
     ));
+    let content = if normal_visual_loading {
+        preview_status(
+            PreviewStatusKind::Loading,
+            "Rendering rich preview…",
+            "Lightweight content is available below while the visual page is prepared.",
+            Some(if ext == "pdf" {
+                "Poppler/MuPDF"
+            } else {
+                "LibreOffice/OpenOffice → Microsoft Office"
+            }),
+            Some("Navigation remains active; Full mode waits for the complete rendered page."),
+            lightweight_lines(content),
+        )
+    } else {
+        content
+    };
     cache_preview(cache_key, content.clone());
     content
 }
@@ -688,6 +802,51 @@ pub fn presentation_slide_count(path: &PathBuf) -> Option<usize> {
 pub fn pdf_page_count(path: &PathBuf) -> Option<usize> {
     let count = lopdf::Document::load(path).ok()?.get_pages().len();
     (count > 0).then_some(count)
+}
+
+/// Cached page discovery. This is called by the preview worker, never by the
+/// UI draw path, so ZIP/PDF parsing cannot stall a terminal repaint.
+pub fn page_count(path: &PathBuf) -> Option<usize> {
+    type Entry = (PathBuf, Option<std::time::SystemTime>, u64, Option<usize>);
+    static CACHE: Lazy<Mutex<VecDeque<Entry>>> = Lazy::new(|| Mutex::new(VecDeque::new()));
+
+    let metadata = fs::metadata(path).ok();
+    let modified = metadata.as_ref().and_then(|value| value.modified().ok());
+    let len = metadata.as_ref().map_or(0, |value| value.len());
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(
+        extension.as_str(),
+        "doc" | "docx" | "odt" | "xls" | "xlsx" | "ods" | "ppt" | "pptx" | "odp"
+    ) {
+        let converted = get_office_pdf_cache_path(path);
+        if converted.exists() {
+            return pdf_page_count(&converted);
+        }
+    }
+    if let Some((_, _, _, count)) =
+        CACHE
+            .lock()
+            .iter()
+            .find(|(cached_path, cached_modified, cached_len, _)| {
+                cached_path == path && *cached_modified == modified && *cached_len == len
+            })
+    {
+        return *count;
+    }
+
+    let count = match extension.as_str() {
+        "pptx" | "odp" => presentation_slide_count(path),
+        "pdf" => pdf_page_count(path),
+        _ => None,
+    };
+    let mut cache = CACHE.lock();
+    cache.push_front((path.clone(), modified, len, count));
+    cache.truncate(64);
+    count
 }
 
 // ── Metadata header ───────────────────────────────────────────────────────────
@@ -2250,6 +2409,17 @@ fn get_office_cache_path(p: &std::path::Path, page_idx: usize) -> PathBuf {
     std::env::temp_dir().join(format!("rr_office_{}.png", hash))
 }
 
+fn get_office_pdf_cache_path(p: &std::path::Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hash_source_identity(&mut hasher, p);
+    hasher.update(b"converted-document-pdf");
+    std::env::temp_dir().join(format!(
+        "rr_office_document_{}.pdf",
+        hex::encode(hasher.finalize())
+    ))
+}
+
 fn try_render_embedded_office_thumbnail(
     p: &PathBuf,
     rotation: u32,
@@ -2441,6 +2611,28 @@ fn publish_rendered_image(source: &std::path::Path, destination: &std::path::Pat
     fs::rename(source, destination).is_ok()
 }
 
+fn publish_cache_file(source: &std::path::Path, destination: &std::path::Path) -> bool {
+    if destination.exists() {
+        return fs::metadata(destination).is_ok_and(|metadata| metadata.len() > 0);
+    }
+    let temporary = destination.with_file_name(format!(
+        ".{}.{}-{}.tmp",
+        destination
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy(),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    let copied = fs::copy(source, &temporary).is_ok_and(|bytes| bytes > 0);
+    let published = copied && fs::rename(&temporary, destination).is_ok();
+    let _ = fs::remove_file(temporary);
+    published || destination.exists()
+}
+
 fn render_office_pdf_page(
     pdf_path: &std::path::Path,
     png_path: &std::path::Path,
@@ -2627,13 +2819,37 @@ fn generate_office_exact_sync(
     let work_dir = std::env::temp_dir().join(format!("{}_work", cache_stem));
     let _ = fs::create_dir_all(&work_dir);
     let pdf_path = work_dir.join("document.pdf");
+    let converted_pdf_cache = get_office_pdf_cache_path(p);
 
     // Full mode deliberately prefers LibreOffice / Apache OpenOffice. It is
     // headless, works without a signed-in desktop Office session, preserves
     // document fonts, and handles PPT/PPTX/DOC/XLS consistently. Microsoft
     // Office COM remains a compatibility fallback.
-    if let Some(converted_pdf) = convert_with_office_suite(p, &work_dir, "pdf") {
-        generated = render_office_pdf_page(&converted_pdf, &cache_path, page_idx);
+    if !converted_pdf_cache.exists() {
+        let owns_conversion = OFFICE_CONVERSION_PENDING
+            .lock()
+            .insert(converted_pdf_cache.clone());
+        if owns_conversion {
+            if let Some(converted_pdf) = convert_with_office_suite(p, &work_dir, "pdf") {
+                let _ = publish_cache_file(&converted_pdf, &converted_pdf_cache);
+            }
+            OFFICE_CONVERSION_PENDING
+                .lock()
+                .remove(&converted_pdf_cache);
+        } else {
+            let started = std::time::Instant::now();
+            while !converted_pdf_cache.exists()
+                && OFFICE_CONVERSION_PENDING
+                    .lock()
+                    .contains(&converted_pdf_cache)
+                && started.elapsed() < std::time::Duration::from_secs(35)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+    if converted_pdf_cache.exists() {
+        generated = render_office_pdf_page(&converted_pdf_cache, &cache_path, page_idx);
     }
 
     if !generated && (ext == "ppt" || ext == "pptx") {
@@ -2763,13 +2979,10 @@ fn render_docx(
             }
             ExactOfficePreview::Failed(detail) => visual_failure = Some(detail),
         }
-        if let Some(mut content) = try_render_embedded_office_thumbnail(p, rotation, flip_h) {
-            if let PreviewContent::ImageFallback(info) = &mut content {
-                info.caption =
-                    Some("Fallback document thumbnail · full renderer failed".to_string());
-            }
-            return content;
-        }
+        // An embedded document thumbnail is not the selected rendered page.
+        // Full mode falls through to the structured text below and labels the
+        // renderer failure explicitly instead of presenting that thumbnail as
+        // a page-faithful preview.
     }
 
     let mut lines = meta_header(p);
@@ -3363,24 +3576,10 @@ fn render_pptx(
             }
             ExactOfficePreview::Failed(detail) => visual_failure = Some(detail),
         }
-        if slide_idx == 0 {
-            if let Some(mut content) = try_render_embedded_office_thumbnail(p, rotation, flip_h) {
-                if let PreviewContent::ImageFallback(info) = &mut content {
-                    info.caption = Some(
-                        "Fallback presentation thumbnail · not the selected full slide".to_string(),
-                    );
-                }
-                return content;
-            }
-        }
-        if let Some(mut content) = try_render_pptx_slide_media(p, rotation, flip_h, slide_idx) {
-            if let PreviewContent::ImageFallback(info) = &mut content {
-                info.caption = Some(
-                    "Fallback embedded media · not reconstructed slide composition".to_string(),
-                );
-            }
-            return content;
-        }
+        // A document thumbnail or one extracted media item is not the selected
+        // slide composition. Full mode therefore never places either in the
+        // page canvas; the structured slide text below is clearly labelled as
+        // a fallback instead.
     }
 
     let mut lines = meta_header(p);
@@ -3500,10 +3699,10 @@ fn render_pptx(
     if let Some(detail) = visual_failure {
         preview_status(
             PreviewStatusKind::Fallback,
-            "PowerPoint visual preview unavailable",
-            detail,
-            Some("PPTX slide-text fallback"),
-            Some("This is extracted text, not the slide layout. Install LibreOffice/OpenOffice or PowerPoint for Full view."),
+            "FULL PREVIEW UNAVAILABLE",
+            format!("Slide {} could not be rendered. {detail}", slide_idx + 1),
+            Some("LibreOffice/OpenOffice → PowerPoint COM → PDF rasterizer"),
+            Some("Showing extracted slide text, not the slide layout. Press Enter to open externally, or switch to Normal mode."),
             lines,
         )
     } else {
@@ -3535,13 +3734,8 @@ fn render_excel(
             }
             ExactOfficePreview::Failed(detail) => visual_failure = Some(detail),
         }
-        if let Some(mut content) = try_render_embedded_office_thumbnail(p, rotation, flip_h) {
-            if let PreviewContent::ImageFallback(info) = &mut content {
-                info.caption =
-                    Some("Fallback workbook thumbnail · full renderer failed".to_string());
-            }
-            return content;
-        }
+        // A workbook thumbnail is document-level artwork, not the selected
+        // sheet/page. Preserve Full mode's exact-or-explicit-fallback contract.
     }
 
     use calamine::{open_workbook_auto, Reader};
@@ -4492,7 +4686,7 @@ mod tests {
     }
 
     #[test]
-    fn full_office_preview_uses_embedded_thumbnail() {
+    fn embedded_office_thumbnail_is_available_for_lightweight_modes() {
         let path = std::env::temp_dir().join(format!(
             "rusty-ranger-office-preview-{}-{}.pptx",
             std::process::id(),
@@ -4587,6 +4781,7 @@ mod tests {
         match render_pptx(&path, 0, false, crate::state::OfficeRenderMode::Full, 1) {
             PreviewContent::Status(status) => {
                 assert_eq!(status.kind, PreviewStatusKind::Fallback);
+                assert_eq!(status.title, "FULL PREVIEW UNAVAILABLE");
                 let rendered = status
                     .lines
                     .iter()
@@ -4741,7 +4936,7 @@ mod tests {
             crate::state::OfficeRenderMode::Text,
             crate::state::PdfRenderMode::Text,
             0,
-            false,
+            crate::state::PreviewMode::Normal,
         );
         let second = render(
             &path,
@@ -4750,7 +4945,7 @@ mod tests {
             crate::state::OfficeRenderMode::Text,
             crate::state::PdfRenderMode::Text,
             0,
-            false,
+            crate::state::PreviewMode::Normal,
         );
         match (first, second) {
             (PreviewContent::Code(first), PreviewContent::Code(second)) => {
@@ -4821,6 +5016,40 @@ mod tests {
     fn office_xml_preserves_utf8_and_decodes_entities() {
         let xml = "<w:p><w:r><w:t>தமிழ் &amp; &#x0B95;</w:t></w:r></w:p>";
         assert_eq!(xml_text(xml), "தமிழ் & க\n");
+    }
+
+    #[test]
+    fn office_xml_preserves_multiple_complex_scripts_and_combining_marks() {
+        let xml = "<w:p><w:r><w:t>தமிழ் हिन्दी العربية বাংলা 中文 👩🏽‍💻 e&#x301;</w:t></w:r></w:p>";
+        let extracted = xml_text(xml);
+        for expected in ["தமிழ்", "हिन्दी", "العربية", "বাংলা", "中文", "👩🏽‍💻", "e\u{301}"]
+        {
+            assert!(extracted.contains(expected), "missing {expected:?}");
+        }
+    }
+
+    #[test]
+    fn blitz_returns_useful_metadata_instead_of_a_deferred_placeholder() {
+        let path = unique_test_path("blitz-metadata", "pdf");
+        fs::write(&path, b"not a real pdf").unwrap();
+        match render(
+            &path,
+            0,
+            false,
+            crate::state::OfficeRenderMode::Text,
+            crate::state::PdfRenderMode::Text,
+            0,
+            crate::state::PreviewMode::Blitz,
+        ) {
+            PreviewContent::Status(status) => {
+                assert_eq!(status.kind, PreviewStatusKind::Info);
+                assert_eq!(status.title, "Blitz lightweight preview");
+                assert!(!status.detail.contains("deferred"));
+                assert!(!status.lines.is_empty());
+            }
+            _ => panic!("Blitz should return lightweight metadata"),
+        }
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -4972,7 +5201,7 @@ mod tests {
             crate::state::OfficeRenderMode::Text,
             crate::state::PdfRenderMode::Text,
             0,
-            false,
+            crate::state::PreviewMode::Normal,
         );
         let rotated = render(
             &path,
@@ -4981,7 +5210,7 @@ mod tests {
             crate::state::OfficeRenderMode::Text,
             crate::state::PdfRenderMode::Text,
             0,
-            false,
+            crate::state::PreviewMode::Normal,
         );
         match (first, rotated) {
             (PreviewContent::ImageFallback(first), PreviewContent::ImageFallback(rotated)) => {

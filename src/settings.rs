@@ -15,7 +15,7 @@ pub struct UserSettings {
     pub font_face: String,
     pub font_size: u16,
     pub font_weight: u16,
-    pub ultra_fast: bool,
+    pub preview_mode: String,
     pub sidebar_width: u16,
     pub column_ratios: Vec<f32>,
     pub last_location: Option<String>,
@@ -37,7 +37,7 @@ impl Default for UserSettings {
             font_face: "Cascadia Code".to_string(),
             font_size: 9,
             font_weight: 400,
-            ultra_fast: false,
+            preview_mode: "normal".to_string(),
             sidebar_width: 26,
             column_ratios: vec![0.10, 0.10, 0.12, 0.18, 0.50],
             last_location: None,
@@ -65,10 +65,7 @@ pub fn load() -> UserSettings {
         .get("explorer_view")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(settings.explorer_view);
-    settings.ultra_fast = value
-        .get("ultra_fast")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(settings.ultra_fast);
+    settings.preview_mode = preview_mode_setting(&value);
     settings.theme_light = bool_setting(&value, "theme_light", settings.theme_light);
     settings.office_full = bool_setting(&value, "office_full", settings.office_full);
     settings.pdf_visual = bool_setting(&value, "pdf_visual", settings.pdf_visual);
@@ -143,6 +140,27 @@ pub fn load() -> UserSettings {
     settings
 }
 
+fn preview_mode_setting(value: &serde_json::Value) -> String {
+    value
+        .get("preview_mode")
+        .and_then(serde_json::Value::as_str)
+        .filter(|mode| matches!(*mode, "normal" | "full" | "blitz"))
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            // Migrate the previous two-state setting without breaking an
+            // existing user profile.
+            if value
+                .get("ultra_fast")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                "blitz".to_string()
+            } else {
+                "normal".to_string()
+            }
+        })
+}
+
 fn bool_setting(value: &serde_json::Value, key: &str, fallback: bool) -> bool {
     value
         .get(key)
@@ -171,7 +189,7 @@ pub fn save(settings: &UserSettings) -> std::io::Result<()> {
         "font_face": settings.font_face,
         "font_size": settings.font_size,
         "font_weight": settings.font_weight,
-        "ultra_fast": settings.ultra_fast,
+        "preview_mode": settings.preview_mode,
         "sidebar_width": settings.sidebar_width,
         "column_ratios": settings.column_ratios,
         "last_location": settings.last_location,
@@ -234,7 +252,22 @@ fn atomic_replace(source: &std::path::Path, destination: &std::path::Path) -> st
 
 #[cfg(test)]
 mod tests {
-    use super::{write_atomic, UserSettings};
+    use super::{preview_mode_setting, write_atomic, UserSettings};
+
+    #[test]
+    fn preview_mode_migrates_the_old_blitz_boolean() {
+        assert_eq!(
+            preview_mode_setting(&serde_json::json!({ "ultra_fast": true })),
+            "blitz"
+        );
+        assert_eq!(
+            preview_mode_setting(&serde_json::json!({
+                "ultra_fast": true,
+                "preview_mode": "full"
+            })),
+            "full"
+        );
+    }
 
     #[test]
     fn defaults_are_fast_but_not_busy_spinning() {
@@ -242,7 +275,7 @@ mod tests {
         assert_eq!(settings.font_face, "Cascadia Code");
         assert_eq!(settings.font_size, 9);
         assert_eq!(settings.font_weight, 400);
-        assert!(!settings.ultra_fast);
+        assert_eq!(settings.preview_mode, "normal");
         assert!(!settings.explorer_view);
         assert!(settings.dir_preview_clickable);
         assert!(settings.hover_enabled);

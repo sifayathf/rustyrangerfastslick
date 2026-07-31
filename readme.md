@@ -8,7 +8,7 @@ On Windows, decoded images and rendered document pages are displayed in a mouse-
 
 ## ✨ Features
 
-*   **⚡ Responsive Navigation**: Coalesced pointer input, event-driven redraws, asynchronous directory scans and file operations, live file-system watching, and a Blitz profile that defers expensive previews.
+*   **⚡ Responsive Navigation**: Coalesced pointer input, event-driven redraws, asynchronous directory scans/file operations/previews, live file-system watching, and three explicit preview policies: Normal, Full, and Blitz.
 *   **🗂️ Two Views**: Toggle between Columns and a responsive Windows-style Tiles grid with icon, name, type, size, modified date, hover, selection, and a details preview.
 *   **🖼️ Rich File Preview Engine**:
     *   **Images**: Supported formats: `jpg`, `jpeg`, `png`, `bmp`, `gif`, `webp`, `tiff`, `ico`. Includes zoom, rotate, and horizontal flip transforms.
@@ -47,6 +47,10 @@ On Windows, decoded images and rendered document pages are displayed in a mouse-
 | `Esc` | Exit Edit mode without saving / Quit application (from general mode) |
 | `q` | Quit application (Only when not in edit mode) |
 | `Space` | Play the selected video, audio, or animated GIF externally |
+| Click preview, then `Left` / `Right` or `PageUp` / `PageDown` | Move between rendered PDF pages or presentation slides |
+| Mouse wheel over paged preview | Move between pages/slides without scrolling the header |
+
+Preview modes are selected in the sidebar: **Normal** stages rich previews after a short settle delay, **Full** forces complete Office/PDF page rendering, and **Blitz** uses cached visuals or lightweight metadata without blocking navigation.
 
 ### 3. Image Transform Controls
 *(Active when hovering over any image format)*

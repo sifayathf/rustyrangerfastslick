@@ -149,16 +149,45 @@ pub enum LayoutMode {
     Explorer,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum OfficeRenderMode {
     Text,
     Full,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PdfRenderMode {
     Text,
     Visual,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PreviewMode {
+    Normal,
+    Full,
+    Blitz,
+}
+
+impl PreviewMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            PreviewMode::Normal => "Normal",
+            PreviewMode::Full => "Full",
+            PreviewMode::Blitz => "Blitz",
+        }
+    }
+
+    pub fn is_blitz(self) -> bool {
+        self == PreviewMode::Blitz
+    }
+}
+
+fn preview_settle_delay(mode: PreviewMode) -> Duration {
+    match mode {
+        PreviewMode::Normal => Duration::from_millis(140),
+        PreviewMode::Full => Duration::from_millis(160),
+        PreviewMode::Blitz => Duration::from_millis(220),
+    }
 }
 
 #[derive(Clone, Default)]
@@ -302,7 +331,9 @@ impl SortMode {
 pub enum ToggleAction {
     Theme,
     LayoutMode,
-    UltraFast,
+    PreviewNormal,
+    PreviewFull,
+    PreviewBlitz,
     OfficeMode,
     PdfMode,
     EditMode,
@@ -317,6 +348,78 @@ pub enum ToggleAction {
     FontSize,
     FontWeight,
     Hover,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreviewRequestKey {
+    path: PathBuf,
+    modified: Option<SystemTime>,
+    len: u64,
+    rotation: u32,
+    flip_h: bool,
+    office_mode: OfficeRenderMode,
+    pdf_mode: PdfRenderMode,
+    page_index: usize,
+    preview_mode: PreviewMode,
+}
+
+struct PreviewRequest {
+    generation: u64,
+    key: PreviewRequestKey,
+}
+
+struct PreviewWorkerEvent {
+    generation: u64,
+    key: PreviewRequestKey,
+    page_count: Option<usize>,
+    content: crate::preview::PreviewContent,
+}
+
+struct PreviewWorker {
+    sender: mpsc::Sender<PreviewRequest>,
+    receiver: Receiver<PreviewWorkerEvent>,
+}
+
+fn spawn_preview_worker() -> PreviewWorker {
+    let (request_sender, request_receiver) = mpsc::channel::<PreviewRequest>();
+    let (result_sender, result_receiver) = mpsc::channel::<PreviewWorkerEvent>();
+    std::thread::spawn(move || {
+        while let Ok(mut request) = request_receiver.recv() {
+            // Navigation can outrun preview parsing. Discard queued obsolete
+            // requests before doing any work and prepare only the newest file.
+            while let Ok(newer) = request_receiver.try_recv() {
+                request = newer;
+            }
+            let page_count = crate::preview::page_count(&request.key.path);
+            let page_index = page_count
+                .map(|count| request.key.page_index.min(count.saturating_sub(1)))
+                .unwrap_or(request.key.page_index);
+            let content = crate::preview::render(
+                &request.key.path,
+                request.key.rotation,
+                request.key.flip_h,
+                request.key.office_mode,
+                request.key.pdf_mode,
+                page_index,
+                request.key.preview_mode,
+            );
+            if result_sender
+                .send(PreviewWorkerEvent {
+                    generation: request.generation,
+                    key: request.key,
+                    page_count,
+                    content,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    PreviewWorker {
+        sender: request_sender,
+        receiver: result_receiver,
+    }
 }
 
 pub struct AppTheme {
@@ -429,12 +532,14 @@ pub struct AppState {
     // Settings & Toggles
     pub theme_mode: ThemeMode,
     pub layout_mode: LayoutMode,
-    pub ultra_fast: bool,
+    pub preview_mode: PreviewMode,
     pub office_mode: OfficeRenderMode,
     pub pdf_mode: PdfRenderMode,
     pub edit_preview_mode: bool,
     pub dir_preview_clickable: bool,
-    pub pptx_slide_index: usize,
+    pub preview_page_index: usize,
+    pub preview_page_count: Option<usize>,
+    pub preview_focused: bool,
     pub sort_mode: SortMode,
     pub sort_descending: bool,
     pub show_file_details: bool,
@@ -465,6 +570,12 @@ pub struct AppState {
     pub image_rotation: u32,    // 0 / 90 / 180 / 270 degrees
     pub image_flip_h: bool,     // 'f' flips horizontally
     pub preview_scroll: usize,  // manual scroll offset for preview pane
+
+    preview_worker: PreviewWorker,
+    preview_generation: u64,
+    preview_requested: Option<PreviewRequestKey>,
+    prepared_preview: Option<(PreviewRequestKey, crate::preview::PreviewContent)>,
+    preview_retry_at: Option<Instant>,
 
     // Mouse double-click tracking: (time, pane_idx, file_idx)
     pub last_click: Option<(Instant, usize, usize)>,
@@ -576,7 +687,11 @@ impl AppState {
             } else {
                 LayoutMode::Miller
             },
-            ultra_fast: user_settings.ultra_fast,
+            preview_mode: match user_settings.preview_mode.as_str() {
+                "full" => PreviewMode::Full,
+                "blitz" => PreviewMode::Blitz,
+                _ => PreviewMode::Normal,
+            },
             office_mode: if user_settings.office_full {
                 OfficeRenderMode::Full
             } else {
@@ -589,7 +704,9 @@ impl AppState {
             },
             edit_preview_mode: false,
             dir_preview_clickable: user_settings.dir_preview_clickable,
-            pptx_slide_index: 0,
+            preview_page_index: 0,
+            preview_page_count: None,
+            preview_focused: false,
             sort_mode: initial_sort_mode,
             sort_descending: user_settings.sort_descending,
             show_file_details: user_settings.show_file_details,
@@ -618,6 +735,11 @@ impl AppState {
             column_ratios: user_settings.column_ratios,
             layout_geometry: Arc::new(Mutex::new(LayoutGeometry::default())),
             preview_scroll: 0,
+            preview_worker: spawn_preview_worker(),
+            preview_generation: 0,
+            preview_requested: None,
+            prepared_preview: None,
+            preview_retry_at: None,
             image_zoom: 1.0,
             image_rotation: 0,
             image_flip_h: false,
@@ -700,6 +822,175 @@ impl AppState {
             }
         }
         self.poll_operation();
+        self.poll_preview_worker();
+        self.refresh_preview_request();
+    }
+
+    fn current_preview_request_key(&self) -> Option<PreviewRequestKey> {
+        let path = self.selected_file()?;
+        if path.is_dir() {
+            return None;
+        }
+        let metadata = fs::metadata(&path).ok();
+        Some(PreviewRequestKey {
+            path,
+            modified: metadata.as_ref().and_then(|value| value.modified().ok()),
+            len: metadata.as_ref().map_or(0, |value| value.len()),
+            rotation: self.image_rotation,
+            flip_h: self.image_flip_h,
+            office_mode: self.office_mode,
+            pdf_mode: self.pdf_mode,
+            page_index: self.preview_page_index,
+            preview_mode: self.preview_mode,
+        })
+    }
+
+    fn invalidate_preview_pipeline(&mut self, reset_page: bool) {
+        self.preview_generation = self.preview_generation.wrapping_add(1);
+        self.preview_requested = None;
+        self.prepared_preview = None;
+        self.preview_retry_at = None;
+        self.preview_page_count = None;
+        if reset_page {
+            self.preview_page_index = 0;
+        }
+        self.native_preview.hide();
+    }
+
+    fn poll_preview_worker(&mut self) {
+        let mut newest = None;
+        while let Ok(event) = self.preview_worker.receiver.try_recv() {
+            newest = Some(event);
+        }
+        let Some(event) = newest else {
+            return;
+        };
+        if event.generation != self.preview_generation {
+            return;
+        }
+        self.preview_requested = None;
+        self.preview_page_count = event.page_count;
+        if let Some(count) = event.page_count {
+            let clamped = self.preview_page_index.min(count.saturating_sub(1));
+            if clamped != self.preview_page_index {
+                self.preview_page_index = clamped;
+                self.preview_generation = self.preview_generation.wrapping_add(1);
+                self.prepared_preview = None;
+                self.preview_retry_at = None;
+                return;
+            }
+        }
+        let loading = matches!(
+            &event.content,
+            crate::preview::PreviewContent::Status(info)
+                if info.kind == crate::preview::PreviewStatusKind::Loading
+        );
+        self.prepared_preview = Some((event.key, event.content));
+        self.preview_retry_at = loading.then(|| Instant::now() + Duration::from_millis(100));
+    }
+
+    fn refresh_preview_request(&mut self) {
+        if self.preview_debounce_active() {
+            return;
+        }
+        let Some(key) = self.current_preview_request_key() else {
+            self.preview_requested = None;
+            self.prepared_preview = None;
+            return;
+        };
+        if self
+            .prepared_preview
+            .as_ref()
+            .is_some_and(|(prepared, _)| prepared != &key)
+        {
+            self.prepared_preview = None;
+            self.preview_page_count = None;
+        }
+        if self.preview_requested.as_ref() == Some(&key) {
+            return;
+        }
+        let prepared_loading = self.prepared_preview.as_ref().is_some_and(|(prepared, content)| {
+            prepared == &key
+                && matches!(content, crate::preview::PreviewContent::Status(info) if info.kind == crate::preview::PreviewStatusKind::Loading)
+        });
+        if self
+            .prepared_preview
+            .as_ref()
+            .is_some_and(|(prepared, _)| prepared == &key)
+            && !prepared_loading
+        {
+            return;
+        }
+        if self.preview_retry_at.is_some_and(|at| Instant::now() < at) {
+            return;
+        }
+        self.preview_generation = self.preview_generation.wrapping_add(1);
+        let generation = self.preview_generation;
+        if self
+            .preview_worker
+            .sender
+            .send(PreviewRequest {
+                generation,
+                key: key.clone(),
+            })
+            .is_ok()
+        {
+            self.preview_requested = Some(key);
+            self.preview_retry_at = None;
+        }
+    }
+
+    pub fn prepared_preview(&self) -> Option<&crate::preview::PreviewContent> {
+        self.prepared_preview.as_ref().map(|(_, content)| content)
+    }
+
+    pub fn effective_office_mode(&self) -> OfficeRenderMode {
+        if self.preview_mode == PreviewMode::Full {
+            OfficeRenderMode::Full
+        } else {
+            self.office_mode
+        }
+    }
+
+    pub fn effective_pdf_mode(&self) -> PdfRenderMode {
+        if self.preview_mode == PreviewMode::Full {
+            PdfRenderMode::Visual
+        } else {
+            self.pdf_mode
+        }
+    }
+
+    pub fn is_paged_visual_selected(&self) -> bool {
+        let extension = self
+            .selected_file()
+            .and_then(|path| path.extension().map(|value| value.to_os_string()))
+            .and_then(|value| value.to_str().map(str::to_ascii_lowercase))
+            .unwrap_or_default();
+        matches!(extension.as_str(), "ppt" | "pptx" | "odp" | "pdf")
+    }
+
+    pub fn step_preview_page(&mut self, delta: isize) {
+        if !self.is_paged_visual_selected() {
+            return;
+        }
+        let next = if delta.is_negative() {
+            self.preview_page_index.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.preview_page_index.saturating_add(delta as usize)
+        };
+        let next = self
+            .preview_page_count
+            .map(|count| next.min(count.saturating_sub(1)))
+            .unwrap_or(next);
+        if next != self.preview_page_index {
+            self.preview_page_index = next;
+            self.preview_generation = self.preview_generation.wrapping_add(1);
+            self.preview_requested = None;
+            self.prepared_preview = None;
+            self.preview_retry_at = None;
+            self.preview_scroll = 0;
+            self.native_preview.hide();
+        }
     }
 
     fn poll_navigation(&mut self) {
@@ -1034,7 +1325,7 @@ impl AppState {
         let next_event = if let Some(pending) = self.pending_event.take() {
             pending
         } else {
-            let input_wait = if self.ultra_fast {
+            let input_wait = if self.preview_mode.is_blitz() {
                 Duration::from_millis(1)
             } else {
                 Duration::from_millis(16)
@@ -1367,6 +1658,37 @@ impl AppState {
                         self.preview_scroll = self.preview_scroll.saturating_sub(3);
                     }
 
+                    // Once the preview has been clicked, paged visual content
+                    // owns these keys. Folder navigation keeps them otherwise.
+                    (KeyCode::Left, _)
+                        if self.mode == AppMode::Normal
+                            && self.preview_focused
+                            && self.is_paged_visual_selected() =>
+                    {
+                        self.step_preview_page(-1)
+                    }
+                    (KeyCode::Right, _)
+                        if self.mode == AppMode::Normal
+                            && self.preview_focused
+                            && self.is_paged_visual_selected() =>
+                    {
+                        self.step_preview_page(1)
+                    }
+                    (KeyCode::PageUp, _)
+                        if self.mode == AppMode::Normal
+                            && self.preview_focused
+                            && self.is_paged_visual_selected() =>
+                    {
+                        self.step_preview_page(-1)
+                    }
+                    (KeyCode::PageDown, _)
+                        if self.mode == AppMode::Normal
+                            && self.preview_focused
+                            && self.is_paged_visual_selected() =>
+                    {
+                        self.step_preview_page(1)
+                    }
+
                     // ── Navigation — only when Normal mode ──────────────────
                     (KeyCode::Down, _) if self.mode == AppMode::Normal => self.move_down(),
                     (KeyCode::Up, _) if self.mode == AppMode::Normal => self.move_up(),
@@ -1625,13 +1947,15 @@ impl AppState {
                         // ── Slide Prev / Next in visual preview ──
                         if let Some(rect) = geo.slide_prev_rect {
                             if point_in(mouse.column, mouse.row, &rect) {
-                                self.pptx_slide_index = self.pptx_slide_index.saturating_sub(1);
+                                self.preview_focused = true;
+                                self.step_preview_page(-1);
                                 return Ok(false);
                             }
                         }
                         if let Some(rect) = geo.slide_next_rect {
                             if point_in(mouse.column, mouse.row, &rect) {
-                                self.pptx_slide_index = self.pptx_slide_index.saturating_add(1);
+                                self.preview_focused = true;
+                                self.step_preview_page(1);
                                 return Ok(false);
                             }
                         }
@@ -1696,13 +2020,21 @@ impl AppState {
                         }
 
                         // ── File/folder rows ──
-                        self.handle_row_click(
+                        let hit_row = self.handle_row_click(
                             &geo,
                             mouse.column,
                             mouse.row,
                             mouse.modifiers,
                             false,
                         );
+                        if hit_row {
+                            self.preview_focused = false;
+                        } else if geo
+                            .preview_rect
+                            .is_some_and(|rect| point_in(mouse.column, mouse.row, &rect))
+                        {
+                            self.preview_focused = true;
+                        }
                     }
                     MouseEventKind::Down(MouseButton::Right) => {
                         let geo = self.layout_geometry.lock().clone();
@@ -1791,43 +2123,20 @@ impl AppState {
         if let Some(pr) = geo.preview_rect {
             if point_in(col, row, &pr) {
                 let selected = self.selected_file();
-                let ext = selected
-                    .as_ref()
-                    .and_then(|path| path.extension())
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-
                 // Visual presentations and PDFs are paged content, not
                 // scrollable text blocks. The wheel requests the adjacent
                 // rendered page instead of moving a metadata header.
-                let visual_presentation = matches!(ext.as_str(), "ppt" | "pptx" | "odp")
-                    && self.office_mode == OfficeRenderMode::Full;
-                let visual_pdf = ext == "pdf" && self.pdf_mode == PdfRenderMode::Visual;
-                if visual_presentation || visual_pdf {
-                    if down {
-                        let last = selected
-                            .as_ref()
-                            .and_then(|path| {
-                                if visual_pdf {
-                                    crate::preview::pdf_page_count(path)
-                                } else {
-                                    crate::preview::presentation_slide_count(path)
-                                }
-                            })
-                            .map(|count| count.saturating_sub(1));
-                        self.pptx_slide_index = match last {
-                            Some(last) => self.pptx_slide_index.saturating_add(steps).min(last),
-                            None => self.pptx_slide_index.saturating_add(steps),
-                        };
+                if self.is_paged_visual_selected() {
+                    self.preview_focused = true;
+                    self.step_preview_page(if down {
+                        steps as isize
                     } else {
-                        self.pptx_slide_index = self.pptx_slide_index.saturating_sub(steps);
-                    }
-                    self.preview_scroll = 0;
+                        -(steps as isize)
+                    });
                 } else if crate::preview::is_visual_preview(
                     selected.as_ref(),
-                    self.office_mode,
-                    self.pdf_mode,
+                    self.effective_office_mode(),
+                    self.effective_pdf_mode(),
                 ) {
                     // Static visual previews have nothing textual to scroll.
                     self.preview_scroll = 0;
@@ -2320,7 +2629,8 @@ impl AppState {
         self.current_mut().selected = index;
         self.keep_selection_visible();
         self.preview_scroll = 0;
-        self.pptx_slide_index = 0;
+        self.last_selection_changed_at = Instant::now();
+        self.invalidate_preview_pipeline(true);
     }
 
     fn select_next_search_match(&mut self, forward: bool) {
@@ -2339,7 +2649,8 @@ impl AppState {
         self.current_mut().selected = matches[next_position];
         self.keep_selection_visible();
         self.preview_scroll = 0;
-        self.pptx_slide_index = 0;
+        self.last_selection_changed_at = Instant::now();
+        self.invalidate_preview_pipeline(true);
     }
 
     /// True if the selected file is an image
@@ -2371,13 +2682,15 @@ impl AppState {
         self.image_flip_h = false;
         self.mode = AppMode::Normal;
         self.preview_scroll = 0;
+        self.preview_focused = false;
+        self.invalidate_preview_pipeline(true);
         self.search_active = false;
         self.search_query.clear();
         self.search_original_selection = None;
     }
 
     pub fn preview_debounce_active(&self) -> bool {
-        self.ultra_fast && self.last_selection_changed_at.elapsed() < Duration::from_millis(24)
+        self.last_selection_changed_at.elapsed() < preview_settle_delay(self.preview_mode)
     }
 
     pub fn event_revision(&self) -> u64 {
@@ -3050,7 +3363,12 @@ impl AppState {
             font_face: self.font_face.clone(),
             font_size: self.font_size,
             font_weight: self.font_weight,
-            ultra_fast: self.ultra_fast,
+            preview_mode: match self.preview_mode {
+                PreviewMode::Normal => "normal",
+                PreviewMode::Full => "full",
+                PreviewMode::Blitz => "blitz",
+            }
+            .to_string(),
             sidebar_width: self.sidebar_width,
             column_ratios: self.column_ratios.clone(),
             last_location: Some(self.current().path.to_string_lossy().into_owned()),
@@ -3096,17 +3414,26 @@ impl AppState {
                     false,
                 );
             }
-            ToggleAction::UltraFast => {
-                self.ultra_fast = !self.ultra_fast;
+            ToggleAction::PreviewNormal
+            | ToggleAction::PreviewFull
+            | ToggleAction::PreviewBlitz => {
+                self.preview_mode = match action {
+                    ToggleAction::PreviewNormal => PreviewMode::Normal,
+                    ToggleAction::PreviewFull => PreviewMode::Full,
+                    ToggleAction::PreviewBlitz => PreviewMode::Blitz,
+                    _ => unreachable!(),
+                };
+                self.last_selection_changed_at = Instant::now();
+                self.invalidate_preview_pipeline(true);
                 self.persist_user_settings();
                 self.set_notice(
                     format!(
-                        "Performance: {}",
-                        if self.ultra_fast {
-                            "Blitz — deferred rich previews, coalesced input, fast image scaling"
-                        } else {
-                            "Balanced"
-                        },
+                        "Preview mode: {}",
+                        match self.preview_mode {
+                            PreviewMode::Normal => "Normal — responsive staged previews",
+                            PreviewMode::Full => "Full — complete page and slide rendering",
+                            PreviewMode::Blitz => "Blitz — cached and lightweight previews",
+                        }
                     ),
                     false,
                 );
@@ -3116,6 +3443,8 @@ impl AppState {
                     OfficeRenderMode::Text => OfficeRenderMode::Full,
                     OfficeRenderMode::Full => OfficeRenderMode::Text,
                 };
+                self.last_selection_changed_at = Instant::now();
+                self.invalidate_preview_pipeline(true);
                 self.set_notice(
                     format!(
                         "Office mode: {}",
@@ -3134,6 +3463,8 @@ impl AppState {
                     PdfRenderMode::Text => PdfRenderMode::Visual,
                     PdfRenderMode::Visual => PdfRenderMode::Text,
                 };
+                self.last_selection_changed_at = Instant::now();
+                self.invalidate_preview_pipeline(true);
                 self.set_notice(
                     format!(
                         "PDF mode: {}",
@@ -4224,6 +4555,22 @@ pub fn list_drives_info() -> Vec<DriveInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_modes_have_distinct_settle_policies() {
+        assert_eq!(
+            preview_settle_delay(PreviewMode::Normal),
+            Duration::from_millis(140)
+        );
+        assert_eq!(
+            preview_settle_delay(PreviewMode::Full),
+            Duration::from_millis(160)
+        );
+        assert_eq!(
+            preview_settle_delay(PreviewMode::Blitz),
+            Duration::from_millis(220)
+        );
+    }
 
     #[test]
     fn repeated_primary_click_opens_only_the_same_row_within_the_window() {

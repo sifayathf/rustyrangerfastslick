@@ -25,7 +25,7 @@ pub enum PreviewCmd {
         term_cols: u16,
         term_rows: u16,
         background: u32,
-        ultra_fast: bool,
+        fast_scaling: bool,
     },
     Hide {
         generation: u64,
@@ -36,6 +36,20 @@ pub enum PreviewCmd {
 pub struct NativePreviewManager {
     sender: Sender<PreviewCmd>,
     generation: Arc<AtomicU64>,
+    last_request: Mutex<Option<NativeRequestKey>>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct NativeRequestKey {
+    path: std::path::PathBuf,
+    rotation: u32,
+    flip_h: bool,
+    zoom_bits: u32,
+    cell_rect: TuiRect,
+    term_cols: u16,
+    term_rows: u16,
+    background: u32,
+    fast_scaling: bool,
 }
 
 impl NativePreviewManager {
@@ -49,6 +63,7 @@ impl NativePreviewManager {
         Self {
             sender: tx,
             generation,
+            last_request: Mutex::new(None),
         }
     }
 
@@ -64,8 +79,25 @@ impl NativePreviewManager {
         term_cols: u16,
         term_rows: u16,
         background: u32,
-        ultra_fast: bool,
+        fast_scaling: bool,
     ) {
+        let request_key = NativeRequestKey {
+            path: path.clone(),
+            rotation,
+            flip_h,
+            zoom_bits: zoom.to_bits(),
+            cell_rect,
+            term_cols,
+            term_rows,
+            background,
+            fast_scaling,
+        };
+        if let Ok(mut last) = self.last_request.lock() {
+            if last.as_ref() == Some(&request_key) {
+                return;
+            }
+            *last = Some(request_key);
+        }
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         let _ = self.sender.send(PreviewCmd::ShowImage {
             generation,
@@ -78,11 +110,17 @@ impl NativePreviewManager {
             term_cols,
             term_rows,
             background,
-            ultra_fast,
+            fast_scaling,
         });
     }
 
     pub fn hide(&self) {
+        if let Ok(mut last) = self.last_request.lock() {
+            if last.is_none() {
+                return;
+            }
+            *last = None;
+        }
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         let _ = self.sender.send(PreviewCmd::Hide { generation });
     }
@@ -412,7 +450,7 @@ fn native_window_thread(rx: Receiver<PreviewCmd>, newest_generation: Arc<AtomicU
         let mut last_applied_rect: (i32, i32, i32, i32) = (i32::MIN, 0, 0, 0);
         let mut last_shown: Option<(Arc<DynamicImage>, f32, TuiRect, u16, u16, bool)> = None;
         let mut is_visible = false;
-        let mut ultra_fast = false;
+        let mut fast_scaling = false;
         let mut last_resync_at = std::time::Instant::now();
         const RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
 
@@ -474,12 +512,12 @@ fn native_window_thread(rx: Receiver<PreviewCmd>, newest_generation: Arc<AtomicU
                         term_cols,
                         term_rows,
                         background,
-                        ultra_fast: requested_ultra,
+                        fast_scaling: requested_fast_scaling,
                     } => {
                         if generation < newest_generation.load(Ordering::Acquire) {
                             continue;
                         }
-                        ultra_fast = requested_ultra;
+                        fast_scaling = requested_fast_scaling;
                         let zoom = zoom.clamp(0.1, 8.0);
                         let key = (path, rotation, flip_h, zoom.to_bits(), background);
                         let unchanged = Some(&key) == last_key.as_ref()
@@ -514,7 +552,7 @@ fn native_window_thread(rx: Receiver<PreviewCmd>, newest_generation: Arc<AtomicU
                                 &mut last_applied_rect,
                                 state_ptr,
                                 true,
-                                requested_ultra,
+                                requested_fast_scaling,
                             );
                             if generation == newest_generation.load(Ordering::Acquire) {
                                 ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -525,7 +563,7 @@ fn native_window_thread(rx: Receiver<PreviewCmd>, newest_generation: Arc<AtomicU
                                     cell_rect,
                                     term_cols,
                                     term_rows,
-                                    requested_ultra,
+                                    requested_fast_scaling,
                                 ));
                                 last_key = Some(key);
                                 last_resync_at = std::time::Instant::now();
@@ -536,7 +574,7 @@ fn native_window_thread(rx: Receiver<PreviewCmd>, newest_generation: Arc<AtomicU
                         if generation < newest_generation.load(Ordering::Acquire) {
                             continue;
                         }
-                        ultra_fast = false;
+                        fast_scaling = false;
                         if is_visible {
                             ShowWindow(hwnd, SW_HIDE);
                             is_visible = false;
@@ -553,7 +591,7 @@ fn native_window_thread(rx: Receiver<PreviewCmd>, newest_generation: Arc<AtomicU
                     }
                 }
             }
-            if ultra_fast {
+            if fast_scaling {
                 // A one-millisecond wait is below a display frame while
                 // avoiding the 100% CPU busy-spin caused by yield_now().
                 thread::sleep(std::time::Duration::from_millis(1));

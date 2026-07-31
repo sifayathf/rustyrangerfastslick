@@ -2,7 +2,8 @@
 #![allow(non_snake_case)]
 use crate::preview::{self, PreviewContent};
 use crate::state::{
-    AppMode, AppState, ContextAction, DirLevel, LayoutGeometry, LayoutMode, SortMode, ThemeMode,
+    AppMode, AppState, ContextAction, DirLevel, LayoutGeometry, LayoutMode, PreviewMode, SortMode,
+    ThemeMode,
 };
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -18,6 +19,27 @@ use unicode_width::UnicodeWidthStr;
 // circle halves (◗/◖) are much shorter than a terminal row and look like dots.
 const PILL_LEFT_CAP: &str = "";
 const PILL_RIGHT_CAP: &str = "";
+const PAGE_PREV_LABEL: &str = "[< Prev]";
+const PAGE_NEXT_LABEL: &str = "[Next >]";
+
+fn page_control_rects(inner: Rect) -> (Rect, Rect) {
+    let prev_x = inner.x.saturating_add(2);
+    let next_x = prev_x.saturating_add(PAGE_PREV_LABEL.len() as u16 + 2);
+    (
+        Rect {
+            x: prev_x,
+            y: inner.y.saturating_add(2),
+            width: PAGE_PREV_LABEL.len() as u16,
+            height: 1,
+        },
+        Rect {
+            x: next_x,
+            y: inner.y.saturating_add(2),
+            width: PAGE_NEXT_LABEL.len() as u16,
+            height: 1,
+        },
+    )
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Top-level draw
@@ -557,17 +579,92 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
             app.layout_mode == LayoutMode::Explorer,
             crate::state::ToggleAction::LayoutMode,
         );
-        draw_toggle(
-            f,
-            geo,
-            &mut y,
-            "⚡",
-            "Mode",
-            "Normal",
-            "Blitz",
-            app.ultra_fast,
-            crate::state::ToggleAction::UltraFast,
-        );
+        if y.saturating_add(1) < max_y {
+            let label_rect = Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            };
+            f.render_widget(
+                Paragraph::new(Span::styled("⚡ Mode", Style::default().fg(C_TEXT))),
+                label_rect,
+            );
+            y += 1;
+
+            let options_rect = Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            };
+            let options = [
+                (
+                    "Normal",
+                    PreviewMode::Normal,
+                    crate::state::ToggleAction::PreviewNormal,
+                ),
+                (
+                    "Full",
+                    PreviewMode::Full,
+                    crate::state::ToggleAction::PreviewFull,
+                ),
+                (
+                    "Blitz",
+                    PreviewMode::Blitz,
+                    crate::state::ToggleAction::PreviewBlitz,
+                ),
+            ];
+            let mut spans = vec![Span::raw(" ")];
+            let mut option_x = options_rect.x.saturating_add(1);
+            for (index, (label, mode, action)) in options.into_iter().enumerate() {
+                if index > 0 {
+                    spans.push(Span::raw(" "));
+                    option_x = option_x.saturating_add(1);
+                }
+                let active = app.preview_mode == mode;
+                let color = if active { C_ACCENT } else { t.sel_bg_inactive };
+                let badge_style = if active {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(color)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(C_MUTED).bg(color)
+                };
+                let cap_style = if app.rounded_selection {
+                    Style::default().fg(color).bg(t.bg_panel)
+                } else {
+                    Style::default().bg(color)
+                };
+                let left_cap = if app.rounded_selection {
+                    PILL_LEFT_CAP
+                } else {
+                    " "
+                };
+                let right_cap = if app.rounded_selection {
+                    PILL_RIGHT_CAP
+                } else {
+                    " "
+                };
+                spans.push(Span::styled(left_cap, cap_style));
+                spans.push(Span::styled(label, badge_style));
+                spans.push(Span::styled(right_cap, cap_style));
+                let width = label.width() as u16 + 2;
+                geo.toggle_rects.push((
+                    Rect {
+                        x: option_x,
+                        y,
+                        width,
+                        height: 1,
+                    },
+                    action,
+                ));
+                option_x = option_x.saturating_add(width);
+            }
+            f.render_widget(Paragraph::new(Line::from(spans)), options_rect);
+            y += 1;
+        }
         draw_toggle(
             f,
             geo,
@@ -576,7 +673,7 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
             "Office",
             "Text",
             "Full",
-            app.office_mode == crate::state::OfficeRenderMode::Full,
+            app.effective_office_mode() == crate::state::OfficeRenderMode::Full,
             crate::state::ToggleAction::OfficeMode,
         );
         draw_toggle(
@@ -587,7 +684,7 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
             "PDF",
             "Text",
             "Visual",
-            app.pdf_mode == crate::state::PdfRenderMode::Visual,
+            app.effective_pdf_mode() == crate::state::PdfRenderMode::Visual,
             crate::state::ToggleAction::PdfMode,
         );
         if y < max_y {
@@ -2514,30 +2611,50 @@ fn draw_preview_pane(
     if app.preview_debounce_active() {
         app.native_preview.hide();
         f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    " BLITZ ",
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(t.accent2)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("  Settling selection…", Style::default().fg(C_MUTED)),
+            Paragraph::new(Text::from(vec![
+                Line::from(vec![
+                    Span::styled(
+                        format!(" {} ", app.preview_mode.label().to_ascii_uppercase()),
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(t.accent2)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("  Settling selection…", Style::default().fg(C_MUTED)),
+                ]),
+                Line::from(Span::styled(
+                    format!("  {name}"),
+                    Style::default().fg(C_TEXT).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    format!("  {}  ·  {}", ext, size_str),
+                    Style::default().fg(C_TEXT_SOFT),
+                )),
             ])),
             inner,
         );
         return;
     }
 
-    match preview::render(
-        &selected.path,
-        app.image_rotation,
-        app.image_flip_h,
-        app.office_mode,
-        app.pdf_mode,
-        app.pptx_slide_index,
-        app.ultra_fast,
-    ) {
+    let Some(preview_content) = app.prepared_preview() else {
+        app.native_preview.hide();
+        f.render_widget(
+            Paragraph::new(Text::from(vec![
+                Line::from(Span::styled(
+                    "  Preparing preview…",
+                    Style::default().fg(C_WARN).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    format!("  {name}  ·  {ext}  ·  {size_str}"),
+                    Style::default().fg(C_MUTED),
+                )),
+            ])),
+            inner,
+        );
+        return;
+    };
+
+    match preview_content {
         PreviewContent::Text(txt) => {
             app.native_preview.hide();
             let padded: Vec<String> = txt.lines().map(|line| format!("  {}", line)).collect();
@@ -2550,7 +2667,7 @@ fn draw_preview_pane(
         PreviewContent::Highlighted(lines) => {
             app.native_preview.hide();
             let mut padded_lines = Vec::new();
-            for line in theme_preview_lines(lines, app.theme_mode) {
+            for line in theme_preview_lines(lines.clone(), app.theme_mode) {
                 let mut spans = line.spans;
                 spans.insert(0, Span::raw("  "));
                 padded_lines.push(Line::from(spans));
@@ -2591,23 +2708,44 @@ fn draw_preview_pane(
                     ),
                     Span::raw("  "),
                     Span::styled(
-                        info.title,
+                        info.title.as_str(),
                         Style::default().fg(C_TEXT).add_modifier(Modifier::BOLD),
                     ),
                 ]),
                 Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(info.detail, Style::default().fg(C_TEXT_SOFT)),
+                    Span::styled(info.detail.as_str(), Style::default().fg(C_TEXT_SOFT)),
                 ]),
             ];
-            if let Some(renderer) = info.renderer {
+            if app.is_paged_visual_selected() {
+                let (previous, next) = page_control_rects(inner);
+                geo.slide_prev_rect = Some(previous);
+                geo.slide_next_rect = Some(next);
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(PAGE_PREV_LABEL, Style::default().fg(t.accent2)),
+                    Span::raw("  "),
+                    Span::styled(PAGE_NEXT_LABEL, Style::default().fg(t.accent2)),
+                    Span::styled(
+                        format!(
+                            "  ·  Page {}{}",
+                            app.preview_page_index + 1,
+                            app.preview_page_count
+                                .map(|count| format!("/{count}"))
+                                .unwrap_or_default()
+                        ),
+                        Style::default().fg(C_MUTED),
+                    ),
+                ]));
+            }
+            if let Some(renderer) = &info.renderer {
                 lines.push(Line::from(vec![
                     Span::raw("  "),
                     Span::styled("Renderer: ", Style::default().fg(C_MUTED)),
                     Span::styled(renderer, Style::default().fg(color)),
                 ]));
             }
-            if let Some(action) = info.action {
+            if let Some(action) = &info.action {
                 lines.push(Line::from(vec![
                     Span::raw("  "),
                     Span::styled(action, Style::default().fg(C_MUTED)),
@@ -2620,7 +2758,7 @@ fn draw_preview_pane(
                     Style::default().fg(C_BORDER_LO),
                 ),
             ]));
-            for line in theme_preview_lines(info.lines, app.theme_mode) {
+            for line in theme_preview_lines(info.lines.clone(), app.theme_mode) {
                 let mut spans = line.spans;
                 spans.insert(0, Span::raw("  "));
                 lines.push(Line::from(spans));
@@ -2640,32 +2778,32 @@ fn draw_preview_pane(
                 ),
             ])];
             let mut meta_str = if matches!(ext.as_str(), "PPT" | "PPTX" | "ODP")
-                && app.office_mode == crate::state::OfficeRenderMode::Full
+                && app.is_paged_visual_selected()
             {
-                match preview::presentation_slide_count(&selected.path) {
+                match app.preview_page_count {
                     Some(count) => format!(
                         "{} Slide {}/{}  |  {}",
                         ext,
-                        app.pptx_slide_index.saturating_add(1).min(count),
+                        app.preview_page_index.saturating_add(1).min(count),
                         count,
                         size_str,
                     ),
                     None => format!(
                         "{} Slide {}  |  {}",
                         ext,
-                        app.pptx_slide_index + 1,
+                        app.preview_page_index + 1,
                         size_str
                     ),
                 }
-            } else if ext == "PDF" && app.pdf_mode == crate::state::PdfRenderMode::Visual {
-                match preview::pdf_page_count(&selected.path) {
+            } else if ext == "PDF" && app.is_paged_visual_selected() {
+                match app.preview_page_count {
                     Some(count) => format!(
                         "PDF Page {}/{}  |  {}",
-                        app.pptx_slide_index.saturating_add(1).min(count),
+                        app.preview_page_index.saturating_add(1).min(count),
                         count,
                         size_str,
                     ),
-                    None => format!("PDF Page {}  |  {}", app.pptx_slide_index + 1, size_str,),
+                    None => format!("PDF Page {}  |  {}", app.preview_page_index + 1, size_str,),
                 }
             } else {
                 format!("{} Image  |  {}", ext, size_str)
@@ -2688,15 +2826,48 @@ fn draw_preview_pane(
                 Span::raw("  "),
                 Span::styled(meta_str, Style::default().fg(C_MUTED)),
             ]));
-            let page_controls = if matches!(ext.as_str(), "PDF" | "PPT" | "PPTX" | "ODP") {
-                "Wheel pages  ·  +/- zoom  ·  0 fit  ·  R rotate  ·  F flip"
+            let paged = matches!(ext.as_str(), "PDF" | "PPT" | "PPTX" | "ODP")
+                && app.is_paged_visual_selected();
+            if paged {
+                let (previous, next) = page_control_rects(inner);
+                geo.slide_prev_rect = Some(previous);
+                geo.slide_next_rect = Some(next);
+                text.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        PAGE_PREV_LABEL,
+                        if app.preview_page_index > 0 {
+                            Style::default().fg(t.accent2).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(C_MUTED)
+                        },
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        PAGE_NEXT_LABEL,
+                        if app
+                            .preview_page_count
+                            .is_none_or(|count| app.preview_page_index.saturating_add(1) < count)
+                        {
+                            Style::default().fg(t.accent2).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(C_MUTED)
+                        },
+                    ),
+                    Span::styled(
+                        "  ·  Wheel/Left/Right pages  ·  +/- zoom",
+                        Style::default().fg(C_MUTED),
+                    ),
+                ]));
             } else {
-                "+/- zoom  ·  0 fit  ·  R rotate  ·  F flip"
-            };
-            text.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(page_controls, Style::default().fg(C_MUTED)),
-            ]));
+                text.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        "+/- zoom  ·  0 fit  ·  R rotate  ·  F flip",
+                        Style::default().fg(C_MUTED),
+                    ),
+                ]));
+            }
             text.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(
@@ -2737,7 +2908,7 @@ fn draw_preview_pane(
                         cols,
                         rows,
                         background,
-                        app.ultra_fast,
+                        app.preview_mode.is_blitz(),
                     );
                 } else {
                     app.native_preview.hide();
@@ -3203,7 +3374,11 @@ fn draw_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
 
 #[cfg(test)]
 mod tests {
-    use super::{tile_grid_dimensions, truncate, PILL_LEFT_CAP, PILL_RIGHT_CAP};
+    use super::{
+        page_control_rects, tile_grid_dimensions, truncate, PAGE_NEXT_LABEL, PAGE_PREV_LABEL,
+        PILL_LEFT_CAP, PILL_RIGHT_CAP,
+    };
+    use ratatui::layout::Rect;
     use unicode_width::UnicodeWidthStr;
 
     #[test]
@@ -3224,5 +3399,16 @@ mod tests {
         assert_eq!(tile_grid_dimensions(29, 4), (1, 1, 1, 29));
         assert_eq!(tile_grid_dimensions(60, 10), (2, 2, 4, 30));
         assert_eq!(tile_grid_dimensions(95, 20), (3, 4, 12, 31));
+    }
+
+    #[test]
+    fn page_controls_are_distinct_click_targets_on_the_controls_row() {
+        let inner = Rect::new(40, 8, 80, 30);
+        let (previous, next) = page_control_rects(inner);
+        assert_eq!(previous.y, inner.y + 2);
+        assert_eq!(next.y, inner.y + 2);
+        assert_eq!(previous.width, PAGE_PREV_LABEL.len() as u16);
+        assert_eq!(next.width, PAGE_NEXT_LABEL.len() as u16);
+        assert!(previous.x + previous.width < next.x);
     }
 }
