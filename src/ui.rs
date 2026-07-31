@@ -12,6 +12,7 @@ use ratatui::{
     Frame,
 };
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 // Full-cell Powerline caps used by the original oval implementation. Standard
 // circle halves (◗/◖) are much shorter than a terminal row and look like dots.
@@ -63,9 +64,10 @@ pub fn draw(f: &mut Frame, app: &AppState) {
     geo.context_menu_rect = None;
 
     // Responsive: hide the sidebar on very narrow terminals so panes stay usable.
-    let show_sidebar = root[0].width >= 60;
+    let show_sidebar = root[0].width >= 90;
     let sidebar_w = if show_sidebar {
-        app.sidebar_width.min(root[0].width.saturating_sub(30))
+        let maximum = root[0].width.saturating_sub(48).clamp(18, 36);
+        app.sidebar_width.clamp(18, maximum)
     } else {
         0
     };
@@ -332,7 +334,14 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
                 icon_span,
                 text_span,
                 Span::styled(
-                    truncate(&d.label, inner.width.saturating_sub(13) as usize),
+                    truncate(
+                        &if d.fs.is_empty() {
+                            d.label.clone()
+                        } else {
+                            format!("{} · {}", d.label, d.fs)
+                        },
+                        inner.width.saturating_sub(13) as usize,
+                    ),
                     Style::default().fg(C_MUTED),
                 ),
             ]),
@@ -364,7 +373,7 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
                 max_y,
                 Line::from(vec![
                     Span::styled("  ", Style::default()),
-                    Span::styled(format!("{}", bar), Style::default().fg(bar_color)),
+                    Span::styled(bar, Style::default().fg(bar_color)),
                 ]),
                 None,
             );
@@ -772,17 +781,25 @@ fn push_line(
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.graphemes(true).count() <= max {
+    if UnicodeWidthStr::width(s) <= max {
         return s.to_string();
     }
-    if max <= 3 {
-        return ".".repeat(max.max(1));
+    if max == 0 {
+        return String::new();
     }
-    let mut out = s
-        .graphemes(true)
-        .take(max.saturating_sub(3))
-        .collect::<String>();
-    out.push_str("...");
+    let ellipsis = "…";
+    let content_width = max.saturating_sub(UnicodeWidthStr::width(ellipsis));
+    let mut used = 0usize;
+    let mut out = String::new();
+    for grapheme in s.graphemes(true) {
+        let width = UnicodeWidthStr::width(grapheme);
+        if used.saturating_add(width) > content_width {
+            break;
+        }
+        out.push_str(grapheme);
+        used += width;
+    }
+    out.push_str(ellipsis);
     out
 }
 
@@ -809,8 +826,8 @@ fn draw_input_modal(f: &mut Frame, app: &AppState) {
     };
     let term_size = f.size();
 
-    let width = 64.min(term_size.width.saturating_sub(4)).max(20);
-    let height = 3;
+    let width = 64.min(term_size.width.saturating_sub(2)).max(1);
+    let height = 3.min(term_size.height).max(1);
 
     let area = Rect {
         x: term_size.x + (term_size.width.saturating_sub(width)) / 2,
@@ -830,7 +847,7 @@ fn draw_input_modal(f: &mut Frame, app: &AppState) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let chars: Vec<char> = app.input_buffer.chars().collect();
+    let graphemes: Vec<&str> = app.input_buffer.graphemes(true).collect();
     let (lo, hi) = if app.input_sel_start <= app.input_cursor {
         (app.input_sel_start, app.input_cursor)
     } else {
@@ -838,14 +855,14 @@ fn draw_input_modal(f: &mut Frame, app: &AppState) {
     };
 
     let mut spans = Vec::new();
-    for (i, c) in chars.iter().enumerate() {
+    for (i, grapheme) in graphemes.iter().enumerate() {
         let selected = i >= lo && i < hi;
         let style = if selected {
             Style::default().fg(Color::Black).bg(C_ACCENT2)
         } else {
             Style::default().fg(C_TEXT)
         };
-        spans.push(Span::styled(c.to_string(), style));
+        spans.push(Span::styled((*grapheme).to_string(), style));
     }
     // Cursor caret (only when there's no active selection to show).
     if lo == hi {
@@ -871,21 +888,22 @@ fn draw_confirm_modal(f: &mut Frame, app: &AppState) {
     let C_ERR = t.err;
 
     let permanent = app.mode == AppMode::ConfirmDeletePermanent;
-    let n = app.selected_paths().len().max(1);
+    let (count, targets) = app.delete_target_summary();
     let title = if permanent {
         " Permanently Delete "
     } else {
         " Delete "
     };
     let msg = if permanent {
-        format!("Permanently delete {} item(s)? This cannot be undone.", n)
+        format!("Permanently delete {count} item(s)? This cannot be undone.")
     } else {
-        format!("Delete {} item(s)?", n)
+        format!("Move {count} item(s) to the Recycle Bin?")
     };
 
     let term_size = f.size();
-    let width = 56.min(term_size.width.saturating_sub(4)).max(20);
-    let height = 5;
+    let width = 68.min(term_size.width.saturating_sub(2)).max(1);
+    let preferred_height = 5u16.saturating_add(targets.len() as u16);
+    let height = preferred_height.min(term_size.height).max(1);
     let area = Rect {
         x: term_size.x + (term_size.width.saturating_sub(width)) / 2,
         y: term_size.y + (term_size.height.saturating_sub(height)) / 2,
@@ -901,16 +919,27 @@ fn draw_confirm_modal(f: &mut Frame, app: &AppState) {
         .style(Style::default().bg(t.bg_panel));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let text = vec![
-        Line::from(Span::styled(msg, Style::default().fg(C_TEXT))),
-        Line::from(""),
+    let available_width = inner.width.saturating_sub(2) as usize;
+    let mut text = vec![Line::from(Span::styled(
+        truncate(&msg, available_width),
+        Style::default().fg(C_TEXT),
+    ))];
+    text.extend(targets.into_iter().map(|target| {
         Line::from(vec![
-            Span::styled(" Y ", Style::default().fg(Color::Black).bg(C_ERR)),
-            Span::raw(" confirm     "),
-            Span::styled(" Esc ", Style::default().fg(Color::Black).bg(C_MUTED)),
-            Span::raw(" cancel"),
-        ]),
-    ];
+            Span::raw("  "),
+            Span::styled(
+                truncate(&target, available_width.saturating_sub(2)),
+                Style::default().fg(C_MUTED),
+            ),
+        ])
+    }));
+    text.push(Line::from(""));
+    text.push(Line::from(vec![
+        Span::styled(" Y ", Style::default().fg(Color::Black).bg(C_ERR)),
+        Span::raw(" confirm     "),
+        Span::styled(" Esc ", Style::default().fg(Color::Black).bg(C_MUTED)),
+        Span::raw(" cancel"),
+    ]));
     f.render_widget(Paragraph::new(text), inner);
 }
 
@@ -927,8 +956,8 @@ fn draw_properties_modal(f: &mut Frame, app: &AppState) {
     };
 
     let term_size = f.size();
-    let width = 78.min(term_size.width.saturating_sub(4)).max(34);
-    let height = 18.min(term_size.height.saturating_sub(4)).max(10);
+    let width = 78.min(term_size.width.saturating_sub(2)).max(1);
+    let height = 18.min(term_size.height.saturating_sub(2)).max(1);
     let area = Rect {
         x: term_size.x + (term_size.width.saturating_sub(width)) / 2,
         y: term_size.y + (term_size.height.saturating_sub(height)) / 2,
@@ -949,7 +978,7 @@ fn draw_properties_modal(f: &mut Frame, app: &AppState) {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.display().to_string());
-    let meta = std::fs::metadata(&path);
+    let meta = std::fs::metadata(path);
     let mut lines = vec![
         Line::from(vec![
             Span::styled("Name:      ", Style::default().fg(C_MUTED)),
@@ -1102,25 +1131,6 @@ fn draw_properties_modal(f: &mut Frame, app: &AppState) {
     )));
 
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
-}
-
-fn format_epoch(secs: u64) -> String {
-    // Lightweight, dependency-free UTC formatting (no timezone database needed).
-    let days = secs / 86_400;
-    let rem = secs % 86_400;
-    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    // Days since 1970-01-01 -> Y-M-D (civil_from_days algorithm).
-    let z = days as i64 + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mth = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if mth <= 2 { y + 1 } else { y };
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", year, mth, d, h, m, s)
 }
 
 fn property_time_line(
@@ -1278,7 +1288,9 @@ fn draw_context_menu(f: &mut Frame, app: &AppState, geo: &mut LayoutGeometry) {
         };
 
         let label_text = format!(" {}", action.label());
-        let pad = " ".repeat((inner.width as usize).saturating_sub(label_text.chars().count()));
+        let pad = " ".repeat(
+            (inner.width as usize).saturating_sub(UnicodeWidthStr::width(label_text.as_str())),
+        );
         let style = if is_hovered {
             Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD)
         } else {
@@ -1350,7 +1362,7 @@ fn draw_breadcrumb(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGe
     while segments.len() > 3
         && (segments
             .iter()
-            .map(|(label, _)| label.chars().count())
+            .map(|(label, _)| UnicodeWidthStr::width(label.as_str()))
             .sum::<usize>()
             + segments.len().saturating_sub(1) * 3
             + usize::from(hidden_middle) * 4)
@@ -1362,7 +1374,7 @@ fn draw_breadcrumb(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGe
     while segments.len() > 1
         && (segments
             .iter()
-            .map(|(label, _)| label.chars().count())
+            .map(|(label, _)| UnicodeWidthStr::width(label.as_str()))
             .sum::<usize>()
             + segments.len().saturating_sub(1) * 3
             + usize::from(hidden_middle) * 4)
@@ -1387,10 +1399,10 @@ fn draw_breadcrumb(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGe
                 " > "
             };
             spans.push(Span::styled(separator, Style::default().fg(C_MUTED)));
-            x += separator.chars().count() as u16;
+            x += UnicodeWidthStr::width(separator) as u16;
         }
         let text = label.clone();
-        let w = text.chars().count() as u16;
+        let w = UnicodeWidthStr::width(text.as_str()) as u16;
         if x + w <= area.x + area.width {
             geo.breadcrumb_segment_rects.push((
                 Rect {
@@ -1461,7 +1473,7 @@ fn draw_breadcrumb(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGe
             let cursor_x = search_rect
                 .x
                 .saturating_add(3)
-                .saturating_add(query.chars().count() as u16)
+                .saturating_add(UnicodeWidthStr::width(query.as_str()) as u16)
                 .min(
                     search_rect
                         .x
@@ -1482,7 +1494,7 @@ fn draw_panes(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeometr
         let Some(level) = app.levels.get(level_index) else {
             return;
         };
-        let show_preview = !level.files.is_empty() && area.width >= 72;
+        let show_preview = !level.files.is_empty() && area.width >= 64;
         let chunks = if show_preview {
             Layout::default()
                 .direction(Direction::Horizontal)
@@ -1506,11 +1518,27 @@ fn draw_panes(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeometr
     }
 
     let num = app.levels.len();
-    let start = if num > 4 { num - 4 } else { 0 };
+    let maximum_columns = match area.width {
+        0..=55 => 1usize,
+        56..=83 => 2,
+        84..=114 => 3,
+        115..=149 => 4,
+        _ => 5,
+    };
+    let wants_preview = app
+        .levels
+        .last()
+        .is_some_and(|level| !level.files.is_empty())
+        && maximum_columns >= 2;
+    let pane_capacity = maximum_columns
+        .saturating_sub(usize::from(wants_preview))
+        .max(1);
+    let visible_panes = num.min(pane_capacity).min(4);
+    let start = num.saturating_sub(visible_panes);
     let panes = &app.levels[start..];
     let np = panes.len();
 
-    let has_preview = panes.last().map_or(false, |l| !l.files.is_empty());
+    let has_preview = wants_preview && panes.last().is_some_and(|level| !level.files.is_empty());
     let n_cols = if has_preview { np + 1 } else { np };
 
     if n_cols == 0 {
@@ -1896,7 +1924,7 @@ fn draw_dir_pane(
         )
     };
 
-    let title_width = title_text.chars().count().min(area.width as usize) as u16;
+    let title_width = UnicodeWidthStr::width(title_text.as_str()).min(area.width as usize) as u16;
     let list = List::new(items).block(
         Block::default()
             .title(title_text)
@@ -2226,13 +2254,13 @@ fn draw_preview_pane(
         {
             let raw_line = &app.edit_buffer[app.edit_cursor_row];
             let head = raw_line
-                .chars()
-                .take(app.edit_cursor_col.min(raw_line.chars().count()))
+                .graphemes(true)
+                .take(app.edit_cursor_col.min(raw_line.graphemes(true).count()))
                 .collect::<String>();
             let display_head = preview::expand_editor_tabs(&head);
             let gutter_digits = app.edit_buffer.len().max(1).to_string().len();
             let gutter_width = Span::raw(format!(
-                "{:>width$}│ ",
+                "{:>width$}│",
                 app.edit_cursor_row + 1,
                 width = gutter_digits,
             ))
@@ -2289,7 +2317,6 @@ fn draw_preview_pane(
             let padded: Vec<String> = txt.lines().map(|line| format!("  {}", line)).collect();
             let para = Paragraph::new(padded.join("\n"))
                 .style(Style::default().fg(C_TEXT_SOFT))
-                .wrap(Wrap { trim: false })
                 .scroll((scroll, 0));
             f.render_widget(para, inner);
         }
@@ -2301,9 +2328,7 @@ fn draw_preview_pane(
                 spans.insert(0, Span::raw("  "));
                 padded_lines.push(Line::from(spans));
             }
-            let para = Paragraph::new(Text::from(padded_lines))
-                .wrap(Wrap { trim: false })
-                .scroll((scroll, 0));
+            let para = Paragraph::new(Text::from(padded_lines)).scroll((scroll, 0));
             f.render_widget(para, inner);
         }
         PreviewContent::Code(lines) => {
@@ -2338,6 +2363,7 @@ fn draw_preview_pane(
                         info.path.clone(),
                         app.image_rotation,
                         app.image_flip_h,
+                        app.image_zoom,
                         img_rect,
                         cols,
                         rows,
@@ -2393,9 +2419,25 @@ fn draw_preview_pane(
             if let Some((w, h)) = info.dimensions {
                 meta_str.push_str(&format!("  |  {} x {}", w, h));
             }
+            meta_str.push_str(&format!("  |  Zoom {:.0}%", app.image_zoom * 100.0));
+            if !app.image_rotation.is_multiple_of(360) {
+                meta_str.push_str(&format!("  |  Rotate {}°", app.image_rotation % 360));
+            }
+            if app.image_flip_h {
+                meta_str.push_str("  |  Flipped");
+            }
             text.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(meta_str, Style::default().fg(C_MUTED)),
+            ]));
+            let page_controls = if matches!(ext.as_str(), "PDF" | "PPT" | "PPTX" | "ODP") {
+                "Wheel pages  ·  +/- zoom  ·  0 fit  ·  R rotate  ·  F flip"
+            } else {
+                "+/- zoom  ·  0 fit  ·  R rotate  ·  F flip"
+            };
+            text.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(page_controls, Style::default().fg(C_MUTED)),
             ]));
             text.push(Line::from(vec![
                 Span::raw("  "),
@@ -2678,6 +2720,28 @@ fn draw_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
     let C_OK = t.ok;
     let C_ERR = t.err;
 
+    if let Some(operation) = &app.operation_status {
+        let percent = operation
+            .done
+            .saturating_mul(100)
+            .checked_div(operation.total)
+            .unwrap_or(100);
+        let message = format!(
+            "  {}  {}/{}  {}%  ·  Esc cancel",
+            operation.label, operation.done, operation.total, percent,
+        );
+        f.render_widget(
+            Paragraph::new(truncate(&message, area.width as usize)).style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(C_WARN)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            area,
+        );
+        return;
+    }
+
     if let Some((msg, is_err)) = app.active_notice() {
         let style = if is_err {
             Style::default()
@@ -2691,8 +2755,25 @@ fn draw_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
                 .add_modifier(Modifier::BOLD)
         };
         let icon = if is_err { "[X]" } else { "[OK]" };
+        let message = truncate(&format!("  {} {}", icon, msg), area.width as usize);
+        f.render_widget(Paragraph::new(message).style(style), area);
+        return;
+    }
+
+    if let Some(path) = &app.navigation_loading {
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| path.to_str().unwrap_or("folder"));
+        let message = truncate(&format!("  Opening {name}…"), area.width as usize);
         f.render_widget(
-            Paragraph::new(format!("  {} {}", icon, msg)).style(style),
+            Paragraph::new(message).style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(t.accent2)
+                    .add_modifier(Modifier::BOLD),
+            ),
             area,
         );
         return;
@@ -2822,10 +2903,19 @@ fn draw_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
 
 #[cfg(test)]
 mod tests {
-    use super::{PILL_LEFT_CAP, PILL_RIGHT_CAP};
+    use super::{truncate, PILL_LEFT_CAP, PILL_RIGHT_CAP};
+    use unicode_width::UnicodeWidthStr;
 
     #[test]
     fn pill_caps_use_the_original_full_height_geometry() {
         assert_eq!(format!("{PILL_LEFT_CAP}value{PILL_RIGHT_CAP}"), "value");
+    }
+
+    #[test]
+    fn truncation_uses_terminal_cells_and_preserves_graphemes() {
+        let value = truncate("தமிழ்-preview", 7);
+        assert!(UnicodeWidthStr::width(value.as_str()) <= 7);
+        assert!(!value.contains(char::REPLACEMENT_CHARACTER));
+        assert!(value.ends_with('…'));
     }
 }

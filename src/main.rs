@@ -19,12 +19,9 @@ use state::AppState;
 const WT_PROFILE_NAME: &str = "Rusty Ranger";
 /// GUID for the dedicated Windows Terminal profile (stable, deterministic)
 const WT_PROFILE_GUID: &str = "{a7b3c4d5-e6f7-4a8b-9c0d-1e2f3a4b5c6d}";
-/// Desired font face for the file manager
 // Match the original rounded-control implementation. Windows Terminal's
 // Cascadia Code profile supplies the full-cell Powerline separator geometry
 // used for pill caps while keeping the normal text grid monospace.
-/// Desired font size (pt) — 9pt gives a compact, Windows-Explorer-like look
-
 /// Detect Windows Terminal and relaunch in a dedicated profile with the right font.
 /// Returns `true` if we relaunched (caller should exit), `false` to continue normally.
 #[cfg(windows)]
@@ -105,7 +102,8 @@ fn try_relaunch_in_wt_profile(user_settings: &settings::UserSettings) -> bool {
         "scrollbarState": "hidden"
     });
 
-    // Insert or update the profile in profiles.list
+    // Insert or update only the fields owned by Rusty Ranger. Recursively
+    // merging keeps any profile customizations the user added themselves.
     let needs_write;
     if let Some(profiles) = settings.get_mut("profiles") {
         if let Some(list) = profiles.get_mut("list") {
@@ -115,9 +113,9 @@ fn try_relaunch_in_wt_profile(user_settings: &settings::UserSettings) -> bool {
                     .iter_mut()
                     .find(|p| p.get("guid").and_then(|g| g.as_str()) == Some(WT_PROFILE_GUID))
                 {
-                    // Update existing profile's commandline and font
-                    *existing = profile;
-                    needs_write = true;
+                    let before = existing.clone();
+                    merge_json(existing, profile);
+                    needs_write = *existing != before;
                 } else {
                     arr.push(profile);
                     needs_write = true;
@@ -133,12 +131,18 @@ fn try_relaunch_in_wt_profile(user_settings: &settings::UserSettings) -> bool {
     }
 
     if needs_write {
-        // Write back settings.json
+        // Keep a one-time recovery copy and atomically publish the update.
+        // A crash can therefore leave either the old or new valid JSON, never
+        // a partially-written Windows Terminal configuration.
         let formatted = match serde_json::to_string_pretty(&settings) {
             Ok(s) => s,
             Err(_) => return false,
         };
-        if std::fs::write(&settings_path, formatted).is_err() {
+        let backup = settings_path.with_extension("json.rusty-ranger.bak");
+        if !backup.exists() && std::fs::copy(&settings_path, &backup).is_err() {
+            return false;
+        }
+        if settings::write_atomic(&settings_path, formatted.as_bytes()).is_err() {
             return false;
         }
     }
@@ -146,12 +150,30 @@ fn try_relaunch_in_wt_profile(user_settings: &settings::UserSettings) -> bool {
     // Relaunch: open a new Windows Terminal window with our profile.
     // Only tell the caller to exit if this actually launched — otherwise
     // we'd vanish with no window at all if wt.exe isn't on PATH.
-    match std::process::Command::new("wt.exe")
+    std::process::Command::new("wt.exe")
         .args(["-p", WT_PROFILE_NAME])
         .spawn()
-    {
-        Ok(_) => true,
-        Err(_) => false,
+        .is_ok()
+}
+
+#[cfg(windows)]
+fn merge_json(destination: &mut serde_json::Value, source: serde_json::Value) {
+    let serde_json::Value::Object(source) = source else {
+        *destination = source;
+        return;
+    };
+    if !destination.is_object() {
+        *destination = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let destination = destination.as_object_mut().expect("object initialized");
+    for (key, source_value) in source {
+        if let Some(destination_value) = destination.get_mut(&key) {
+            if destination_value.is_object() && source_value.is_object() {
+                merge_json(destination_value, source_value);
+                continue;
+            }
+        }
+        destination.insert(key, source_value);
     }
 }
 
@@ -193,9 +215,7 @@ fn main() -> anyhow::Result<()> {
             let handle = windows_sys::Win32::System::Console::GetStdHandle(
                 windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE,
             );
-            if handle != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
-                && handle != std::ptr::null_mut()
-            {
+            if handle != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE && !handle.is_null() {
                 let mut font_info: windows_sys::Win32::System::Console::CONSOLE_FONT_INFOEX =
                     std::mem::zeroed();
                 font_info.cbSize = std::mem::size_of::<
@@ -211,9 +231,7 @@ fn main() -> anyhow::Result<()> {
                     .encode_utf16()
                     .collect::<Vec<_>>();
                 let len = name.len().min(32);
-                for i in 0..len {
-                    font_info.FaceName[i] = name[i];
-                }
+                font_info.FaceName[..len].copy_from_slice(&name[..len]);
 
                 windows_sys::Win32::System::Console::SetCurrentConsoleFontEx(handle, 0, &font_info);
             }
@@ -229,40 +247,8 @@ fn main() -> anyhow::Result<()> {
     terminal.clear()?;
 
     let mut app = AppState::new()?;
-    let mut previous_frame_signature = None;
-
     loop {
-        app.maybe_refresh_drives();
-
-        // Ratatui normally emits only changed terminal cells. Indic scripts
-        // use zero-width combining marks, and some terminal renderers can
-        // leave an old mark behind when a preview changes in-place. Force a
-        // clean frame only when preview-affecting state changes; ordinary
-        // idle/hover frames retain the fast diff renderer.
-        let frame_signature = (
-            (
-                app.selected_entry_path(),
-                app.preview_scroll,
-                app.pptx_slide_index,
-                app.image_rotation,
-                app.image_flip_h,
-                app.image_zoom.to_bits(),
-                app.office_mode,
-            ),
-            (
-                app.pdf_mode,
-                app.theme_mode,
-                app.layout_mode,
-                app.mode.clone(),
-                app.edit_cursor_row,
-                app.edit_cursor_col,
-                app.edit_buffer.get(app.edit_cursor_row).cloned(),
-            ),
-        );
-        if previous_frame_signature.as_ref() != Some(&frame_signature) {
-            terminal.clear()?;
-            previous_frame_signature = Some(frame_signature);
-        }
+        app.tick_background();
         terminal.draw(|f| ui::draw(f, &app))?;
 
         if app.handle_events()? {
@@ -279,4 +265,29 @@ fn main() -> anyhow::Result<()> {
     terminal.show_cursor()?;
     overlay::shutdown();
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::merge_json;
+
+    #[test]
+    fn terminal_profile_merge_preserves_user_fields() {
+        let mut destination = serde_json::json!({
+            "guid": "old",
+            "opacity": 73,
+            "font": { "face": "Old", "features": { "liga": 0 } }
+        });
+        merge_json(
+            &mut destination,
+            serde_json::json!({
+                "guid": "new",
+                "font": { "face": "Cascadia Code", "size": 9 }
+            }),
+        );
+        assert_eq!(destination["guid"], "new");
+        assert_eq!(destination["opacity"], 73);
+        assert_eq!(destination["font"]["face"], "Cascadia Code");
+        assert_eq!(destination["font"]["features"]["liga"], 0);
+    }
 }

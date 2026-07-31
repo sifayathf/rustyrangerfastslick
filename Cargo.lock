@@ -1622,6 +1622,7 @@ dependencies = [
  "crossterm",
  "csv",
  "dirs",
+ "encoding_rs",
  "hex",
  "image 0.25.10",
  "lofty",

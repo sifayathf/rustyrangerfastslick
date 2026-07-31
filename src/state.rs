@@ -16,13 +16,14 @@ use std::{
     },
     time::{Duration, Instant, SystemTime},
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 // ── Directory listing cache ───────────────────────────────────────────────────
 // TTL prevents re-reading the filesystem every frame when the preview pane
-// hovers over a directory. Cap stops UI freezes on System32-sized folders.
+// hovers over a directory. Rendering is virtualized, so listings are never
+// silently truncated.
 
 const DIR_CACHE_TTL: Duration = Duration::from_secs(2);
-const MAX_DIR_ENTRIES: usize = 3_000;
 
 #[inline]
 fn point_in(col: u16, row: u16, r: &Rect) -> bool {
@@ -169,6 +170,91 @@ pub struct FolderStats {
 
 struct PropertyScan {
     receiver: Receiver<FolderStats>,
+    cancel: Arc<AtomicBool>,
+}
+
+fn grapheme_byte_index(value: &str, index: usize) -> usize {
+    value
+        .grapheme_indices(true)
+        .nth(index)
+        .map(|(byte, _)| byte)
+        .unwrap_or(value.len())
+}
+
+fn grapheme_count(value: &str) -> usize {
+    value.graphemes(true).count()
+}
+
+#[cfg(windows)]
+fn system_double_click_interval() -> Duration {
+    let milliseconds =
+        unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() };
+    Duration::from_millis(milliseconds.max(100) as u64)
+}
+
+#[cfg(not(windows))]
+fn system_double_click_interval() -> Duration {
+    Duration::from_millis(500)
+}
+
+enum DirectoryWatchEvent {
+    Snapshot {
+        path: PathBuf,
+        entries: Vec<DirEntryInfo>,
+    },
+    Error {
+        path: PathBuf,
+        message: String,
+    },
+}
+
+struct DirectoryWatch {
+    path: PathBuf,
+    receiver: Receiver<DirectoryWatchEvent>,
+    cancel: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+enum NavigationAction {
+    Replace { select_path: Option<PathBuf> },
+    Push { origin_level: usize },
+}
+
+enum NavigationEvent {
+    Complete(Vec<DirEntryInfo>),
+    Error(String),
+}
+
+struct NavigationTask {
+    generation: u64,
+    path: PathBuf,
+    action: NavigationAction,
+    receiver: Receiver<NavigationEvent>,
+}
+
+#[derive(Clone)]
+pub struct OperationStatus {
+    pub label: String,
+    pub done: usize,
+    pub total: usize,
+}
+
+enum OperationEvent {
+    Progress {
+        label: String,
+        done: usize,
+        total: usize,
+    },
+    Complete {
+        message: String,
+        is_error: bool,
+        clear_clipboard: bool,
+        snapshots: Vec<(PathBuf, Vec<DirEntryInfo>)>,
+    },
+}
+
+struct OperationTask {
+    receiver: Receiver<OperationEvent>,
     cancel: Arc<AtomicBool>,
 }
 
@@ -370,6 +456,8 @@ pub struct AppState {
 
     // Right-click context menu
     pub context_menu_target: Option<PathBuf>,
+    context_menu_targets: Vec<PathBuf>,
+    pending_delete_targets: Option<Vec<PathBuf>>,
     pub context_menu_items: Vec<ContextAction>,
     pub context_menu_hover: Option<usize>,
     pub hovered_row: Option<(usize, usize)>,
@@ -380,6 +468,14 @@ pub struct AppState {
     pub properties_path: Option<PathBuf>,
     pub properties_stats: Option<FolderStats>,
     property_scan: Option<PropertyScan>,
+    directory_watch: Option<DirectoryWatch>,
+
+    navigation_generation: u64,
+    navigation_task: Option<NavigationTask>,
+    pub navigation_loading: Option<PathBuf>,
+
+    operation_task: Option<OperationTask>,
+    pub operation_status: Option<OperationStatus>,
 
     // Non-blocking status notifications (message, shown_at)
     pub notice: Option<(String, Instant, bool)>, // bool = is_error
@@ -401,9 +497,21 @@ impl AppState {
                 PathBuf::from("/")
             }
         });
-        let files = list_dir(&home)?;
+        let start_path = user_settings
+            .last_location
+            .as_deref()
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+            .unwrap_or_else(|| home.clone());
+        let initial_sort_mode = match user_settings.sort_mode.as_str() {
+            "modified" => SortMode::Modified,
+            "size" => SortMode::Size,
+            _ => SortMode::Name,
+        };
+        let mut files = list_dir(&start_path)?;
+        sort_dir_entries(&mut files, initial_sort_mode, user_settings.sort_descending);
 
-        let level = DirLevel::new(home.clone(), files);
+        let level = DirLevel::new(start_path, files);
 
         let mut quick_access: Vec<(&'static str, PathBuf)> = Vec::new();
         // Store labels without embedded emoji. Emoji cell widths vary between
@@ -429,26 +537,38 @@ impl AppState {
             levels: vec![level],
             current_level: 0,
             last_event_time: Instant::now(),
-            theme_mode: ThemeMode::Dark,
+            theme_mode: if user_settings.theme_light {
+                ThemeMode::Light
+            } else {
+                ThemeMode::Dark
+            },
             layout_mode: if user_settings.explorer_view {
                 LayoutMode::Explorer
             } else {
                 LayoutMode::Miller
             },
             ultra_fast: user_settings.ultra_fast,
-            office_mode: OfficeRenderMode::Text,
-            pdf_mode: PdfRenderMode::Text,
+            office_mode: if user_settings.office_full {
+                OfficeRenderMode::Full
+            } else {
+                OfficeRenderMode::Text
+            },
+            pdf_mode: if user_settings.pdf_visual {
+                PdfRenderMode::Visual
+            } else {
+                PdfRenderMode::Text
+            },
             edit_preview_mode: false,
-            dir_preview_clickable: true,
+            dir_preview_clickable: user_settings.dir_preview_clickable,
             pptx_slide_index: 0,
-            sort_mode: SortMode::Name,
-            sort_descending: false,
-            show_file_details: false,
-            rounded_selection: false,
+            sort_mode: initial_sort_mode,
+            sort_descending: user_settings.sort_descending,
+            show_file_details: user_settings.show_file_details,
+            rounded_selection: user_settings.rounded_selection,
             font_face: user_settings.font_face,
             font_size: user_settings.font_size,
             font_weight: user_settings.font_weight,
-            hover_enabled: true,
+            hover_enabled: user_settings.hover_enabled,
             search_active: false,
             search_query: String::new(),
             search_original_selection: None,
@@ -466,7 +586,7 @@ impl AppState {
             last_click: None,
             dragging_divider: None,
             dragging_sidebar: false,
-            column_ratios: vec![0.10, 0.10, 0.12, 0.18, 0.50],
+            column_ratios: user_settings.column_ratios,
             layout_geometry: Arc::new(Mutex::new(LayoutGeometry::default())),
             preview_scroll: 0,
             image_zoom: 1.0,
@@ -475,8 +595,10 @@ impl AppState {
             drives: list_drives_info(),
             quick_access,
             drives_refreshed_at: Instant::now(),
-            sidebar_width: 26,
+            sidebar_width: user_settings.sidebar_width,
             context_menu_target: None,
+            context_menu_targets: Vec::new(),
+            pending_delete_targets: None,
             context_menu_items: Vec::new(),
             context_menu_hover: None,
             hovered_row: None,
@@ -485,6 +607,12 @@ impl AppState {
             properties_path: None,
             properties_stats: None,
             property_scan: None,
+            directory_watch: None,
+            navigation_generation: 0,
+            navigation_task: None,
+            navigation_loading: None,
+            operation_task: None,
+            operation_status: None,
             notice: None,
             native_preview: crate::native::NativePreviewManager::new(),
         })
@@ -505,6 +633,260 @@ impl AppState {
         }
     }
 
+    /// Poll background services once per frame. Keeping this separate from
+    /// input handling lets filesystem and preview work complete even while
+    /// the user is not pressing a key.
+    pub fn tick_background(&mut self) {
+        self.maybe_refresh_drives();
+        self.refresh_property_scan();
+        self.poll_navigation();
+        self.sync_directory_watch();
+        let mut events = Vec::new();
+        let mut watch_disconnected = false;
+        if let Some(watch) = self.directory_watch.as_ref() {
+            loop {
+                match watch.receiver.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        watch_disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if watch_disconnected {
+            self.directory_watch = None;
+        }
+        for event in events {
+            match event {
+                DirectoryWatchEvent::Snapshot { path, entries } => {
+                    self.apply_directory_snapshot(&path, entries)
+                }
+                DirectoryWatchEvent::Error { path, message } => {
+                    if self.current().path == path {
+                        self.set_notice(message, true);
+                    }
+                }
+            }
+        }
+        self.poll_operation();
+    }
+
+    fn poll_navigation(&mut self) {
+        let event = self
+            .navigation_task
+            .as_ref()
+            .and_then(|task| match task.receiver.try_recv() {
+                Ok(event) => Some(event),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(NavigationEvent::Error(
+                    "Folder scan stopped unexpectedly".to_string(),
+                )),
+            });
+        let Some(event) = event else {
+            return;
+        };
+        let Some(task) = self.navigation_task.take() else {
+            return;
+        };
+        if task.generation != self.navigation_generation {
+            return;
+        }
+        self.navigation_loading = None;
+        match event {
+            NavigationEvent::Complete(entries) => {
+                self.apply_navigation(task.path, entries, task.action);
+            }
+            NavigationEvent::Error(message) => self.set_notice(message, true),
+        }
+    }
+
+    fn cancel_navigation(&mut self) {
+        self.navigation_generation = self.navigation_generation.wrapping_add(1);
+        self.navigation_task = None;
+        self.navigation_loading = None;
+    }
+
+    fn cached_sorted_dir(&self, path: &std::path::Path) -> Option<Vec<DirEntryInfo>> {
+        let mut entries = DIR_CACHE
+            .lock()
+            .get(path)
+            .map(|entry| entry.entries.clone())?;
+        sort_dir_entries(&mut entries, self.sort_mode, self.sort_descending);
+        Some(entries)
+    }
+
+    fn request_navigation(&mut self, path: PathBuf, action: NavigationAction) {
+        self.cancel_navigation();
+        if let Some(entries) = self.cached_sorted_dir(&path) {
+            self.apply_navigation(path, entries, action);
+            return;
+        }
+
+        self.navigation_generation = self.navigation_generation.wrapping_add(1);
+        let generation = self.navigation_generation;
+        let (sender, receiver) = mpsc::channel();
+        let worker_path = path.clone();
+        let sort_mode = self.sort_mode;
+        let sort_descending = self.sort_descending;
+        std::thread::spawn(move || {
+            let result = list_dir(&worker_path).map(|mut entries| {
+                sort_dir_entries(&mut entries, sort_mode, sort_descending);
+                entries
+            });
+            let event = match result {
+                Ok(entries) => NavigationEvent::Complete(entries),
+                Err(error) => NavigationEvent::Error(format!(
+                    "Can't open {}: {}",
+                    worker_path.display(),
+                    error
+                )),
+            };
+            let _ = sender.send(event);
+        });
+        self.navigation_loading = Some(path.clone());
+        self.navigation_task = Some(NavigationTask {
+            generation,
+            path,
+            action,
+            receiver,
+        });
+    }
+
+    fn apply_navigation(
+        &mut self,
+        path: PathBuf,
+        entries: Vec<DirEntryInfo>,
+        action: NavigationAction,
+    ) {
+        match action {
+            NavigationAction::Replace { select_path } => {
+                let mut level = DirLevel::new(path, entries);
+                if let Some(target) = select_path {
+                    if let Some(index) = level.files.iter().position(|entry| entry.path == target) {
+                        level.selected = index;
+                        level.select_anchor = index;
+                    }
+                }
+                self.levels = vec![level];
+                self.current_level = 0;
+            }
+            NavigationAction::Push { origin_level } => {
+                if origin_level >= self.levels.len() {
+                    return;
+                }
+                self.levels.truncate(origin_level + 1);
+                self.levels.push(DirLevel::new(path, entries));
+                self.current_level = origin_level + 1;
+            }
+        }
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|(_, _, is_error)| *is_error)
+        {
+            self.notice = None;
+        }
+        self.reset_image_state();
+    }
+
+    fn poll_operation(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(task) = self.operation_task.as_ref() {
+            loop {
+                match task.receiver.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        let mut completed = false;
+        for event in events {
+            match event {
+                OperationEvent::Progress { label, done, total } => {
+                    self.operation_status = Some(OperationStatus { label, done, total });
+                }
+                OperationEvent::Complete {
+                    message,
+                    is_error,
+                    clear_clipboard,
+                    snapshots,
+                } => {
+                    for (path, entries) in snapshots {
+                        self.apply_directory_snapshot(&path, entries);
+                    }
+                    if clear_clipboard {
+                        self.clipboard = None;
+                    }
+                    self.operation_status = None;
+                    self.set_notice(message, is_error);
+                    completed = true;
+                }
+            }
+        }
+        if completed {
+            self.operation_task = None;
+        } else if disconnected {
+            self.operation_task = None;
+            self.operation_status = None;
+            self.set_notice("File operation stopped unexpectedly", true);
+        }
+    }
+
+    fn sync_directory_watch(&mut self) {
+        let path = self.current().path.clone();
+        let replace = self
+            .directory_watch
+            .as_ref()
+            .map(|watch| watch.path != path)
+            .unwrap_or(true);
+        if !replace {
+            return;
+        }
+        if let Some(watch) = self.directory_watch.take() {
+            watch.cancel.store(true, Ordering::Release);
+        }
+        self.directory_watch = Some(start_directory_watch(path));
+    }
+
+    fn apply_directory_snapshot(&mut self, path: &std::path::Path, mut entries: Vec<DirEntryInfo>) {
+        sort_dir_entries(&mut entries, self.sort_mode, self.sort_descending);
+        DIR_CACHE.lock().insert(
+            path.to_path_buf(),
+            DirCacheEntry {
+                entries: entries.clone(),
+                at: Instant::now(),
+            },
+        );
+
+        for level in self.levels.iter_mut().filter(|level| level.path == path) {
+            if directory_fingerprint(&level.files) == directory_fingerprint(&entries) {
+                continue;
+            }
+            let selected_path = level
+                .files
+                .get(level.selected)
+                .map(|entry| entry.path.clone());
+            level.files = entries.clone();
+            level
+                .marked
+                .retain(|marked| level.files.iter().any(|entry| &entry.path == marked));
+            level.selected = selected_path
+                .as_ref()
+                .and_then(|selected| level.files.iter().position(|entry| &entry.path == selected))
+                .unwrap_or_else(|| level.selected.min(level.files.len().saturating_sub(1)));
+            level.select_anchor = level.selected;
+            level.scroll = level.scroll.min(level.files.len().saturating_sub(1));
+            crate::preview::invalidate_cached_dir(Some(path));
+        }
+    }
+
     pub fn set_notice(&mut self, msg: impl Into<String>, is_error: bool) {
         self.notice = Some((msg.into(), Instant::now(), is_error));
     }
@@ -512,7 +894,9 @@ impl AppState {
     /// Active (non-expired) notice text, if any.
     pub fn active_notice(&self) -> Option<(&str, bool)> {
         self.notice.as_ref().and_then(|(msg, at, err)| {
-            if at.elapsed() < Duration::from_secs(4) {
+            // Errors remain visible until the next successful action or an
+            // explicit Escape. Transient success messages still expire.
+            if *err || at.elapsed() < Duration::from_secs(4) {
                 Some((msg.as_str(), *err))
             } else {
                 None
@@ -565,14 +949,14 @@ impl AppState {
     /// Navigate the active pane directly to an arbitrary directory path
     /// (used by sidebar clicks, breadcrumb clicks, and drive navigation).
     pub fn navigate_to(&mut self, path: &std::path::Path) {
-        match self.load_sorted_dir(path) {
-            Ok(files) => {
-                self.levels = vec![DirLevel::new(path.to_path_buf(), files)];
-                self.current_level = 0;
-                self.reset_image_state();
-            }
-            Err(e) => self.set_notice(format!("Can't open {}: {}", path.display(), e), true),
-        }
+        self.navigate_to_select(path, None);
+    }
+
+    fn navigate_to_select(&mut self, path: &std::path::Path, select_path: Option<PathBuf>) {
+        self.request_navigation(
+            path.to_path_buf(),
+            NavigationAction::Replace { select_path },
+        );
     }
 
     pub fn current(&self) -> &DirLevel {
@@ -634,18 +1018,19 @@ impl AppState {
 
         match next_event {
             Event::Key(key) => {
-                // Only process KeyPress events — ignore KeyRelease/KeyRepeat.
-                // Critical on Windows: prevents double-triggering.
-                if key.kind != KeyEventKind::Press {
+                // Releases are duplicates on Windows. Repeats are deliberate
+                // input and make held navigation keys feel native.
+                if key.kind == KeyEventKind::Release {
                     return Ok(false);
                 }
 
                 self.last_event_time = Instant::now();
 
-                if self.edit_preview_mode && self.mode == AppMode::Normal {
-                    if self.handle_edit_key(key.code, key.modifiers) {
-                        return Ok(false);
-                    }
+                if self.edit_preview_mode
+                    && self.mode == AppMode::Normal
+                    && self.handle_edit_key(key.code, key.modifiers)
+                {
+                    return Ok(false);
                 }
 
                 if self.search_active {
@@ -694,6 +1079,17 @@ impl AppState {
                         // Escape cancels modes
                         self.mode = AppMode::Normal;
                     }
+                    (KeyCode::Esc, _) if self.operation_task.is_some() => {
+                        self.cancel_operation();
+                    }
+                    (KeyCode::Esc, _)
+                        if self
+                            .notice
+                            .as_ref()
+                            .is_some_and(|(_, _, is_error)| *is_error) =>
+                    {
+                        self.notice = None;
+                    }
                     (KeyCode::Esc, _) => return Ok(true),
 
                     // ── Modes ───────────────────────────────────────
@@ -702,11 +1098,13 @@ impl AppState {
                     }
                     (KeyCode::Delete, KeyModifiers::SHIFT) if self.mode == AppMode::Normal => {
                         if !self.current().files.is_empty() {
+                            self.pending_delete_targets = Some(self.selected_paths());
                             self.mode = AppMode::ConfirmDeletePermanent;
                         }
                     }
                     (KeyCode::Delete, _) if self.mode == AppMode::Normal => {
                         if !self.current().files.is_empty() {
+                            self.pending_delete_targets = Some(self.selected_paths());
                             self.mode = AppMode::ConfirmDelete;
                         }
                     }
@@ -775,7 +1173,7 @@ impl AppState {
                     // ── Rename input editing ─────────────────────────────────
                     (KeyCode::Char('a'), KeyModifiers::CONTROL) if self.mode == AppMode::Rename => {
                         self.input_sel_start = 0;
-                        self.input_cursor = self.input_buffer.chars().count();
+                        self.input_cursor = self.input_grapheme_len();
                     }
                     (KeyCode::Char(c), m)
                         if self.mode == AppMode::Rename
@@ -787,9 +1185,7 @@ impl AppState {
                     (KeyCode::Char(c), _)
                         if self.mode == AppMode::NewFolder || self.mode == AppMode::NewFile =>
                     {
-                        self.input_buffer
-                            .insert(self.byte_idx(self.input_cursor), c);
-                        self.input_cursor += 1;
+                        self.insert_input_char(c);
                         return Ok(false);
                     }
                     (KeyCode::Backspace, _) if self.mode == AppMode::Rename => {
@@ -821,7 +1217,7 @@ impl AppState {
                             AppMode::Rename | AppMode::NewFolder | AppMode::NewFile
                         ) =>
                     {
-                        let len = self.input_buffer.chars().count();
+                        let len = self.input_grapheme_len();
                         if self.input_cursor < len {
                             let idx = self.byte_idx(self.input_cursor);
                             let end = self.byte_idx(self.input_cursor + 1);
@@ -846,7 +1242,7 @@ impl AppState {
                             AppMode::Rename | AppMode::NewFolder | AppMode::NewFile
                         ) =>
                     {
-                        let len = self.input_buffer.chars().count();
+                        let len = self.input_grapheme_len();
                         self.input_cursor = (self.input_cursor + 1).min(len);
                         self.input_sel_start = self.input_cursor;
                         return Ok(false);
@@ -867,7 +1263,7 @@ impl AppState {
                             AppMode::Rename | AppMode::NewFolder | AppMode::NewFile
                         ) =>
                     {
-                        let len = self.input_buffer.chars().count();
+                        let len = self.input_grapheme_len();
                         self.input_cursor = len;
                         self.input_sel_start = len;
                         return Ok(false);
@@ -1193,20 +1589,7 @@ impl AppState {
                                     if path.is_dir() {
                                         self.navigate_to(path);
                                     } else if let Some(parent) = path.parent() {
-                                        let file_name = path.file_name();
-                                        self.navigate_to(parent);
-                                        if let Some(name) = file_name {
-                                            if let Some(cur) = self.levels.last_mut() {
-                                                if let Some(idx) = cur
-                                                    .files
-                                                    .iter()
-                                                    .position(|f| f.path.file_name() == Some(name))
-                                                {
-                                                    cur.selected = idx;
-                                                    cur.select_anchor = idx;
-                                                }
-                                            }
-                                        }
+                                        self.navigate_to_select(parent, Some(path.clone()));
                                     }
                                     return Ok(false);
                                 }
@@ -1290,55 +1673,49 @@ impl AppState {
                     MouseEventKind::Drag(MouseButton::Left) => {
                         if self.dragging_sidebar {
                             let term_w = crossterm::terminal::size().unwrap_or((100, 30)).0;
-                            self.sidebar_width = mouse.column.clamp(16, term_w.saturating_sub(30));
+                            let maximum = term_w.saturating_sub(48).clamp(18, 36);
+                            self.sidebar_width = mouse.column.clamp(18, maximum);
                         } else if let Some(idx) = self.dragging_divider {
                             let geo = self.layout_geometry.lock().clone();
-                            if let Some(_first_pane) = geo.pane_rects.first() {
-                                let term_w = crossterm::terminal::size().unwrap_or((100, 30)).0;
-                                let old_bound =
-                                    geo.divider_rects.get(idx).map(|r| r.x).unwrap_or(0);
-                                let new_bound = mouse.column;
-
-                                if old_bound > 0
-                                    && new_bound != old_bound
-                                    && new_bound > 0
-                                    && new_bound < term_w
-                                {
-                                    let delta_ratio =
-                                        (new_bound as f32 - old_bound as f32) / term_w as f32;
-
-                                    let num = self.levels.len();
-                                    let start = if num > 4 { num - 4 } else { 0 };
-                                    let panes = &self.levels[start..];
-                                    let np = panes.len();
-                                    let has_preview =
-                                        panes.last().map_or(false, |l| !l.files.is_empty());
-                                    let n_cols = if has_preview { np + 1 } else { np };
-
-                                    let start_ratio_idx = 5 - n_cols;
+                            let mut columns = geo.pane_rects.clone();
+                            if let Some(preview) = geo.preview_rect {
+                                columns.push(preview);
+                            }
+                            if let (Some(left), Some(right)) =
+                                (columns.get(idx), columns.get(idx + 1))
+                            {
+                                let combined = left.width.saturating_add(right.width);
+                                let minimum = 8u16.min(combined / 2);
+                                if combined > minimum.saturating_mul(2) {
+                                    let new_left = mouse
+                                        .column
+                                        .saturating_sub(left.x)
+                                        .clamp(minimum, combined.saturating_sub(minimum));
+                                    let n_cols = columns.len().min(self.column_ratios.len());
+                                    let start_ratio_idx = self.column_ratios.len() - n_cols;
                                     let ratio_idx_left = start_ratio_idx + idx;
                                     let ratio_idx_right = ratio_idx_left + 1;
-
-                                    if ratio_idx_left < self.column_ratios.len()
-                                        && ratio_idx_right < self.column_ratios.len()
-                                    {
-                                        let val_left =
-                                            self.column_ratios[ratio_idx_left] + delta_ratio;
-                                        let val_right =
-                                            self.column_ratios[ratio_idx_right] - delta_ratio;
-
-                                        if val_left > 0.06 && val_right > 0.06 {
-                                            self.column_ratios[ratio_idx_left] = val_left;
-                                            self.column_ratios[ratio_idx_right] = val_right;
-                                        }
+                                    if ratio_idx_right < self.column_ratios.len() {
+                                        let pair_total = self.column_ratios[ratio_idx_left]
+                                            + self.column_ratios[ratio_idx_right];
+                                        let left_ratio =
+                                            pair_total * new_left as f32 / combined as f32;
+                                        self.column_ratios[ratio_idx_left] = left_ratio;
+                                        self.column_ratios[ratio_idx_right] =
+                                            pair_total - left_ratio;
                                     }
                                 }
                             }
                         }
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
+                        let changed_layout =
+                            self.dragging_divider.is_some() || self.dragging_sidebar;
                         self.dragging_divider = None;
                         self.dragging_sidebar = false;
+                        if changed_layout {
+                            self.persist_user_settings();
+                        }
                     }
                     _ => {}
                 }
@@ -1418,7 +1795,7 @@ impl AppState {
                     return;
                 }
                 let num = self.levels.len();
-                let start = if num > 4 { num - 4 } else { 0 };
+                let start = num.saturating_sub(4);
                 let real_idx = geo
                     .pane_level_indices
                     .get(&idx)
@@ -1454,7 +1831,7 @@ impl AppState {
             for (file_idx, rect) in rows {
                 if point_in(col, row, rect) {
                     let num = self.levels.len();
-                    let start = if num > 4 { num - 4 } else { 0 };
+                    let start = num.saturating_sub(4);
                     let real_level_idx = geo
                         .pane_level_indices
                         .get(pane_idx)
@@ -1500,11 +1877,13 @@ impl AppState {
                     let last_click_val = self.last_click;
                     let old_selected = self.current().selected;
                     let had_marks = !self.current().marked.is_empty();
+                    let double_click_ms = system_double_click_interval().as_millis();
+                    let rename_limit_ms = (double_click_ms * 4).max(1_200);
 
                     let is_double_click = matches!(last_click_val,
                         Some((last_time, last_pane, last_file))
                             if last_pane == *pane_idx && last_file == *file_idx
-                                && now.duration_since(last_time).as_millis() < 450);
+                                && now.duration_since(last_time).as_millis() <= double_click_ms);
 
                     // A slower second click on an already-selected, already-active row
                     // (Explorer-style click-click-pause) starts an inline rename.
@@ -1515,8 +1894,8 @@ impl AppState {
                         && matches!(last_click_val,
                             Some((last_time, last_pane, last_file))
                                 if last_pane == *pane_idx && last_file == *file_idx
-                                    && now.duration_since(last_time).as_millis() >= 450
-                                    && now.duration_since(last_time).as_millis() < 1800);
+                                    && now.duration_since(last_time).as_millis() > double_click_ms
+                                    && now.duration_since(last_time).as_millis() < rename_limit_ms);
 
                     self.clear_marks();
                     self.current_mut().selected = *file_idx;
@@ -1600,43 +1979,35 @@ impl AppState {
         let selected_entry = &current.files[current.selected];
 
         if selected_entry.is_dir {
-            let files = self.load_sorted_dir(&selected_entry.path)?;
-
-            let new_level = DirLevel::new(selected_entry.path.clone(), files);
-
-            // Discard levels to the right when branching
-            self.levels.truncate(self.current_level + 1);
-            self.levels.push(new_level);
-            self.current_level += 1;
+            self.request_navigation(
+                selected_entry.path.clone(),
+                NavigationAction::Push {
+                    origin_level: self.current_level,
+                },
+            );
         }
         Ok(())
     }
 
     fn go_left(&mut self) -> anyhow::Result<()> {
+        self.cancel_navigation();
         if self.current_level > 0 {
             self.current_level -= 1;
             // Truncate the trailing levels so the right-hand preview pane
             // immediately reflects the currently selected item in the new level.
             self.levels.truncate(self.current_level + 1);
         } else {
-            // At leftmost level — navigate up to parent
-            let current = self.current();
-            if let Some(parent) = current.path.parent() {
+            // At the leftmost level, open the parent and keep the directory
+            // we came from selected. The scan stays off the input thread.
+            let child = self.current().path.clone();
+            if let Some(parent) = child.parent() {
                 let parent_path = parent.to_path_buf();
-                let files = self.load_sorted_dir(&parent_path)?;
-
-                // Keep the cursor on the directory we came from
-                let selected = files
-                    .iter()
-                    .position(|e| e.path == current.path)
-                    .unwrap_or(0);
-
-                let mut new_level = DirLevel::new(parent_path, files);
-                new_level.selected = selected;
-                new_level.select_anchor = selected;
-
-                self.levels.insert(0, new_level);
-                self.current_level += 1; // adjust index after insert
+                self.request_navigation(
+                    parent_path,
+                    NavigationAction::Replace {
+                        select_path: Some(child),
+                    },
+                );
             }
         }
         Ok(())
@@ -1664,21 +2035,36 @@ impl AppState {
     }
 
     pub fn open_selected(&mut self) {
-        let current = self.current();
-        if current.files.is_empty() {
-            return;
+        if let Some(path) = self.selected_entry_path() {
+            self.open_path(path);
         }
+    }
 
-        let selected_entry = &current.files[current.selected];
+    fn focus_path(&mut self, path: &std::path::Path) {
+        if let Some(index) = self
+            .current()
+            .files
+            .iter()
+            .position(|entry| entry.path == path)
+        {
+            let current = self.current_mut();
+            current.selected = index;
+            current.select_anchor = index;
+        }
+    }
 
-        if selected_entry.is_dir {
-            // It's a directory, go right
-            let _ = self.go_right();
+    fn open_path(&mut self, path: PathBuf) {
+        if path.is_dir() {
+            if self.current().files.iter().any(|entry| entry.path == path) {
+                self.focus_path(&path);
+                let _ = self.go_right();
+            } else {
+                self.navigate_to(&path);
+            }
         } else {
-            // It's a file, open with default app
             #[cfg(windows)]
             {
-                let path_str = selected_entry.path.to_string_lossy().to_string();
+                let path_str = path.to_string_lossy().to_string();
                 // /C start "" "path"
                 let _ = std::process::Command::new("cmd")
                     .args(["/C", "start", "", &path_str])
@@ -1686,7 +2072,7 @@ impl AppState {
             }
             #[cfg(not(windows))]
             {
-                let path_str = selected_entry.path.to_string_lossy().to_string();
+                let path_str = path.to_string_lossy().to_string();
                 let _ = std::process::Command::new("xdg-open")
                     .arg(&path_str)
                     .spawn();
@@ -1719,9 +2105,7 @@ impl AppState {
 
     fn go_home(&mut self) -> anyhow::Result<()> {
         if let Some(home) = dirs::home_dir() {
-            let files = self.load_sorted_dir(&home)?;
-            self.levels = vec![DirLevel::new(home, files)];
-            self.current_level = 0;
+            self.navigate_to(&home);
         }
         Ok(())
     }
@@ -1729,9 +2113,7 @@ impl AppState {
     #[cfg(not(windows))]
     fn go_root(&mut self) -> anyhow::Result<()> {
         let root = PathBuf::from("/");
-        let files = self.load_sorted_dir(&root)?;
-        self.levels = vec![DirLevel::new(root, files)];
-        self.current_level = 0;
+        self.navigate_to(&root);
         Ok(())
     }
 
@@ -1739,6 +2121,7 @@ impl AppState {
     /// synthetic top-level directory listing.
     #[cfg(windows)]
     fn go_drives(&mut self) -> anyhow::Result<()> {
+        self.cancel_navigation();
         let drives = list_windows_drives();
         // Use a sentinel path to indicate "drives root"
         let drives_root = PathBuf::from("\\\\drives");
@@ -1860,7 +2243,7 @@ impl AppState {
 
     /// True if the selected file is an image
     fn is_image_selected(&self) -> bool {
-        self.selected_file().map_or(false, |p| {
+        self.selected_file().is_some_and(|p| {
             let ext = p
                 .extension()
                 .and_then(|s| s.to_str())
@@ -1891,47 +2274,26 @@ impl AppState {
         self.search_original_selection = None;
     }
 
-    /// Calculate the visual boundaries of all columns in character cells
-    pub fn get_column_boundaries(&self, term_width: u16) -> Vec<u16> {
-        let num = self.levels.len();
-        let start = if num > 4 { num - 4 } else { 0 };
-        let panes = &self.levels[start..];
-        let np = panes.len();
-        let has_preview = panes.last().map_or(false, |l| !l.files.is_empty());
-        let n_cols = if has_preview { np + 1 } else { np };
-
-        if n_cols == 0 {
-            return Vec::new();
-        }
-
-        // Get default or custom ratios for the visible columns
-        let start_idx = 5 - n_cols;
-        let mut sub_ratios = self.column_ratios[start_idx..].to_vec();
-        let sum: f32 = sub_ratios.iter().sum();
-        if sum > 0.0 {
-            for r in sub_ratios.iter_mut() {
-                *r /= sum;
-            }
-        }
-
-        let mut boundaries = Vec::new();
-        let mut current_x = 0.0;
-        for r in sub_ratios.iter() {
-            let col_width = r * term_width as f32;
-            current_x += col_width;
-            boundaries.push(current_x.round() as u16);
-        }
-        boundaries
-    }
-
     // ── Text-editing helpers for Rename / New Folder input ───────────────────
 
-    fn byte_idx(&self, char_idx: usize) -> usize {
+    fn byte_idx(&self, grapheme_idx: usize) -> usize {
         self.input_buffer
-            .char_indices()
-            .nth(char_idx)
+            .grapheme_indices(true)
+            .nth(grapheme_idx)
             .map(|(b, _)| b)
             .unwrap_or(self.input_buffer.len())
+    }
+
+    fn input_grapheme_len(&self) -> usize {
+        self.input_buffer.graphemes(true).count()
+    }
+
+    fn insert_input_char(&mut self, value: char) {
+        let byte = self.byte_idx(self.input_cursor);
+        self.input_buffer.insert(byte, value);
+        let after = byte + value.len_utf8();
+        self.input_cursor = self.input_buffer[..after].graphemes(true).count();
+        self.input_sel_start = self.input_cursor;
     }
 
     fn rename_input_replace_selection_with(&mut self, s: &str) {
@@ -1943,7 +2305,7 @@ impl AppState {
         let bl = self.byte_idx(lo);
         let bh = self.byte_idx(hi);
         self.input_buffer.replace_range(bl..bh, s);
-        let new_pos = lo + s.chars().count();
+        let new_pos = self.input_buffer[..bl + s.len()].graphemes(true).count();
         self.input_cursor = new_pos;
         self.input_sel_start = new_pos;
     }
@@ -1992,6 +2354,49 @@ impl AppState {
             return Vec::new();
         }
         vec![cur.files[cur.selected].path.clone()]
+    }
+
+    pub fn delete_target_summary(&self) -> (usize, Vec<String>) {
+        let paths = self
+            .pending_delete_targets
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| self.selected_paths());
+        let count = paths.len();
+        let mut examples = paths
+            .iter()
+            .take(3)
+            .map(|path| {
+                let kind = if path.is_dir() { "Folder" } else { "File" };
+                let name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                format!("[{kind}] {name}")
+            })
+            .collect::<Vec<_>>();
+        if count > examples.len() {
+            examples.push(format!("… and {} more", count - examples.len()));
+        }
+        if examples.is_empty() {
+            examples.push(
+                paths
+                    .first()
+                    .and_then(|path| path.file_name())
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        if count == 1 && examples[0].is_empty() {
+            examples[0] = paths[0]
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+        }
+        (count, examples)
     }
 
     pub fn toggle_mark(&mut self, idx: usize) {
@@ -2045,11 +2450,11 @@ impl AppState {
         self.input_buffer = name.clone();
         // Select the basename but not the extension (files only).
         let sel_end = if is_dir {
-            name.chars().count()
+            name.graphemes(true).count()
         } else {
             match name.rfind('.') {
-                Some(byte_pos) if byte_pos > 0 => name[..byte_pos].chars().count(),
-                _ => name.chars().count(),
+                Some(byte_pos) if byte_pos > 0 => name[..byte_pos].graphemes(true).count(),
+                _ => name.graphemes(true).count(),
             }
         };
         self.input_sel_start = 0;
@@ -2179,69 +2584,90 @@ impl AppState {
     // ── Delete ─────────────────────────────────────────────────────────────
 
     fn do_delete(&mut self, permanent: bool) {
-        let paths = self.selected_paths();
+        let paths = self
+            .pending_delete_targets
+            .take()
+            .unwrap_or_else(|| self.selected_paths());
         if paths.is_empty() {
             self.mode = AppMode::Normal;
             return;
         }
-        let mut errors = 0usize;
-        let mut deleted = 0usize;
-
-        #[cfg(windows)]
-        if !permanent {
-            match move_to_recycle_bin(&paths) {
-                Ok(()) => deleted = paths.len(),
-                Err(_) => errors = paths.len(),
-            }
+        if self.operation_task.is_some() {
+            self.set_notice("Another file operation is still running", true);
+            self.mode = AppMode::Normal;
+            return;
         }
-
-        #[cfg(not(windows))]
-        let _ = permanent;
-
-        if permanent || cfg!(not(windows)) {
-            for path in &paths {
-                let result = if path.is_dir() {
-                    fs::remove_dir_all(path)
+        let total = paths.len();
+        let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        self.operation_status = Some(OperationStatus {
+            label: if permanent {
+                "Deleting permanently".to_string()
+            } else {
+                "Moving to Recycle Bin".to_string()
+            },
+            done: 0,
+            total,
+        });
+        self.operation_task = Some(OperationTask { receiver, cancel });
+        std::thread::spawn(move || {
+            let mut deleted = 0usize;
+            let mut errors = Vec::new();
+            let label = if permanent {
+                "Deleting permanently"
+            } else {
+                "Moving to Recycle Bin"
+            };
+            for (index, path) in paths.iter().enumerate() {
+                if worker_cancel.load(Ordering::Acquire) {
+                    break;
+                }
+                #[cfg(windows)]
+                let result = if permanent {
+                    remove_path(path)
                 } else {
-                    fs::remove_file(path)
+                    move_to_recycle_bin(std::slice::from_ref(path))
                 };
+                #[cfg(not(windows))]
+                let result = remove_path(path);
                 match result {
-                    Ok(_) => deleted += 1,
-                    Err(_) => errors += 1,
+                    Ok(()) => deleted += 1,
+                    Err(error) => errors.push(format!("{}: {}", path.display(), error)),
                 }
+                let _ = sender.send(OperationEvent::Progress {
+                    label: label.to_string(),
+                    done: index + 1,
+                    total,
+                });
             }
-        }
-        if let Some(parent) = paths[0].parent().map(|p| p.to_path_buf()) {
-            DIR_CACHE.lock().remove(&parent);
-            crate::preview::invalidate_cached_dir(Some(&parent));
-            if let Ok(files) = self.load_sorted_dir(&parent) {
-                let cur = self.current_mut();
-                cur.files = files;
-                cur.marked.clear();
-                if cur.selected >= cur.files.len() {
-                    cur.selected = cur.files.len().saturating_sub(1);
-                }
-            }
-        }
-        if errors > 0 {
-            self.set_notice(
-                format!(
-                    "Deleted {} item(s), {} failed (in use or access denied)",
-                    deleted, errors
-                ),
-                errors == deleted,
-            );
-        } else {
+            let snapshots = snapshots_for_parents(&paths);
+            let failed = errors.len();
+            let cancelled = worker_cancel.load(Ordering::Acquire);
             let destination = if !permanent && cfg!(windows) {
                 "to Recycle Bin"
             } else {
                 "permanently"
             };
-            self.set_notice(
-                format!("Deleted {} item(s) {}", deleted, destination),
-                false,
-            );
-        }
+            let message = if cancelled {
+                format!("Cancelled after deleting {deleted} of {total} item(s)")
+            } else if failed == 0 {
+                format!("Deleted {} item(s) {}", deleted, destination)
+            } else {
+                format!(
+                    "Deleted {} item(s); {} failed: {}",
+                    deleted,
+                    failed,
+                    errors.first().cloned().unwrap_or_default()
+                )
+            };
+            let _ = sender.send(OperationEvent::Complete {
+                message,
+                is_error: failed > 0,
+                clear_clipboard: false,
+                snapshots,
+            });
+        });
         self.mode = AppMode::Normal;
     }
 
@@ -2251,78 +2677,74 @@ impl AppState {
         let Some((srcs, is_cut)) = self.clipboard.clone() else {
             return;
         };
+        if self.operation_task.is_some() {
+            self.set_notice("Another file operation is still running", true);
+            return;
+        }
         let dest_dir = self.current().path.clone();
-        let mut ok = 0usize;
-        let mut errors: Vec<String> = Vec::new();
-
-        for src_path in &srcs {
-            let Some(file_name) = src_path.file_name() else {
-                continue;
-            };
-
-            if src_path.is_dir() && destination_is_inside_source(src_path, &dest_dir) {
-                errors.push(format!(
-                    "{}: can't copy or move a folder into itself",
-                    file_name.to_string_lossy()
-                ));
-                continue;
-            }
-
-            let mut dest_path = dest_dir.join(file_name);
-
-            // Collision handling: never silently overwrite — auto-suffix instead.
-            if dest_path.exists() && dest_path != *src_path {
-                dest_path = unique_dest_path(&dest_dir, file_name);
-            }
-            if dest_path == *src_path {
-                continue; // pasting into the same location as source; skip
-            }
-
-            let result = if is_cut {
-                fs::rename(src_path, &dest_path).or_else(|_| {
-                    // Cross-drive move: rename fails, fall back to copy+delete.
-                    if src_path.is_dir() {
-                        copy_dir_all(src_path, &dest_path)
-                            .and_then(|_| fs::remove_dir_all(src_path))
-                    } else {
-                        fs::copy(src_path, &dest_path)
-                            .map(|_| ())
-                            .and_then(|_| fs::remove_file(src_path))
-                    }
-                })
-            } else if src_path.is_dir() {
-                copy_dir_all(src_path, &dest_path)
-            } else {
-                fs::copy(src_path, &dest_path).map(|_| ())
-            };
-
-            match result {
-                Ok(_) => {
-                    ok += 1;
-                    if let Some(p) = src_path.parent() {
-                        DIR_CACHE.lock().remove(p);
-                        crate::preview::invalidate_cached_dir(Some(p));
-                    }
+        let total = srcs.len();
+        let label = if is_cut { "Moving" } else { "Copying" }.to_string();
+        let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        self.operation_status = Some(OperationStatus {
+            label: label.clone(),
+            done: 0,
+            total,
+        });
+        self.operation_task = Some(OperationTask { receiver, cancel });
+        std::thread::spawn(move || {
+            let mut ok = 0usize;
+            let mut errors = Vec::new();
+            for (index, src_path) in srcs.iter().enumerate() {
+                if worker_cancel.load(Ordering::Acquire) {
+                    break;
                 }
-                Err(e) => errors.push(format!("{}: {}", file_name.to_string_lossy(), e)),
+                match paste_one(src_path, &dest_dir, is_cut, &worker_cancel) {
+                    Ok(PasteOutcome::Completed) => ok += 1,
+                    Ok(PasteOutcome::Skipped) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => break,
+                    Err(error) => errors.push(format!("{}: {}", src_path.display(), error)),
+                }
+                let _ = sender.send(OperationEvent::Progress {
+                    label: label.clone(),
+                    done: index + 1,
+                    total,
+                });
             }
-        }
+            let mut refresh = srcs.clone();
+            refresh.push(dest_dir.clone());
+            let snapshots = snapshots_for_parents_and_directories(&refresh, &dest_dir);
+            let failed = errors.len();
+            let cancelled = worker_cancel.load(Ordering::Acquire);
+            let message = if cancelled {
+                format!("Cancelled after {} of {} item(s)", ok, total)
+            } else if failed == 0 {
+                format!("{} {} item(s)", if is_cut { "Moved" } else { "Copied" }, ok)
+            } else {
+                format!(
+                    "{} {} item(s); {} failed: {}",
+                    if is_cut { "Moved" } else { "Copied" },
+                    ok,
+                    failed,
+                    errors.first().cloned().unwrap_or_default()
+                )
+            };
+            let _ = sender.send(OperationEvent::Complete {
+                message,
+                is_error: failed > 0,
+                clear_clipboard: is_cut && failed == 0 && !cancelled,
+                snapshots,
+            });
+        });
+    }
 
-        DIR_CACHE.lock().remove(&dest_dir);
-        crate::preview::invalidate_cached_dir(Some(&dest_dir));
-        if let Ok(files) = self.load_sorted_dir(&dest_dir) {
-            self.current_mut().files = files;
-        }
-        if is_cut && errors.is_empty() {
-            self.clipboard = None;
-        }
-        if errors.is_empty() {
-            self.set_notice(format!("Pasted {} item(s)", ok), false);
-        } else {
-            self.set_notice(
-                format!("Pasted {} item(s), {} failed", ok, errors.len()),
-                true,
-            );
+    fn cancel_operation(&mut self) {
+        if let Some(task) = self.operation_task.as_ref() {
+            task.cancel.store(true, Ordering::Release);
+            if let Some(status) = self.operation_status.as_mut() {
+                status.label = "Cancelling".to_string();
+            }
         }
     }
 
@@ -2331,6 +2753,16 @@ impl AppState {
     pub fn open_context_menu(&mut self, path: Option<PathBuf>) {
         self.context_menu_hover = None;
         self.context_menu_target = path.clone();
+        self.context_menu_targets = path
+            .as_ref()
+            .map(|target| {
+                if self.current().marked.contains(target) {
+                    self.selected_paths()
+                } else {
+                    vec![target.clone()]
+                }
+            })
+            .unwrap_or_default();
         let has_selection = path.is_some();
         let has_clipboard = self.clipboard.is_some();
         let mut items = Vec::new();
@@ -2360,27 +2792,36 @@ impl AppState {
 
     pub fn apply_context_action(&mut self, action: ContextAction) {
         let target = self.context_menu_target.clone();
+        let targets = self.context_menu_targets.clone();
         self.mode = AppMode::Normal;
         match action {
             ContextAction::Open => {
-                self.open_selected();
+                if let Some(path) = targets.first() {
+                    self.open_path(path.clone());
+                }
             }
             ContextAction::OpenWith => self.do_open_with(target),
             ContextAction::Cut => {
-                let paths = self.selected_paths();
-                if !paths.is_empty() {
-                    self.clipboard = Some((paths, true));
+                if !targets.is_empty() {
+                    self.clipboard = Some((targets, true));
                 }
             }
             ContextAction::Copy => {
-                let paths = self.selected_paths();
-                if !paths.is_empty() {
-                    self.clipboard = Some((paths, false));
+                if !targets.is_empty() {
+                    self.clipboard = Some((targets, false));
                 }
             }
             ContextAction::Paste => self.do_paste(),
-            ContextAction::Rename => self.start_rename(),
-            ContextAction::Delete => self.mode = AppMode::ConfirmDelete,
+            ContextAction::Rename => {
+                if let Some(path) = targets.first() {
+                    self.focus_path(path);
+                }
+                self.start_rename();
+            }
+            ContextAction::Delete => {
+                self.pending_delete_targets = Some(targets);
+                self.mode = AppMode::ConfirmDelete;
+            }
             ContextAction::Properties => {
                 if let Some(path) = target.or_else(|| self.selected_entry_path()) {
                     self.open_properties(path);
@@ -2474,10 +2915,27 @@ impl AppState {
     fn persist_user_settings(&self) {
         let _ = crate::settings::save(&crate::settings::UserSettings {
             explorer_view: self.layout_mode == LayoutMode::Explorer,
+            theme_light: self.theme_mode == ThemeMode::Light,
+            office_full: self.office_mode == OfficeRenderMode::Full,
+            pdf_visual: self.pdf_mode == PdfRenderMode::Visual,
+            dir_preview_clickable: self.dir_preview_clickable,
+            sort_mode: match self.sort_mode {
+                SortMode::Name => "name",
+                SortMode::Modified => "modified",
+                SortMode::Size => "size",
+            }
+            .to_string(),
+            sort_descending: self.sort_descending,
+            show_file_details: self.show_file_details,
+            rounded_selection: self.rounded_selection,
+            hover_enabled: self.hover_enabled,
             font_face: self.font_face.clone(),
             font_size: self.font_size,
             font_weight: self.font_weight,
             ultra_fast: self.ultra_fast,
+            sidebar_width: self.sidebar_width,
+            column_ratios: self.column_ratios.clone(),
+            last_location: Some(self.current().path.to_string_lossy().into_owned()),
         });
     }
 
@@ -2499,6 +2957,7 @@ impl AppState {
                     ),
                     false,
                 );
+                self.persist_user_settings();
             }
             ToggleAction::LayoutMode => {
                 self.layout_mode = match self.layout_mode {
@@ -2550,6 +3009,7 @@ impl AppState {
                     ),
                     false,
                 );
+                self.persist_user_settings();
             }
             ToggleAction::PdfMode => {
                 self.pdf_mode = match self.pdf_mode {
@@ -2567,6 +3027,7 @@ impl AppState {
                     ),
                     false,
                 );
+                self.persist_user_settings();
             }
             ToggleAction::EditMode => {
                 if self.edit_preview_mode {
@@ -2605,6 +3066,7 @@ impl AppState {
                     ),
                     false,
                 );
+                self.persist_user_settings();
             }
             ToggleAction::SortName => self.select_sort_mode(SortMode::Name),
             ToggleAction::SortModified => self.select_sort_mode(SortMode::Modified),
@@ -2623,6 +3085,7 @@ impl AppState {
                     ),
                     false,
                 );
+                self.persist_user_settings();
             }
             ToggleAction::Details => {
                 self.show_file_details = !self.show_file_details;
@@ -2637,6 +3100,7 @@ impl AppState {
                     ),
                     false,
                 );
+                self.persist_user_settings();
             }
             ToggleAction::SelectionStyle => {
                 self.rounded_selection = !self.rounded_selection;
@@ -2651,6 +3115,7 @@ impl AppState {
                     ),
                     false,
                 );
+                self.persist_user_settings();
             }
             ToggleAction::FontFamily => {
                 const FACES: [&str; 4] =
@@ -2715,6 +3180,7 @@ impl AppState {
                     ),
                     false,
                 );
+                self.persist_user_settings();
             }
         }
     }
@@ -2727,6 +3193,7 @@ impl AppState {
             self.sort_descending = false;
         }
         self.resort_levels();
+        self.persist_user_settings();
         self.set_notice(
             format!(
                 "Sorted by {} ({})",
@@ -2817,11 +3284,11 @@ impl AppState {
             return true;
         }
 
-        if modifiers.contains(KeyModifiers::CONTROL) {
-            if code == KeyCode::Char('s') || code == KeyCode::Char('S') {
-                self.save_edited_preview();
-                return true;
-            }
+        if modifiers.contains(KeyModifiers::CONTROL)
+            && (code == KeyCode::Char('s') || code == KeyCode::Char('S'))
+        {
+            self.save_edited_preview();
+            return true;
         }
 
         match code {
@@ -2830,13 +3297,9 @@ impl AppState {
             {
                 if self.edit_cursor_row < self.edit_buffer.len() {
                     let line = &mut self.edit_buffer[self.edit_cursor_row];
-                    let idx = line
-                        .char_indices()
-                        .nth(self.edit_cursor_col)
-                        .map(|(i, _)| i)
-                        .unwrap_or(line.len());
+                    let idx = grapheme_byte_index(line, self.edit_cursor_col);
                     line.insert(idx, c);
-                    self.edit_cursor_col += 1;
+                    self.edit_cursor_col = grapheme_count(&line[..idx + c.len_utf8()]);
                     self.edit_dirty = true;
                     return true;
                 }
@@ -2844,11 +3307,7 @@ impl AppState {
             KeyCode::Enter => {
                 if self.edit_cursor_row < self.edit_buffer.len() {
                     let line = self.edit_buffer[self.edit_cursor_row].clone();
-                    let idx = line
-                        .char_indices()
-                        .nth(self.edit_cursor_col)
-                        .map(|(i, _)| i)
-                        .unwrap_or(line.len());
+                    let idx = grapheme_byte_index(&line, self.edit_cursor_col);
                     let (head, tail) = line.split_at(idx);
                     self.edit_buffer[self.edit_cursor_row] = head.to_string();
                     self.edit_buffer
@@ -2862,16 +3321,8 @@ impl AppState {
             KeyCode::Backspace => {
                 if self.edit_cursor_col > 0 {
                     let line = &mut self.edit_buffer[self.edit_cursor_row];
-                    let idx = line
-                        .char_indices()
-                        .nth(self.edit_cursor_col - 1)
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                    let end = line
-                        .char_indices()
-                        .nth(self.edit_cursor_col)
-                        .map(|(i, _)| i)
-                        .unwrap_or(line.len());
+                    let idx = grapheme_byte_index(line, self.edit_cursor_col - 1);
+                    let end = grapheme_byte_index(line, self.edit_cursor_col);
                     line.replace_range(idx..end, "");
                     self.edit_cursor_col -= 1;
                     self.edit_dirty = true;
@@ -2880,7 +3331,7 @@ impl AppState {
                     let curr = self.edit_buffer.remove(self.edit_cursor_row);
                     self.edit_cursor_row -= 1;
                     let prev = &mut self.edit_buffer[self.edit_cursor_row];
-                    self.edit_cursor_col = prev.chars().count();
+                    self.edit_cursor_col = grapheme_count(prev);
                     prev.push_str(&curr);
                     self.edit_dirty = true;
                     return true;
@@ -2888,19 +3339,11 @@ impl AppState {
             }
             KeyCode::Delete => {
                 if self.edit_cursor_row < self.edit_buffer.len() {
-                    let len = self.edit_buffer[self.edit_cursor_row].chars().count();
+                    let len = grapheme_count(&self.edit_buffer[self.edit_cursor_row]);
                     if self.edit_cursor_col < len {
                         let line = &mut self.edit_buffer[self.edit_cursor_row];
-                        let idx = line
-                            .char_indices()
-                            .nth(self.edit_cursor_col)
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
-                        let end = line
-                            .char_indices()
-                            .nth(self.edit_cursor_col + 1)
-                            .map(|(i, _)| i)
-                            .unwrap_or(line.len());
+                        let idx = grapheme_byte_index(line, self.edit_cursor_col);
+                        let end = grapheme_byte_index(line, self.edit_cursor_col + 1);
                         line.replace_range(idx..end, "");
                         self.edit_dirty = true;
                         return true;
@@ -2915,7 +3358,7 @@ impl AppState {
             KeyCode::Up => {
                 if self.edit_cursor_row > 0 {
                     self.edit_cursor_row -= 1;
-                    let len = self.edit_buffer[self.edit_cursor_row].chars().count();
+                    let len = grapheme_count(&self.edit_buffer[self.edit_cursor_row]);
                     self.edit_cursor_col = self.edit_cursor_col.min(len);
                     return true;
                 }
@@ -2923,7 +3366,7 @@ impl AppState {
             KeyCode::Down => {
                 if self.edit_cursor_row + 1 < self.edit_buffer.len() {
                     self.edit_cursor_row += 1;
-                    let len = self.edit_buffer[self.edit_cursor_row].chars().count();
+                    let len = grapheme_count(&self.edit_buffer[self.edit_cursor_row]);
                     self.edit_cursor_col = self.edit_cursor_col.min(len);
                     return true;
                 }
@@ -2934,13 +3377,13 @@ impl AppState {
                     return true;
                 } else if self.edit_cursor_row > 0 {
                     self.edit_cursor_row -= 1;
-                    self.edit_cursor_col = self.edit_buffer[self.edit_cursor_row].chars().count();
+                    self.edit_cursor_col = grapheme_count(&self.edit_buffer[self.edit_cursor_row]);
                     return true;
                 }
             }
             KeyCode::Right => {
                 if self.edit_cursor_row < self.edit_buffer.len() {
-                    let len = self.edit_buffer[self.edit_cursor_row].chars().count();
+                    let len = grapheme_count(&self.edit_buffer[self.edit_cursor_row]);
                     if self.edit_cursor_col < len {
                         self.edit_cursor_col += 1;
                         return true;
@@ -2957,23 +3400,17 @@ impl AppState {
             }
             KeyCode::End => {
                 if self.edit_cursor_row < self.edit_buffer.len() {
-                    self.edit_cursor_col = self.edit_buffer[self.edit_cursor_row].chars().count();
+                    self.edit_cursor_col = grapheme_count(&self.edit_buffer[self.edit_cursor_row]);
                     return true;
                 }
             }
-            KeyCode::Tab => {
-                if self.edit_cursor_row < self.edit_buffer.len() {
-                    let line = &mut self.edit_buffer[self.edit_cursor_row];
-                    let idx = line
-                        .char_indices()
-                        .nth(self.edit_cursor_col)
-                        .map(|(i, _)| i)
-                        .unwrap_or(line.len());
-                    line.insert_str(idx, "    ");
-                    self.edit_cursor_col += 4;
-                    self.edit_dirty = true;
-                    return true;
-                }
+            KeyCode::Tab if self.edit_cursor_row < self.edit_buffer.len() => {
+                let line = &mut self.edit_buffer[self.edit_cursor_row];
+                let idx = grapheme_byte_index(line, self.edit_cursor_col);
+                line.insert_str(idx, "    ");
+                self.edit_cursor_col += 4;
+                self.edit_dirty = true;
+                return true;
             }
             _ => {}
         }
@@ -2982,6 +3419,21 @@ impl AppState {
 }
 
 // ── Text/code extension check ─────────────────────────────────────────────────
+
+impl Drop for AppState {
+    fn drop(&mut self) {
+        self.persist_user_settings();
+        if let Some(watch) = self.directory_watch.take() {
+            watch.cancel.store(true, Ordering::Release);
+        }
+        if let Some(scan) = self.property_scan.take() {
+            scan.cancel.store(true, Ordering::Release);
+        }
+        if let Some(operation) = self.operation_task.take() {
+            operation.cancel.store(true, Ordering::Release);
+        }
+    }
+}
 
 fn scan_folder_stats(
     root: PathBuf,
@@ -3077,70 +3529,114 @@ fn split_edit_text(content: &str) -> (Vec<String>, &'static str) {
     (lines, line_ending)
 }
 
-pub fn is_text_or_code(p: &PathBuf) -> bool {
-    let ext = p
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    matches!(
-        ext.as_str(),
-        "rs" | "py"
-            | "js"
-            | "ts"
-            | "tsx"
-            | "jsx"
-            | "html"
-            | "htm"
-            | "css"
-            | "scss"
-            | "json"
-            | "toml"
-            | "yaml"
-            | "yml"
-            | "sh"
-            | "bash"
-            | "zsh"
-            | "ps1"
-            | "bat"
-            | "c"
-            | "cpp"
-            | "h"
-            | "hpp"
-            | "java"
-            | "kt"
-            | "go"
-            | "rb"
-            | "php"
-            | "cs"
-            | "lua"
-            | "sql"
-            | "xml"
-            | "md"
-            | "markdown"
-            | "txt"
-            | "log"
-            | "ini"
-            | "cfg"
-            | "conf"
-            | "swift"
-            | "dart"
-            | "r"
-            | "jl"
-            | "hs"
-            | "ex"
-            | "exs"
-            | "vue"
-            | "svelte"
-            | "astro"
-            | "rtf"
-            | "csv"
-            | "tsv"
-            | "rst"
-    )
+// ── Directory listing ─────────────────────────────────────────────────────────
+
+fn scan_dir_uncached(path: &std::path::Path) -> std::io::Result<Vec<DirEntryInfo>> {
+    fs::read_dir(path)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| {
+            let path = entry.path();
+            let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+            let metadata = entry.metadata().ok();
+            let size = metadata
+                .as_ref()
+                .filter(|meta| !meta.is_dir())
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            let modified = metadata.and_then(|meta| meta.modified().ok());
+            Ok(DirEntryInfo {
+                path,
+                is_dir,
+                size,
+                modified,
+            })
+        })
+        .collect()
 }
 
-// ── Directory listing ─────────────────────────────────────────────────────────
+fn directory_fingerprint(entries: &[DirEntryInfo]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut stable: Vec<&DirEntryInfo> = entries.iter().collect();
+    stable.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for entry in stable {
+        entry.path.hash(&mut hasher);
+        entry.is_dir.hash(&mut hasher);
+        entry.size.hash(&mut hasher);
+        entry.modified.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn start_directory_watch(path: PathBuf) -> DirectoryWatch {
+    let (sender, receiver) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let worker_path = path.clone();
+    std::thread::spawn(move || {
+        let mut last_fingerprint = None;
+        let mut last_error = None;
+        let mut last_directory_modified = None;
+        let mut last_full_scan = Instant::now()
+            .checked_sub(Duration::from_secs(3))
+            .unwrap_or_else(Instant::now);
+        while !worker_cancel.load(Ordering::Acquire) {
+            let directory_modified = fs::metadata(&worker_path)
+                .and_then(|meta| meta.modified())
+                .ok();
+            let must_scan = directory_modified != last_directory_modified
+                || last_full_scan.elapsed() >= Duration::from_secs(2);
+            if must_scan {
+                last_directory_modified = directory_modified;
+                last_full_scan = Instant::now();
+                match scan_dir_uncached(&worker_path) {
+                    Ok(entries) => {
+                        let fingerprint = directory_fingerprint(&entries);
+                        if last_fingerprint != Some(fingerprint) {
+                            last_fingerprint = Some(fingerprint);
+                            last_error = None;
+                            if sender
+                                .send(DirectoryWatchEvent::Snapshot {
+                                    path: worker_path.clone(),
+                                    entries,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let message = format!("Can't refresh {}: {}", worker_path.display(), error);
+                        if last_error.as_deref() != Some(message.as_str()) {
+                            last_error = Some(message.clone());
+                            if sender
+                                .send(DirectoryWatchEvent::Error {
+                                    path: worker_path.clone(),
+                                    message,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            for _ in 0..10 {
+                if worker_cancel.load(Ordering::Acquire) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    });
+    DirectoryWatch {
+        path,
+        receiver,
+        cancel,
+    }
+}
 
 pub fn list_dir<P: AsRef<std::path::Path>>(path: P) -> anyhow::Result<Vec<DirEntryInfo>> {
     let path_ref = path.as_ref();
@@ -3162,27 +3658,7 @@ pub fn list_dir<P: AsRef<std::path::Path>>(path: P) -> anyhow::Result<Vec<DirEnt
         }
     }
 
-    let mut entries: Vec<_> = fs::read_dir(path_ref)?
-        .filter_map(|e| e.ok())
-        .map(|e| {
-            let path = e.path();
-            let is_dir = e.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-            let metadata = e.metadata().ok();
-            let size = metadata
-                .as_ref()
-                .filter(|meta| !meta.is_dir())
-                .map(|meta| meta.len())
-                .unwrap_or(0);
-            let modified = metadata.and_then(|meta| meta.modified().ok());
-            DirEntryInfo {
-                path,
-                is_dir,
-                size,
-                modified,
-            }
-        })
-        .take(MAX_DIR_ENTRIES) // cap to prevent Sort + UI lag on huge dirs
-        .collect();
+    let mut entries = scan_dir_uncached(path_ref)?;
 
     // Sort: directories first, then files, both alphabetically (case-insensitive)
     entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
@@ -3311,10 +3787,9 @@ fn move_to_recycle_bin(paths: &[PathBuf]) -> std::io::Result<()> {
     if status == 0 && operation.fAnyOperationsAborted == 0 {
         Ok(())
     } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Recycle Bin operation failed (code {status})"),
-        ))
+        Err(std::io::Error::other(format!(
+            "Recycle Bin operation failed (code {status})"
+        )))
     }
 }
 
@@ -3327,16 +3802,163 @@ fn destination_is_inside_source(src: &std::path::Path, destination_dir: &std::pa
     }
 }
 
+fn remove_path(path: &std::path::Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+#[derive(Debug)]
+enum PasteOutcome {
+    Completed,
+    Skipped,
+}
+
+fn paste_one(
+    source: &std::path::Path,
+    destination_dir: &std::path::Path,
+    is_cut: bool,
+    cancel: &AtomicBool,
+) -> std::io::Result<PasteOutcome> {
+    check_cancelled(cancel)?;
+    let file_name = source.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "source has no file name")
+    })?;
+    if source.is_dir() && destination_is_inside_source(source, destination_dir) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "can't copy or move a folder into itself",
+        ));
+    }
+
+    let mut destination = destination_dir.join(file_name);
+    if destination.exists() && destination != source {
+        destination = unique_dest_path(destination_dir, file_name);
+    }
+    if destination == source {
+        return Ok(PasteOutcome::Skipped);
+    }
+
+    if is_cut && fs::rename(source, &destination).is_ok() {
+        return Ok(PasteOutcome::Completed);
+    }
+
+    transactional_copy(source, &destination, cancel)?;
+    check_cancelled(cancel)?;
+    if is_cut {
+        remove_path(source)?;
+    }
+    Ok(PasteOutcome::Completed)
+}
+
+fn transactional_copy(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+    cancel: &AtomicBool,
+) -> std::io::Result<()> {
+    check_cancelled(cancel)?;
+    let parent = destination.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "destination has no parent",
+        )
+    })?;
+    let name = destination
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let mut temporary = None;
+    for sequence in 0..10_000u32 {
+        let candidate = parent.join(format!(
+            ".rusty-ranger-partial-{}-{}-{}",
+            name,
+            std::process::id(),
+            sequence
+        ));
+        if !candidate.exists() {
+            temporary = Some(candidate);
+            break;
+        }
+    }
+    let temporary = temporary.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a temporary destination",
+        )
+    })?;
+
+    let copied = if source.is_dir() {
+        copy_dir_all(source, &temporary, cancel)
+    } else {
+        fs::copy(source, &temporary).map(|_| ())
+    };
+    if let Err(error) = copied {
+        let _ = remove_path(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = check_cancelled(cancel) {
+        let _ = remove_path(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temporary, destination) {
+        let _ = remove_path(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn snapshots_for_parents(paths: &[PathBuf]) -> Vec<(PathBuf, Vec<DirEntryInfo>)> {
+    let directories: std::collections::HashSet<PathBuf> = paths
+        .iter()
+        .filter_map(|path| path.parent().map(std::path::Path::to_path_buf))
+        .collect();
+    snapshot_directories(directories)
+}
+
+fn snapshots_for_parents_and_directories(
+    paths: &[PathBuf],
+    destination: &std::path::Path,
+) -> Vec<(PathBuf, Vec<DirEntryInfo>)> {
+    let mut directories: std::collections::HashSet<PathBuf> = paths
+        .iter()
+        .filter_map(|path| path.parent().map(std::path::Path::to_path_buf))
+        .collect();
+    directories.insert(destination.to_path_buf());
+    snapshot_directories(directories)
+}
+
+fn snapshot_directories(
+    directories: std::collections::HashSet<PathBuf>,
+) -> Vec<(PathBuf, Vec<DirEntryInfo>)> {
+    directories
+        .into_iter()
+        .filter_map(|path| scan_dir_uncached(&path).ok().map(|entries| (path, entries)))
+        .collect()
+}
+
 fn copy_dir_all(
     src: impl AsRef<std::path::Path>,
     dst: impl AsRef<std::path::Path>,
+    cancel: &AtomicBool,
 ) -> std::io::Result<()> {
+    check_cancelled(cancel)?;
     fs::create_dir_all(&dst)?;
     for entry in fs::read_dir(src)? {
+        check_cancelled(cancel)?;
         let entry = entry?;
         let ty = entry.file_type()?;
-        if ty.is_dir() {
-            copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        if ty.is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!(
+                    "symbolic link or reparse point is not followed: {}",
+                    entry.path().display()
+                ),
+            ));
+        } else if ty.is_dir() {
+            copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()), cancel)?;
         } else {
             fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
         }
@@ -3344,9 +3966,20 @@ fn copy_dir_all(
     Ok(())
 }
 
+fn check_cancelled(cancel: &AtomicBool) -> std::io::Result<()> {
+    if cancel.load(Ordering::Acquire) {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "operation cancelled",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Generate a non-colliding destination path by appending " (2)", " (3)", …
 /// before the extension, matching Windows Explorer's paste-collision behavior.
-fn unique_dest_path(dir: &PathBuf, file_name: &std::ffi::OsStr) -> PathBuf {
+fn unique_dest_path(dir: &std::path::Path, file_name: &std::ffi::OsStr) -> PathBuf {
     let name = file_name.to_string_lossy().to_string();
     let (stem, ext) = match name.rfind('.') {
         Some(pos) if pos > 0 => (name[..pos].to_string(), name[pos..].to_string()),
@@ -3630,5 +4263,84 @@ mod tests {
         assert!(filename_matches(&entry, ".pdf"));
         assert!(!filename_matches(&entry, "draft"));
         assert!(!filename_matches(&entry, ""));
+    }
+
+    #[test]
+    fn transactional_copy_publishes_only_the_complete_destination() {
+        let base = std::env::temp_dir().join(format!(
+            "rusty-ranger-copy-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = base.join("source.txt");
+        let destination_dir = base.join("destination");
+        fs::create_dir_all(&destination_dir).unwrap();
+        fs::write(&source, b"complete payload").unwrap();
+        let cancel = AtomicBool::new(false);
+
+        assert!(matches!(
+            paste_one(&source, &destination_dir, false, &cancel).unwrap(),
+            PasteOutcome::Completed
+        ));
+        assert_eq!(
+            fs::read(destination_dir.join("source.txt")).unwrap(),
+            b"complete payload"
+        );
+        assert!(fs::read_dir(&destination_dir)
+            .unwrap()
+            .flatten()
+            .all(|entry| !entry.file_name().to_string_lossy().contains("partial")));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn cancelled_copy_does_not_publish_a_destination() {
+        let base = std::env::temp_dir().join(format!(
+            "rusty-ranger-cancel-copy-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = base.join("source.txt");
+        let destination_dir = base.join("destination");
+        fs::create_dir_all(&destination_dir).unwrap();
+        fs::write(&source, b"payload").unwrap();
+        let cancel = AtomicBool::new(true);
+
+        let error = paste_one(&source, &destination_dir, false, &cancel).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert!(!destination_dir.join("source.txt").exists());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn grapheme_cursor_treats_tamil_combining_sequence_as_one_unit() {
+        let value = "கொ";
+        assert_eq!(grapheme_count(value), 1);
+        assert_eq!(grapheme_byte_index(value, 1), value.len());
+    }
+
+    #[test]
+    fn directory_listing_is_not_silently_limited_to_three_thousand_entries() {
+        let base = std::env::temp_dir().join(format!(
+            "rusty-ranger-listing-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        for index in 0..3_005 {
+            fs::write(base.join(format!("item-{index:04}")), []).unwrap();
+        }
+        assert_eq!(scan_dir_uncached(&base).unwrap().len(), 3_005);
+        fs::remove_dir_all(base).unwrap();
     }
 }

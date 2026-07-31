@@ -3,7 +3,10 @@ use image::DynamicImage;
 use ratatui::layout::Rect as TuiRect;
 use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 use std::thread;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::*;
@@ -12,50 +15,65 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 pub enum PreviewCmd {
     ShowImage {
+        generation: u64,
         img: Arc<DynamicImage>,
         path: std::path::PathBuf,
         rotation: u32,
         flip_h: bool,
+        zoom: f32,
         cell_rect: TuiRect,
         term_cols: u16,
         term_rows: u16,
         background: u32,
         ultra_fast: bool,
     },
-    Hide,
+    Hide {
+        generation: u64,
+    },
     Quit,
 }
 
 pub struct NativePreviewManager {
     sender: Sender<PreviewCmd>,
+    generation: Arc<AtomicU64>,
 }
 
 impl NativePreviewManager {
     pub fn new() -> Self {
         let (tx, rx) = channel();
+        let generation = Arc::new(AtomicU64::new(0));
+        let worker_generation = Arc::clone(&generation);
         thread::spawn(move || {
-            native_window_thread(rx);
+            native_window_thread(rx, worker_generation);
         });
-        Self { sender: tx }
+        Self {
+            sender: tx,
+            generation,
+        }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn show(
         &self,
         img: Arc<DynamicImage>,
         path: std::path::PathBuf,
         rotation: u32,
         flip_h: bool,
+        zoom: f32,
         cell_rect: TuiRect,
         term_cols: u16,
         term_rows: u16,
         background: u32,
         ultra_fast: bool,
     ) {
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         let _ = self.sender.send(PreviewCmd::ShowImage {
+            generation,
             img,
             path,
             rotation,
             flip_h,
+            zoom,
             cell_rect,
             term_cols,
             term_rows,
@@ -65,26 +83,14 @@ impl NativePreviewManager {
     }
 
     pub fn hide(&self) {
-        let _ = self.sender.send(PreviewCmd::Hide);
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let _ = self.sender.send(PreviewCmd::Hide { generation });
     }
 }
 
 impl Drop for NativePreviewManager {
     fn drop(&mut self) {
         let _ = self.sender.send(PreviewCmd::Quit);
-    }
-}
-
-// ── Debug Logging ─────────────────────────────────────────────────────────────
-fn log_debug(msg: &str) {
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(true)
-        .open("debug.log")
-    {
-        use std::io::Write;
-        let _ = writeln!(file, "{}", msg);
     }
 }
 
@@ -287,7 +293,7 @@ unsafe extern "system" fn wnd_proc(
                         bi.bmiHeader.biHeight = -(state.img_h as i32); // top-down
                         bi.bmiHeader.biPlanes = 1;
                         bi.bmiHeader.biBitCount = 32;
-                        bi.bmiHeader.biCompression = BI_RGB as u32;
+                        bi.bmiHeader.biCompression = BI_RGB;
 
                         // Center within the popup window
                         let win_w = rect.right - rect.left;
@@ -316,6 +322,7 @@ unsafe extern "system" fn wnd_proc(
             EndPaint(hwnd, &ps);
             0
         }
+        WM_NCHITTEST => HTTRANSPARENT as LRESULT,
         WM_DESTROY => 0,
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
@@ -323,7 +330,7 @@ unsafe extern "system" fn wnd_proc(
 
 // ── Overlay window thread ─────────────────────────────────────────────────────
 
-fn native_window_thread(rx: Receiver<PreviewCmd>) {
+fn native_window_thread(rx: Receiver<PreviewCmd>, newest_generation: Arc<AtomicU64>) {
     unsafe {
         let state_ptr = Box::into_raw(Box::new(Mutex::new(WindowState {
             img_bgra: Vec::new(),
@@ -343,7 +350,7 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
         let term_hwnd = find_terminal_window();
 
         let hwnd = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW,
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class_name.as_ptr(),
             std::ptr::null(),
             WS_POPUP,
@@ -356,6 +363,12 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
             std::ptr::null_mut(),
             state_ptr as *const _,
         );
+
+        if hwnd.is_null() {
+            let _ = Box::from_raw(state_ptr);
+            UnregisterClassW(class_name.as_ptr(), std::ptr::null_mut());
+            return;
+        }
 
         SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
 
@@ -380,7 +393,7 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
         // PPTX), which are all near-identically-sized generated PNGs — using
         // pointer identity there caused the overlay to wrongly think a
         // brand-new preview was "the same image" and skip repainting.
-        let mut last_key: Option<(std::path::PathBuf, u32, bool, u32)> = None;
+        let mut last_key: Option<(std::path::PathBuf, u32, bool, u32, u32)> = None;
         let mut last_cell_rect: TuiRect = TuiRect {
             x: 0,
             y: 0,
@@ -390,7 +403,7 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
         let mut last_term_cols: u16 = 0;
         let mut last_term_rows: u16 = 0;
         let mut last_applied_rect: (i32, i32, i32, i32) = (i32::MIN, 0, 0, 0);
-        let mut last_shown: Option<(Arc<DynamicImage>, TuiRect, u16, u16)> = None;
+        let mut last_shown: Option<(Arc<DynamicImage>, f32, TuiRect, u16, u16)> = None;
         let mut is_visible = false;
         let mut ultra_fast = false;
         let mut last_resync_at = std::time::Instant::now();
@@ -420,10 +433,11 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
                 // Nothing new to show, but periodically re-check the terminal's
                 // on-screen position so the overlay follows a dragged/moved
                 // window. This is position-only: no image decode, no resize.
-                if let Some((img, cell_rect, cols, rows)) = last_shown.clone() {
+                if let Some((img, zoom, cell_rect, cols, rows)) = last_shown.clone() {
                     reposition_overlay(
                         hwnd,
                         &img,
+                        zoom,
                         cell_rect,
                         cols,
                         rows,
@@ -442,18 +456,24 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
             if let Some(cmd) = latest_cmd {
                 match cmd {
                     PreviewCmd::ShowImage {
+                        generation,
                         img,
                         path,
                         rotation,
                         flip_h,
+                        zoom,
                         cell_rect,
                         term_cols,
                         term_rows,
                         background,
                         ultra_fast: requested_ultra,
                     } => {
+                        if generation < newest_generation.load(Ordering::Acquire) {
+                            continue;
+                        }
                         ultra_fast = requested_ultra;
-                        let key = (path, rotation, flip_h, background);
+                        let zoom = zoom.clamp(0.1, 8.0);
+                        let key = (path, rotation, flip_h, zoom.to_bits(), background);
                         let unchanged = Some(&key) == last_key.as_ref()
                             && cell_rect == last_cell_rect
                             && term_cols == last_term_cols
@@ -461,6 +481,10 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
                             && is_visible;
 
                         if !unchanged {
+                            // Hide the previous bitmap before doing any resize
+                            // work so it can never linger over a newer file.
+                            ShowWindow(hwnd, SW_HIDE);
+                            is_visible = false;
                             if let Ok(mut state) = (*state_ptr).lock() {
                                 state.background = background;
                             }
@@ -471,6 +495,7 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
                             reposition_overlay(
                                 hwnd,
                                 &img,
+                                zoom,
                                 cell_rect,
                                 term_cols,
                                 term_rows,
@@ -482,13 +507,19 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
                                 state_ptr,
                                 true,
                             );
-                            is_visible = true;
-                            last_shown = Some((img, cell_rect, term_cols, term_rows));
-                            last_key = Some(key);
-                            last_resync_at = std::time::Instant::now();
+                            if generation == newest_generation.load(Ordering::Acquire) {
+                                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                                is_visible = true;
+                                last_shown = Some((img, zoom, cell_rect, term_cols, term_rows));
+                                last_key = Some(key);
+                                last_resync_at = std::time::Instant::now();
+                            }
                         }
                     }
-                    PreviewCmd::Hide => {
+                    PreviewCmd::Hide { generation } => {
+                        if generation < newest_generation.load(Ordering::Acquire) {
+                            continue;
+                        }
                         ultra_fast = false;
                         if is_visible {
                             ShowWindow(hwnd, SW_HIDE);
@@ -501,6 +532,7 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
                     PreviewCmd::Quit => {
                         let _ = Box::from_raw(state_ptr);
                         DestroyWindow(hwnd);
+                        UnregisterClassW(class_name.as_ptr(), std::ptr::null_mut());
                         return;
                     }
                 }
@@ -518,9 +550,11 @@ fn native_window_thread(rx: Receiver<PreviewCmd>) {
 /// it. `allow_resize` gates the expensive Lanczos3 decode/resize + repaint;
 /// periodic resyncs pass `false` and only move the window if its position
 /// actually changed.
+#[allow(clippy::too_many_arguments)]
 unsafe fn reposition_overlay(
     hwnd: HWND,
     img: &Arc<DynamicImage>,
+    zoom: f32,
     cell_rect: TuiRect,
     term_cols: u16,
     term_rows: u16,
@@ -612,32 +646,18 @@ unsafe fn reposition_overlay(
     }
 
     if rect_changed {
-        SetWindowPos(
-            hwnd,
-            std::ptr::null_mut(),
-            px,
-            py,
-            pw,
-            ph,
-            SWP_SHOWWINDOW | SWP_NOACTIVATE,
-        );
+        SetWindowPos(hwnd, std::ptr::null_mut(), px, py, pw, ph, SWP_NOACTIVATE);
         *last_applied_rect = (px, py, pw, ph);
     } else {
-        // Window is already exactly where it needs to be — still make sure
-        // it's shown (covers the very first ShowImage after startup/hide).
-        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        // The caller shows the window only after confirming that this render
+        // still belongs to the newest preview generation.
     }
 
-    // Fit image inside pw x ph
-    let img_w = img.width() as f32;
-    let img_h = img.height() as f32;
-    if img_w <= 0.0 || img_h <= 0.0 || pw <= 0 || ph <= 0 {
+    // Fit at 100%, then apply user zoom. The overlay window remains clipped
+    // to the preview pane, so zooming never paints over navigation/UI chrome.
+    let Some((fw, fh)) = fitted_zoom_dimensions(img.width(), img.height(), pw, ph, zoom) else {
         return;
-    }
-
-    let scale = (pw as f32 / img_w).min(ph as f32 / img_h).min(1.0);
-    let fw = ((img_w * scale) as u32).max(1);
-    let fh = ((img_h * scale) as u32).max(1);
+    };
 
     // Decode/resize outside of WM_PAINT — this is the expensive step
     // (Lanczos3), so it only ever runs when the image or its target size
@@ -656,4 +676,50 @@ unsafe fn reposition_overlay(
     }
 
     InvalidateRect(hwnd, std::ptr::null(), 0);
+}
+
+fn fitted_zoom_dimensions(
+    image_width: u32,
+    image_height: u32,
+    pane_width: i32,
+    pane_height: i32,
+    zoom: f32,
+) -> Option<(u32, u32)> {
+    if image_width == 0 || image_height == 0 || pane_width <= 0 || pane_height <= 0 {
+        return None;
+    }
+    let image_width = image_width as f32;
+    let image_height = image_height as f32;
+    let fit_scale = (pane_width as f32 / image_width).min(pane_height as f32 / image_height);
+    let requested_scale = fit_scale * zoom.clamp(0.1, 8.0);
+    // Bound the decoded bitmap even at 800% so a large monitor cannot trigger
+    // a hundreds-of-megabytes transient allocation while rapidly zooming.
+    const MAX_RENDER_DIM: f32 = 4096.0;
+    let scale = requested_scale
+        .min(MAX_RENDER_DIM / image_width)
+        .min(MAX_RENDER_DIM / image_height);
+    Some((
+        ((image_width * scale).round() as u32).max(1),
+        ((image_height * scale).round() as u32).max(1),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fitted_zoom_dimensions;
+
+    #[test]
+    fn native_preview_zoom_fits_scales_and_caps_allocations() {
+        assert_eq!(
+            fitted_zoom_dimensions(400, 200, 200, 200, 1.0),
+            Some((200, 100))
+        );
+        assert_eq!(
+            fitted_zoom_dimensions(400, 200, 200, 200, 2.0),
+            Some((400, 200))
+        );
+        let huge_zoom = fitted_zoom_dimensions(10, 10, 2_000, 2_000, 8.0).unwrap();
+        assert_eq!(huge_zoom, (4096, 4096));
+        assert_eq!(fitted_zoom_dimensions(0, 200, 200, 200, 1.0), None);
+    }
 }

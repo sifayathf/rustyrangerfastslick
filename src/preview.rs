@@ -12,7 +12,9 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
-use std::{borrow::Cow, fs, io::Read, path::PathBuf, process::Command, sync::Arc};
+use std::{
+    borrow::Cow, collections::VecDeque, fs, io::Read, path::PathBuf, process::Command, sync::Arc,
+};
 use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -74,6 +76,8 @@ const SH_FN: Color = Color::Rgb(116, 199, 236); // sky     — function names
 
 struct ImgCache {
     path: PathBuf,
+    modified: Option<std::time::SystemTime>,
+    len: u64,
     rotation: u32,
     flip_h: bool,
     img: Arc<image::DynamicImage>,
@@ -87,23 +91,51 @@ static VIDEO_RENDER_FAILURES: Lazy<Mutex<std::collections::HashMap<PathBuf, std:
 static VISUAL_RENDER_PENDING: Lazy<Mutex<std::collections::HashSet<PathBuf>>> =
     Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
 
-struct PreviewCacheEntry {
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PreviewCacheKey {
     path: PathBuf,
     modified: Option<std::time::SystemTime>,
     len: u64,
+    rotation: u32,
+    flip_h: bool,
     office_full: bool,
     pdf_visual: bool,
     slide_idx: usize,
-    content: PreviewContent,
 }
 
-static PREVIEW_CACHE: Lazy<Mutex<Option<PreviewCacheEntry>>> = Lazy::new(|| Mutex::new(None));
+const PREVIEW_CACHE_CAPACITY: usize = 8;
+static PREVIEW_CACHE: Lazy<Mutex<VecDeque<(PreviewCacheKey, PreviewContent)>>> =
+    Lazy::new(|| Mutex::new(VecDeque::new()));
+static PREVIEW_PARSE_PENDING: Lazy<Mutex<std::collections::HashSet<PreviewCacheKey>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
+const ASYNC_PREVIEW_THRESHOLD: u64 = 256 * 1024;
+
+fn invalidate_preview_path(path: &std::path::Path) {
+    PREVIEW_CACHE
+        .lock()
+        .retain(|(key, _)| key.path.as_path() != path);
+}
+
+fn cache_preview(key: PreviewCacheKey, content: PreviewContent) {
+    let mut cache = PREVIEW_CACHE.lock();
+    cache.retain(|(cached_key, _)| cached_key != &key);
+    cache.push_front((key, content));
+    cache.truncate(PREVIEW_CACHE_CAPACITY);
+}
 
 fn get_or_decode(path: &PathBuf, rotation: u32, flip_h: bool) -> Option<Arc<image::DynamicImage>> {
+    let metadata = fs::metadata(path).ok();
+    let modified = metadata.as_ref().and_then(|value| value.modified().ok());
+    let len = metadata.as_ref().map(|value| value.len()).unwrap_or(0);
     {
         let g = IMG_CACHE.lock();
         if let Some(c) = g.as_ref() {
-            if &c.path == path && c.rotation == rotation && c.flip_h == flip_h {
+            if &c.path == path
+                && c.modified == modified
+                && c.len == len
+                && c.rotation == rotation
+                && c.flip_h == flip_h
+            {
                 return Some(Arc::clone(&c.img));
             }
         }
@@ -119,6 +151,8 @@ fn get_or_decode(path: &PathBuf, rotation: u32, flip_h: bool) -> Option<Arc<imag
     let arc = Arc::new(final_img);
     *IMG_CACHE.lock() = Some(ImgCache {
         path: path.clone(),
+        modified,
+        len,
         rotation,
         flip_h,
         img: Arc::clone(&arc),
@@ -192,6 +226,16 @@ pub fn render(
     let len = metadata.as_ref().map_or(0, |value| value.len());
     let office_full = office_mode == crate::state::OfficeRenderMode::Full;
     let pdf_visual = pdf_mode == crate::state::PdfRenderMode::Visual;
+    let cache_key = PreviewCacheKey {
+        path: p.clone(),
+        modified,
+        len,
+        rotation,
+        flip_h,
+        office_full,
+        pdf_visual,
+        slide_idx,
+    };
     let is_video = is_video_extension(&ext);
     let visual_requested = (office_full
         && matches!(
@@ -214,25 +258,112 @@ pub fn render(
         None
     };
     let visual_ready = ready_visual_path.as_ref().is_some_and(|path| path.exists());
-    if let Some(cache) = PREVIEW_CACHE.lock().as_ref() {
-        if cache.path == *p
-            && cache.modified == modified
-            && cache.len == len
-            && cache.office_full == office_full
-            && cache.pdf_visual == pdf_visual
-            && cache.slide_idx == slide_idx
-        {
-            let cached_ready_visual = match (&cache.content, ready_visual_path.as_ref()) {
-                (PreviewContent::ImageFallback(info), Some(ready_path)) => info.path == *ready_path,
-                _ => false,
-            };
-            if !visual_requested || !visual_ready || cached_ready_visual {
-                return cache.content.clone();
-            }
+    let cached = {
+        let mut cache = PREVIEW_CACHE.lock();
+        cache
+            .iter()
+            .position(|(key, _)| key == &cache_key)
+            .and_then(|index| cache.remove(index))
+            .map(|entry| {
+                let content = entry.1.clone();
+                cache.push_front(entry);
+                content
+            })
+    };
+    if let Some(cached) = cached {
+        let cached_ready_visual = match (&cached, ready_visual_path.as_ref()) {
+            (PreviewContent::ImageFallback(info), Some(ready_path)) => info.path == *ready_path,
+            _ => false,
+        };
+        if !visual_requested || !visual_ready || cached_ready_visual {
+            return cached;
         }
     }
 
-    let content = normalize_preview_content(match ext.as_str() {
+    if len >= ASYNC_PREVIEW_THRESHOLD && !visual_requested && should_parse_in_background(&ext) {
+        let mut pending = PREVIEW_PARSE_PENDING.lock();
+        if pending.insert(cache_key.clone()) {
+            let source = p.clone();
+            let worker_key = cache_key.clone();
+            let worker_ext = ext.clone();
+            std::thread::spawn(move || {
+                let content = normalize_preview_content(render_uncached(
+                    &source,
+                    &worker_ext,
+                    rotation,
+                    flip_h,
+                    office_mode,
+                    pdf_mode,
+                    slide_idx,
+                ));
+                let metadata = fs::metadata(&source).ok();
+                let still_current = metadata.as_ref().and_then(|value| value.modified().ok())
+                    == worker_key.modified
+                    && metadata.as_ref().map_or(0, |value| value.len()) == worker_key.len;
+                if still_current {
+                    cache_preview(worker_key.clone(), content);
+                }
+                PREVIEW_PARSE_PENDING.lock().remove(&worker_key);
+            });
+        }
+        return PreviewContent::Highlighted(vec![
+            Line::from(Span::styled(
+                "Preparing preview…",
+                Style::default().fg(SH_FN).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!("{} is being parsed in the background", human_size(len)),
+                Style::default().fg(SH_CMT),
+            )),
+        ]);
+    }
+
+    let content = normalize_preview_content(render_uncached(
+        p,
+        &ext,
+        rotation,
+        flip_h,
+        office_mode,
+        pdf_mode,
+        slide_idx,
+    ));
+    cache_preview(cache_key, content.clone());
+    content
+}
+
+fn should_parse_in_background(ext: &str) -> bool {
+    !matches!(
+        ext,
+        "jpg"
+            | "jpeg"
+            | "png"
+            | "bmp"
+            | "gif"
+            | "webp"
+            | "tiff"
+            | "tif"
+            | "ico"
+            | "mp3"
+            | "flac"
+            | "wav"
+            | "ogg"
+            | "aac"
+            | "m4a"
+            | "opus"
+            | "wma"
+    )
+}
+
+fn render_uncached(
+    p: &PathBuf,
+    ext: &str,
+    rotation: u32,
+    flip_h: bool,
+    office_mode: crate::state::OfficeRenderMode,
+    pdf_mode: crate::state::PdfRenderMode,
+    slide_idx: usize,
+) -> PreviewContent {
+    match ext {
         "jpg" | "jpeg" | "png" | "bmp" | "gif" | "webp" | "tiff" | "tif" | "ico" => {
             render_image(p, rotation, flip_h)
         }
@@ -247,17 +378,7 @@ pub fn render(
         "ipynb" => render_notebook(p),
         "zip" | "7z" | "tar" | "gz" | "bz2" | "xz" | "rar" | "tgz" => render_archive(p),
         _ => text_preview(p),
-    });
-    *PREVIEW_CACHE.lock() = Some(PreviewCacheEntry {
-        path: p.clone(),
-        modified,
-        len,
-        office_full,
-        pdf_visual,
-        slide_idx,
-        content: content.clone(),
-    });
-    content
+    }
 }
 
 pub fn is_visual_preview(
@@ -431,7 +552,7 @@ fn highlight_document_line(line: &str) -> Line<'static> {
     if trimmed.starts_with('•')
         || trimmed.starts_with('-')
         || trimmed.starts_with('*')
-        || (trimmed.chars().next().map_or(false, |c| c.is_numeric()) && trimmed.contains(". "))
+        || (trimmed.chars().next().is_some_and(|c| c.is_numeric()) && trimmed.contains(". "))
     {
         // Find the index of the bullet/number separator
         let sep_idx =
@@ -554,7 +675,7 @@ fn highlight_code_with_limit(text: &str, ext: &str, max_lines: usize) -> Vec<Lin
 
         // Line number gutter
         spans.push(Span::styled(
-            format!("{:>width$}│ ", ln_idx + 1, width = gutter_digits),
+            format!("{:>width$}│", ln_idx + 1, width = gutter_digits),
             Style::default().fg(SH_LN),
         ));
 
@@ -584,9 +705,8 @@ fn highlight_code_with_limit(text: &str, ext: &str, max_lines: usize) -> Vec<Lin
             // Block comment open?
             if let Some((open, _)) = cmt_block {
                 let remaining: String = chars[i..].iter().collect();
-                if remaining.starts_with(open) {
+                if let Some(after_open) = remaining.strip_prefix(open) {
                     let close = cmt_block.unwrap().1;
-                    let after_open = &remaining[open.len()..];
                     if let Some(end) = after_open.find(close) {
                         // whole block on this line
                         let len = open.len() + end + close.len();
@@ -1470,6 +1590,12 @@ fn ffmpeg_candidates() -> Vec<PathBuf> {
         PathBuf::from("C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe"),
         PathBuf::from("C:\\ffmpeg\\bin\\ffmpeg.exe"),
     ];
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(directory) = executable.parent() {
+            candidates.insert(0, directory.join("ffmpeg.exe"));
+            candidates.insert(1, directory.join("tools").join("ffmpeg.exe"));
+        }
+    }
     if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
         let winget = PathBuf::from(local_app_data)
             .join("Microsoft")
@@ -1483,7 +1609,8 @@ fn ffmpeg_candidates() -> Vec<PathBuf> {
 
 fn generate_video_thumbnail(source: &PathBuf, target: &PathBuf) -> bool {
     for ffmpeg in ffmpeg_candidates() {
-        let status = Command::new(ffmpeg)
+        let mut command = Command::new(ffmpeg);
+        command
             .args([
                 "-y",
                 "-hide_banner",
@@ -1494,12 +1621,13 @@ fn generate_video_thumbnail(source: &PathBuf, target: &PathBuf) -> bool {
                 "-i",
             ])
             .arg(source)
-            .args(["-an", "-frames:v", "1", "-vf", "scale='min(1280,iw)':-2"])
+            .args(["-an", "-frames:v", "1", "-vf", "scale=min(1280\\,iw):-2"])
             .arg(target)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        if status.is_ok_and(|status| status.success()) && target.exists() {
+            .stderr(std::process::Stdio::null());
+        if run_command_with_timeout(&mut command, std::time::Duration::from_secs(15))
+            && target.exists()
+        {
             return true;
         }
     }
@@ -1531,7 +1659,7 @@ fn render_video(p: &PathBuf) -> PreviewContent {
                         .insert(cache_path.clone(), std::time::Instant::now());
                 }
                 VISUAL_RENDER_PENDING.lock().remove(&cache_path);
-                *PREVIEW_CACHE.lock() = None;
+                invalidate_preview_path(&source);
             });
         } else {
             pending = true;
@@ -1696,7 +1824,7 @@ where
         let stderr_h = GetStdHandle(STD_ERROR_HANDLE);
 
         if let Ok(null_file) = File::create("NUL") {
-            let null_raw = null_file.as_raw_handle() as *mut std::ffi::c_void;
+            let null_raw = null_file.as_raw_handle();
             SetStdHandle(STD_OUTPUT_HANDLE, null_raw);
             SetStdHandle(STD_ERROR_HANDLE, null_raw);
             let res = f();
@@ -1762,7 +1890,7 @@ fn try_render_pdf_visual(p: &PathBuf, page_idx: usize) -> Result<Option<PreviewC
                 .lock()
                 .insert(cache_path, std::time::Instant::now());
         }
-        *PREVIEW_CACHE.lock() = None;
+        invalidate_preview_path(&source);
     });
     Ok(None)
 }
@@ -1782,7 +1910,7 @@ fn render_pdf(
                         Style::default().fg(SH_FN).add_modifier(Modifier::BOLD),
                     )),
                     Line::from(Span::styled(
-                        "Rendering first page in the background…",
+                        format!("Rendering page {} in the background…", page_idx + 1),
                         Style::default().fg(SH_CMT),
                     )),
                 ]);
@@ -1915,8 +2043,11 @@ fn try_render_embedded_office_thumbnail(
         let image = if flip_h { rotated.fliph() } else { rotated };
         let dimensions = Some((image.width(), image.height()));
         let image = Arc::new(image);
+        let metadata = fs::metadata(p).ok();
         *IMG_CACHE.lock() = Some(ImgCache {
             path: p.clone(),
+            modified: metadata.as_ref().and_then(|value| value.modified().ok()),
+            len: metadata.as_ref().map(|value| value.len()).unwrap_or(0),
             rotation,
             flip_h,
             img: Arc::clone(&image),
@@ -2172,7 +2303,7 @@ fn try_render_office_exact(
     std::thread::spawn(move || {
         let _ = generate_office_exact_sync(&source, rotation, flip_h, page_idx);
         VISUAL_RENDER_PENDING.lock().remove(&cache_path);
-        *PREVIEW_CACHE.lock() = None;
+        invalidate_preview_path(&source);
     });
     None
 }
@@ -2643,7 +2774,7 @@ fn render_pptx(
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
-        let extracted_text = xml_text(&xml);
+        let extracted_text = xml_text(xml);
         let mut slide_has_text = false;
         for l in extracted_text.lines() {
             let trimmed = l.trim();
@@ -3019,34 +3150,8 @@ fn render_rtf(p: &PathBuf) -> PreviewContent {
             return PreviewContent::Highlighted(lines);
         }
     };
-    let raw = String::from_utf8_lossy(&bytes).to_string();
-    let mut out = String::new();
-    let mut chars = raw.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\\' => {
-                while let Some(&nc) = chars.peek() {
-                    if nc.is_alphabetic() || nc == '-' {
-                        chars.next();
-                    } else if nc.is_ascii_digit() {
-                        chars.next();
-                    } else {
-                        if nc == ' ' {
-                            chars.next();
-                        }
-                        break;
-                    }
-                }
-            }
-            '{' | '}' => {}
-            '\n' | '\r' => {
-                out.push('\n');
-            }
-            _ => {
-                out.push(ch);
-            }
-        }
-    }
+    let raw = String::from_utf8_lossy(&bytes);
+    let out = decode_rtf_text(&raw);
 
     lines.push(Line::from(Span::styled(
         "📄  RTF Document",
@@ -3056,10 +3161,179 @@ fn render_rtf(p: &PathBuf) -> PreviewContent {
         "─".repeat(44),
         Style::default().fg(SH_CMT),
     )));
-    for l in out.lines().filter(|l| !l.trim().is_empty()).take(300) {
+    for l in out.lines().filter(|l| !l.trim().is_empty()) {
         lines.push(highlight_document_line(l));
     }
     PreviewContent::Highlighted(lines)
+}
+
+#[derive(Clone, Copy)]
+struct RtfState {
+    unicode_fallback: usize,
+    ignorable: bool,
+}
+
+fn decode_rtf_text(raw: &str) -> String {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut output = String::new();
+    let mut index = 0;
+    let mut state = RtfState {
+        unicode_fallback: 1,
+        ignorable: false,
+    };
+    let mut stack = Vec::new();
+
+    while index < chars.len() {
+        match chars[index] {
+            '{' => {
+                stack.push(state);
+                index += 1;
+            }
+            '}' => {
+                state = stack.pop().unwrap_or(state);
+                index += 1;
+            }
+            '\\' => {
+                index += 1;
+                if index >= chars.len() {
+                    break;
+                }
+                match chars[index] {
+                    '\\' | '{' | '}' => {
+                        if !state.ignorable {
+                            output.push(chars[index]);
+                        }
+                        index += 1;
+                    }
+                    '\'' if index + 2 < chars.len() => {
+                        let digits = format!("{}{}", chars[index + 1], chars[index + 2]);
+                        if let Ok(byte) = u8::from_str_radix(&digits, 16) {
+                            let bytes = [byte];
+                            let (decoded, _, _) = encoding_rs::WINDOWS_1252.decode(&bytes);
+                            if !state.ignorable {
+                                output.push_str(&decoded);
+                            }
+                        }
+                        index += 3;
+                    }
+                    '*' => {
+                        state.ignorable = true;
+                        index += 1;
+                    }
+                    '~' => {
+                        if !state.ignorable {
+                            output.push('\u{00A0}');
+                        }
+                        index += 1;
+                    }
+                    '-' => {
+                        if !state.ignorable {
+                            output.push('\u{00AD}');
+                        }
+                        index += 1;
+                    }
+                    '_' => {
+                        if !state.ignorable {
+                            output.push('\u{2011}');
+                        }
+                        index += 1;
+                    }
+                    symbol if !symbol.is_ascii_alphabetic() => {
+                        index += 1;
+                    }
+                    _ => {
+                        let word_start = index;
+                        while index < chars.len() && chars[index].is_ascii_alphabetic() {
+                            index += 1;
+                        }
+                        let word: String = chars[word_start..index].iter().collect();
+                        let number_start = index;
+                        if index < chars.len() && chars[index] == '-' {
+                            index += 1;
+                        }
+                        while index < chars.len() && chars[index].is_ascii_digit() {
+                            index += 1;
+                        }
+                        let parameter = if index > number_start {
+                            chars[number_start..index]
+                                .iter()
+                                .collect::<String>()
+                                .parse::<i32>()
+                                .ok()
+                        } else {
+                            None
+                        };
+                        if index < chars.len() && chars[index] == ' ' {
+                            index += 1;
+                        }
+
+                        if matches!(
+                            word.as_str(),
+                            "fonttbl"
+                                | "colortbl"
+                                | "stylesheet"
+                                | "info"
+                                | "pict"
+                                | "object"
+                                | "header"
+                                | "footer"
+                        ) {
+                            state.ignorable = true;
+                        } else if word == "uc" {
+                            state.unicode_fallback = parameter.unwrap_or(1).max(0) as usize;
+                        } else if word == "u" {
+                            if let Some(value) = parameter {
+                                let scalar = if value < 0 {
+                                    (value + 65_536) as u32
+                                } else {
+                                    value as u32
+                                };
+                                if !state.ignorable {
+                                    if let Some(character) = char::from_u32(scalar) {
+                                        output.push(character);
+                                    }
+                                }
+                                for _ in 0..state.unicode_fallback {
+                                    index = skip_rtf_fallback(&chars, index);
+                                }
+                            }
+                        } else if !state.ignorable {
+                            match word.as_str() {
+                                "par" | "line" => output.push('\n'),
+                                "tab" => output.push('\t'),
+                                "emdash" => output.push('\u{2014}'),
+                                "endash" => output.push('\u{2013}'),
+                                "bullet" => output.push('•'),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            '\n' | '\r' => index += 1,
+            character => {
+                if !state.ignorable {
+                    output.push(character);
+                }
+                index += 1;
+            }
+        }
+    }
+    output
+}
+
+fn skip_rtf_fallback(chars: &[char], mut index: usize) -> usize {
+    if index >= chars.len() {
+        return index;
+    }
+    if chars[index] == '\\' && index + 1 < chars.len() {
+        index += 1;
+        if chars[index] == '\'' {
+            return (index + 3).min(chars.len());
+        }
+        return (index + 1).min(chars.len());
+    }
+    index + 1
 }
 
 // ── Archive ───────────────────────────────────────────────────────────────────
@@ -3133,6 +3407,79 @@ fn render_archive(p: &PathBuf) -> PreviewContent {
 
 // ── Text / code ───────────────────────────────────────────────────────────────
 
+fn decode_text_bytes(bytes: &[u8]) -> Option<String> {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8(bytes[3..].to_vec()).ok();
+    }
+    if bytes.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) {
+        return decode_utf32(&bytes[4..], true);
+    }
+    if bytes.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) {
+        return decode_utf32(&bytes[4..], false);
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        return Some(decode_utf16(&bytes[2..], true));
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        return Some(decode_utf16(&bytes[2..], false));
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return Some(text.to_string());
+    }
+
+    let sample = &bytes[..bytes.len().min(8192)];
+    let even_nuls = sample.iter().step_by(2).filter(|byte| **byte == 0).count();
+    let odd_nuls = sample
+        .iter()
+        .skip(1)
+        .step_by(2)
+        .filter(|byte| **byte == 0)
+        .count();
+    let pairs = sample.len().div_ceil(2).max(1);
+    if odd_nuls * 2 > pairs {
+        return Some(decode_utf16(bytes, true));
+    }
+    if even_nuls * 2 > pairs {
+        return Some(decode_utf16(bytes, false));
+    }
+
+    let controls = sample
+        .iter()
+        .filter(|byte| **byte < 0x20 && !matches!(**byte, b'\t' | b'\n' | b'\r'))
+        .count();
+    if sample.contains(&0) || controls.saturating_mul(50) > sample.len().max(1) {
+        return None;
+    }
+    let (decoded, _, _) = encoding_rs::WINDOWS_1252.decode(bytes);
+    Some(decoded.into_owned())
+}
+
+fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
+    let units = bytes.chunks_exact(2).map(|pair| {
+        if little_endian {
+            u16::from_le_bytes([pair[0], pair[1]])
+        } else {
+            u16::from_be_bytes([pair[0], pair[1]])
+        }
+    });
+    std::char::decode_utf16(units)
+        .map(|value| value.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect()
+}
+
+fn decode_utf32(bytes: &[u8], little_endian: bool) -> Option<String> {
+    let mut output = String::new();
+    for chunk in bytes.chunks_exact(4) {
+        let value = if little_endian {
+            u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+        } else {
+            u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+        };
+        output.push(char::from_u32(value)?);
+    }
+    Some(output)
+}
+
 fn text_preview(p: &PathBuf) -> PreviewContent {
     let header = meta_header(p);
     let bytes = match fs::read(p) {
@@ -3147,9 +3494,7 @@ fn text_preview(p: &PathBuf) -> PreviewContent {
         }
     };
 
-    // Binary detection: null bytes in first 8KB
-    let sample = &bytes[..bytes.len().min(8192)];
-    if sample.contains(&0u8) {
+    let Some(text) = decode_text_bytes(&bytes) else {
         let hex_lines = render_hex_lines(&bytes);
         let mut lines = header;
         lines.push(Line::from(Span::styled(
@@ -3170,10 +3515,7 @@ fn text_preview(p: &PathBuf) -> PreviewContent {
         ]));
         lines.extend(hex_lines);
         return PreviewContent::Highlighted(lines);
-    }
-
-    let text = String::from_utf8(bytes.clone())
-        .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned());
+    };
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
 
     let ext = p
@@ -3204,7 +3546,7 @@ fn text_preview(p: &PathBuf) -> PreviewContent {
                     format!("{:>width$}", index + 1, width = gutter_digits),
                     Style::default().fg(SH_LN),
                 ),
-                Span::styled("│ ", Style::default().fg(SH_CMT)),
+                Span::styled("│", Style::default().fg(SH_CMT)),
                 Span::styled(line.to_string(), Style::default().fg(SH_FG)),
             ])
         }));
@@ -3315,43 +3657,73 @@ fn is_code(ext: &str) -> bool {
 
 fn xml_text(xml: &str) -> String {
     let mut out = String::new();
-    let b = xml.as_bytes();
-    let mut i = 0;
     let mut in_tag = false;
     let mut tag = String::new();
     let mut collect = false;
 
-    while i < b.len() {
-        match b[i] {
-            b'<' => {
+    for character in xml.chars() {
+        match character {
+            '<' => {
                 in_tag = true;
                 tag.clear();
-                i += 1;
             }
-            b'>' if in_tag => {
+            '>' if in_tag => {
                 in_tag = false;
-                let t = tag.trim_start_matches('/');
+                let trimmed = tag.trim();
+                let closing = trimmed.starts_with('/');
+                let t = trimmed.trim_start_matches('/');
                 let name = t.split_whitespace().next().unwrap_or("");
-                collect = matches!(name, "w:t" | "a:t" | "t" | "w:delText");
-                if matches!(name, "w:p" | "/w:p" | "a:p" | "/a:p" | "w:br") {
+                collect = !closing && matches!(name, "w:t" | "a:t" | "t" | "w:delText");
+                if (closing && matches!(name, "w:p" | "a:p")) || name == "w:br" {
                     out.push('\n');
                 }
-                i += 1;
             }
             _ if in_tag => {
-                tag.push(b[i] as char);
-                i += 1;
+                tag.push(character);
             }
             _ if collect => {
-                out.push(b[i] as char);
-                i += 1;
+                out.push(character);
             }
-            _ => {
-                i += 1;
-            }
+            _ => {}
         }
     }
-    out
+    decode_xml_entities(&out)
+}
+
+fn decode_xml_entities(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('&') {
+        output.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let Some(end) = rest.find(';') else {
+            output.push_str(rest);
+            return output;
+        };
+        let entity = &rest[1..end];
+        let decoded = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            value if value.starts_with("#x") => u32::from_str_radix(&value[2..], 16)
+                .ok()
+                .and_then(char::from_u32),
+            value if value.starts_with('#') => {
+                value[1..].parse::<u32>().ok().and_then(char::from_u32)
+            }
+            _ => None,
+        };
+        if let Some(character) = decoded {
+            output.push(character);
+        } else {
+            output.push_str(&rest[..=end]);
+        }
+        rest = &rest[end + 1..];
+    }
+    output.push_str(rest);
+    output
 }
 
 // ── Save file (edit mode) ─────────────────────────────────────────────────────
@@ -3493,7 +3865,7 @@ mod tests {
             PreviewContent::Code(lines) => {
                 assert_eq!(lines.len(), 2);
                 assert_eq!(lines[0].spans[0].content.as_ref(), "1");
-                assert_eq!(lines[0].spans[1].content.as_ref(), "│ ");
+                assert_eq!(lines[0].spans[1].content.as_ref(), "│");
                 assert_eq!(lines[0].spans[2].content.as_ref(), "alpha");
                 assert_ne!(lines[0].spans[0].style.fg, lines[0].spans[2].style.fg);
             }
@@ -3511,11 +3883,11 @@ mod tests {
             .join("\n");
         let lines = highlight_code_with_limit(&source, "py", 400);
 
-        assert_eq!(lines[0].spans[0].content.as_ref(), "  1│ ");
-        assert_eq!(lines[98].spans[0].content.as_ref(), " 99│ ");
-        assert_eq!(lines[99].spans[0].content.as_ref(), "100│ ");
-        assert_eq!(lines[104].spans[0].content.as_ref(), "105│ ");
-        assert!(lines.iter().all(|line| line.spans[0].width() == 5));
+        assert_eq!(lines[0].spans[0].content.as_ref(), "  1│");
+        assert_eq!(lines[98].spans[0].content.as_ref(), " 99│");
+        assert_eq!(lines[99].spans[0].content.as_ref(), "100│");
+        assert_eq!(lines[104].spans[0].content.as_ref(), "105│");
+        assert!(lines.iter().all(|line| line.spans[0].width() == 4));
     }
 
     #[test]
@@ -3537,7 +3909,7 @@ mod tests {
         match text_preview(&path) {
             PreviewContent::Code(lines) => {
                 assert_eq!(lines.len(), 710);
-                assert_eq!(lines[709].spans[0].content.as_ref(), "710│ ");
+                assert_eq!(lines[709].spans[0].content.as_ref(), "710│");
             }
             _ => panic!("Python should use the full code preview"),
         }
@@ -3669,6 +4041,76 @@ mod tests {
             }
             _ => panic!("Tamil text must remain a highlighted text preview"),
         }
+    }
+
+    #[test]
+    fn text_decoder_handles_tamil_utf8_and_utf16_without_binary_fallback() {
+        let tamil = "தமிழ் முன்னோட்டம்";
+        assert_eq!(decode_text_bytes(tamil.as_bytes()).as_deref(), Some(tamil));
+
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in tamil.encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert_eq!(decode_text_bytes(&utf16).as_deref(), Some(tamil));
+    }
+
+    #[test]
+    fn rtf_unicode_escapes_preserve_tamil_and_paragraphs() {
+        let content = r#"{\rtf1\ansi\uc1 \u2980?\u2990?\u3007?\u2996?\u3021?\par next}"#;
+        let decoded = decode_rtf_text(content);
+        assert_eq!(decoded, "தமிழ்\nnext");
+    }
+
+    #[test]
+    fn office_xml_preserves_utf8_and_decodes_entities() {
+        let xml = "<w:p><w:r><w:t>தமிழ் &amp; &#x0B95;</w:t></w:r></w:p>";
+        assert_eq!(xml_text(xml), "தமிழ் & க\n");
+    }
+
+    #[test]
+    fn preview_cache_distinguishes_image_rotation() {
+        let path = std::env::temp_dir().join(format!(
+            "rusty-ranger-rotation-cache-{}-{}.png",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        image::DynamicImage::new_rgb8(2, 3).save(&path).unwrap();
+
+        let first = render(
+            &path,
+            0,
+            false,
+            crate::state::OfficeRenderMode::Text,
+            crate::state::PdfRenderMode::Text,
+            0,
+        );
+        let rotated = render(
+            &path,
+            90,
+            false,
+            crate::state::OfficeRenderMode::Text,
+            crate::state::PdfRenderMode::Text,
+            0,
+        );
+        match (first, rotated) {
+            (PreviewContent::ImageFallback(first), PreviewContent::ImageFallback(rotated)) => {
+                assert_eq!(first.dimensions, Some((2, 3)));
+                assert_eq!(rotated.dimensions, Some((3, 2)));
+            }
+            _ => panic!("PNG previews should use the image path"),
+        }
+
+        invalidate_preview_path(&path);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn text_decoder_rejects_binary_control_data() {
+        assert!(decode_text_bytes(&[0, 1, 2, 3, 4, 5, 0, 255]).is_none());
     }
 
     #[test]
