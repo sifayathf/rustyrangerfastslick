@@ -50,6 +50,8 @@ pub fn draw(f: &mut Frame, app: &AppState) {
     geo.pane_level_indices.clear();
     geo.preview_rect = None;
     geo.row_rects.clear();
+    geo.tile_columns = 1;
+    geo.tile_visible_items = 0;
     geo.divider_rects.clear();
     geo.sidebar_item_rects.clear();
     geo.toggle_rects.clear();
@@ -551,7 +553,7 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
             "▣",
             "View",
             "Miller",
-            "Win",
+            "Tiles",
             app.layout_mode == LayoutMode::Explorer,
             crate::state::ToggleAction::LayoutMode,
         );
@@ -560,9 +562,9 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
             geo,
             &mut y,
             "⚡",
-            "Fast",
-            "Norm",
-            "Ultra",
+            "Mode",
+            "Normal",
+            "Blitz",
             app.ultra_fast,
             crate::state::ToggleAction::UltraFast,
         );
@@ -1494,11 +1496,11 @@ fn draw_panes(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeometr
         let Some(level) = app.levels.get(level_index) else {
             return;
         };
-        let show_preview = !level.files.is_empty() && area.width >= 64;
+        let show_preview = !level.files.is_empty() && area.width >= 80;
         let chunks = if show_preview {
             Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(44), Constraint::Min(0)])
+                .constraints([Constraint::Percentage(72), Constraint::Min(0)])
                 .split(area)
         } else {
             Layout::default()
@@ -1509,7 +1511,7 @@ fn draw_panes(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeometr
 
         geo.pane_rects.push(chunks[0]);
         geo.pane_level_indices.insert(0, level_index);
-        draw_dir_pane(f, app, level, true, chunks[0], geo, 0);
+        draw_tile_pane(f, app, level, chunks[0], geo, 0);
         if show_preview {
             geo.preview_rect = Some(chunks[1]);
             draw_preview_pane(f, app, level, chunks[1], geo);
@@ -1606,6 +1608,211 @@ fn draw_panes(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeometr
             draw_preview_pane(f, app, current, chunks[np], geo);
         }
     }
+}
+
+/// Windows-style Tiles view: items flow left-to-right in a responsive grid,
+/// with an icon, filename, type, size, and modified date in each tile. The
+/// whole tile is the hit target, so hover and selection remain immediate.
+fn tile_grid_dimensions(width: u16, height: u16) -> (usize, usize, usize, u16) {
+    const IDEAL_TILE_WIDTH: u16 = 30;
+    const TILE_HEIGHT: u16 = 5;
+    let columns = (width / IDEAL_TILE_WIDTH).max(1) as usize;
+    let rows = (height / TILE_HEIGHT).max(1) as usize;
+    let visible = columns.saturating_mul(rows);
+    let tile_width = (width / columns as u16).max(1);
+    (columns, rows, visible, tile_width)
+}
+
+fn draw_tile_pane(
+    f: &mut Frame,
+    app: &AppState,
+    level: &DirLevel,
+    area: Rect,
+    geo: &mut LayoutGeometry,
+    pane_idx: usize,
+) {
+    let t = app.theme();
+    let title = level
+        .path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| level.path.display().to_string());
+    let filtered_indices = level
+        .files
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            (!app.search_active
+                || app.search_query.is_empty()
+                || crate::state::filename_matches(entry, &app.search_query))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let title_text = format!(
+        " {} · Tiles · {} {} · {} items ",
+        if title.is_empty() { "/" } else { &title },
+        app.sort_mode.label(),
+        if app.sort_descending { "↓" } else { "↑" },
+        filtered_indices.len(),
+    );
+    let block = Block::default()
+        .title(title_text.clone())
+        .title_style(Style::default().fg(t.accent).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(t.border))
+        .style(Style::default().bg(t.bg_panel));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    const TILE_HEIGHT: u16 = 5;
+    let (columns, _rows, visible_items, tile_width) =
+        tile_grid_dimensions(inner.width, inner.height);
+    geo.tile_columns = columns;
+    geo.tile_visible_items = visible_items;
+
+    let selected_position = filtered_indices
+        .iter()
+        .position(|index| *index == level.selected)
+        .unwrap_or(0);
+    let start = if app.search_active && !app.search_query.is_empty() {
+        selected_position
+            .saturating_sub(visible_items.saturating_sub(columns) / 2)
+            .div_euclid(columns)
+            * columns
+    } else {
+        level
+            .scroll
+            .min(filtered_indices.len().saturating_sub(visible_items))
+            .div_euclid(columns)
+            * columns
+    };
+    let mut hitboxes = Vec::new();
+
+    for (slot, file_index) in filtered_indices
+        .iter()
+        .skip(start)
+        .take(visible_items)
+        .enumerate()
+    {
+        let file_index = *file_index;
+        let entry = &level.files[file_index];
+        let column = slot % columns;
+        let row = slot / columns;
+        let x = inner.x + column as u16 * tile_width;
+        let right = if column + 1 == columns {
+            inner.x + inner.width
+        } else {
+            x + tile_width
+        };
+        let rect = Rect {
+            x,
+            y: inner.y + row as u16 * TILE_HEIGHT,
+            width: right.saturating_sub(x),
+            height: TILE_HEIGHT.min(inner.y + inner.height - (inner.y + row as u16 * TILE_HEIGHT)),
+        };
+        if rect.width == 0 || rect.height == 0 {
+            continue;
+        }
+        hitboxes.push((file_index, rect));
+
+        let is_selected = file_index == level.selected;
+        let is_hovered = app.hovered_row == Some((pane_idx, file_index));
+        let is_marked = level.marked.contains(&entry.path);
+        let background = if is_selected {
+            t.sel_bg
+        } else if is_hovered {
+            t.sel_bg_inactive
+        } else {
+            t.bg_panel
+        };
+        let border_color = if is_selected {
+            t.accent
+        } else if is_hovered {
+            t.accent2
+        } else {
+            t.bg_panel
+        };
+        let tile_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(if app.rounded_selection {
+                BorderType::Rounded
+            } else {
+                BorderType::Plain
+            })
+            .border_style(Style::default().fg(border_color).bg(background))
+            .style(Style::default().bg(background));
+        let tile_inner = tile_block.inner(rect);
+        f.render_widget(tile_block, rect);
+
+        let name = entry
+            .path
+            .file_name()
+            .unwrap_or_else(|| entry.path.as_os_str())
+            .to_string_lossy();
+        let extension = entry
+            .path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        let (icon, icon_color) = if entry.is_dir {
+            (get_icon_set().folder, t.folder)
+        } else {
+            file_icon(extension)
+        };
+        let type_label = if entry.is_dir {
+            "File folder".to_string()
+        } else if extension.is_empty() {
+            "File".to_string()
+        } else {
+            format!("{} file", extension.to_ascii_uppercase())
+        };
+        let details = if entry.is_dir {
+            compact_modified(entry.modified)
+        } else {
+            format!(
+                "{} · {}",
+                compact_size(entry.size),
+                compact_modified(entry.modified)
+            )
+        };
+        let name_budget = usize::from(tile_inner.width).saturating_sub(4).max(4);
+        let marker = if is_marked { "✓ " } else { "" };
+        let lines = vec![
+            Line::from(vec![
+                Span::styled(icon, Style::default().fg(icon_color).bg(background)),
+                Span::raw("  "),
+                Span::styled(
+                    format!("{}{}", marker, truncate(&name, name_budget)),
+                    Style::default()
+                        .fg(if is_selected { t.accent } else { t.text })
+                        .bg(background)
+                        .add_modifier(if is_selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+            ]),
+            Line::from(Span::styled(
+                format!("    {}", truncate(&type_label, name_budget)),
+                Style::default().fg(t.text_soft).bg(background),
+            )),
+            Line::from(Span::styled(
+                format!("    {}", truncate(&details, name_budget)),
+                Style::default().fg(t.muted).bg(background),
+            )),
+        ];
+        f.render_widget(Paragraph::new(lines), tile_inner);
+    }
+    geo.row_rects.insert(pane_idx, hitboxes);
+    geo.pane_sort_rect = Some(Rect {
+        x: area.x.saturating_add(1),
+        y: area.y,
+        width: UnicodeWidthStr::width(title_text.as_str())
+            .min(area.width.saturating_sub(2) as usize) as u16,
+        height: 1,
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2304,6 +2511,24 @@ fn draw_preview_pane(
 
     let scroll = app.preview_scroll as u16;
 
+    if app.preview_debounce_active() {
+        app.native_preview.hide();
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " BLITZ ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(t.accent2)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  Settling selection…", Style::default().fg(C_MUTED)),
+            ])),
+            inner,
+        );
+        return;
+    }
+
     match preview::render(
         &selected.path,
         app.image_rotation,
@@ -2311,12 +2536,14 @@ fn draw_preview_pane(
         app.office_mode,
         app.pdf_mode,
         app.pptx_slide_index,
+        app.ultra_fast,
     ) {
         PreviewContent::Text(txt) => {
             app.native_preview.hide();
             let padded: Vec<String> = txt.lines().map(|line| format!("  {}", line)).collect();
             let para = Paragraph::new(padded.join("\n"))
                 .style(Style::default().fg(C_TEXT_SOFT))
+                .wrap(Wrap { trim: false })
                 .scroll((scroll, 0));
             f.render_widget(para, inner);
         }
@@ -2328,7 +2555,9 @@ fn draw_preview_pane(
                 spans.insert(0, Span::raw("  "));
                 padded_lines.push(Line::from(spans));
             }
-            let para = Paragraph::new(Text::from(padded_lines)).scroll((scroll, 0));
+            let para = Paragraph::new(Text::from(padded_lines))
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0));
             f.render_widget(para, inner);
         }
         PreviewContent::Code(lines) => {
@@ -2341,43 +2570,68 @@ fn draw_preview_pane(
             let para = Paragraph::new(Text::from(theme_preview_lines(visible, app.theme_mode)));
             f.render_widget(para, inner);
         }
+        PreviewContent::Status(info) => {
+            app.native_preview.hide();
+            let (badge, color) = match info.kind {
+                preview::PreviewStatusKind::Loading => ("RENDERING", C_WARN),
+                preview::PreviewStatusKind::Fallback => ("FALLBACK", C_WARN),
+                preview::PreviewStatusKind::Unsupported => ("UNSUPPORTED", C_MUTED),
+                preview::PreviewStatusKind::Failed => ("FAILED", t.err),
+                preview::PreviewStatusKind::Info => ("INFO", t.accent2),
+            };
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        format!(" {badge} "),
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        info.title,
+                        Style::default().fg(C_TEXT).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(info.detail, Style::default().fg(C_TEXT_SOFT)),
+                ]),
+            ];
+            if let Some(renderer) = info.renderer {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled("Renderer: ", Style::default().fg(C_MUTED)),
+                    Span::styled(renderer, Style::default().fg(color)),
+                ]));
+            }
+            if let Some(action) = info.action {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(action, Style::default().fg(C_MUTED)),
+                ]));
+            }
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "─".repeat((inner.width as usize).saturating_sub(4)),
+                    Style::default().fg(C_BORDER_LO),
+                ),
+            ]));
+            for line in theme_preview_lines(info.lines, app.theme_mode) {
+                let mut spans = line.spans;
+                spans.insert(0, Span::raw("  "));
+                lines.push(Line::from(spans));
+            }
+            let para = Paragraph::new(Text::from(lines))
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0));
+            f.render_widget(para, inner);
+        }
         PreviewContent::ImageFallback(info) => {
             let mut top_margin = 0;
-            if let Some(img) = &info.img {
-                let (cols, rows) = crossterm::terminal::size().unwrap_or((0, 0));
-                let mut img_rect = inner;
-                if img_rect.height > 6 {
-                    img_rect.y += 4;
-                    img_rect.height -= 4;
-                }
-                if app.mode == AppMode::Normal {
-                    let background = match t.bg_panel {
-                        Color::Rgb(r, g, b) => {
-                            u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16)
-                        }
-                        Color::White => 0x00FF_FFFF,
-                        _ => 30 | (30 << 8) | (46 << 16),
-                    };
-                    app.native_preview.show(
-                        std::sync::Arc::clone(img),
-                        info.path.clone(),
-                        app.image_rotation,
-                        app.image_flip_h,
-                        app.image_zoom,
-                        img_rect,
-                        cols,
-                        rows,
-                        background,
-                        app.ultra_fast,
-                    );
-                } else {
-                    app.native_preview.hide();
-                }
-                top_margin = img_rect.y - inner.y;
-            } else {
-                app.native_preview.hide();
-            }
-
             let mut text = vec![Line::from(vec![
                 Span::raw("  "),
                 Span::styled(
@@ -2426,6 +2680,10 @@ fn draw_preview_pane(
             if app.image_flip_h {
                 meta_str.push_str("  |  Flipped");
             }
+            if let Some(caption) = &info.caption {
+                meta_str.push_str("  |  ");
+                meta_str.push_str(caption);
+            }
             text.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(meta_str, Style::default().fg(C_MUTED)),
@@ -2446,6 +2704,48 @@ fn draw_preview_pane(
                     Style::default().fg(C_BORDER_LO),
                 ),
             ]));
+
+            if let Some(img) = &info.img {
+                let available_width = usize::from(inner.width.max(1));
+                let header_rows = text
+                    .iter()
+                    .map(|line| line.width().max(1).div_ceil(available_width))
+                    .sum::<usize>()
+                    .min(usize::from(inner.height.saturating_sub(1)))
+                    as u16;
+                let mut img_rect = inner;
+                if img_rect.height > header_rows.saturating_add(2) {
+                    img_rect.y = img_rect.y.saturating_add(header_rows);
+                    img_rect.height = img_rect.height.saturating_sub(header_rows);
+                }
+                let (cols, rows) = crossterm::terminal::size().unwrap_or((0, 0));
+                if app.mode == AppMode::Normal {
+                    let background = match t.bg_panel {
+                        Color::Rgb(r, g, b) => {
+                            u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16)
+                        }
+                        Color::White => 0x00FF_FFFF,
+                        _ => 30 | (30 << 8) | (46 << 16),
+                    };
+                    app.native_preview.show(
+                        std::sync::Arc::clone(img),
+                        info.path.clone(),
+                        app.image_rotation,
+                        app.image_flip_h,
+                        app.image_zoom,
+                        img_rect,
+                        cols,
+                        rows,
+                        background,
+                        app.ultra_fast,
+                    );
+                } else {
+                    app.native_preview.hide();
+                }
+                top_margin = img_rect.y.saturating_sub(inner.y);
+            } else {
+                app.native_preview.hide();
+            }
 
             for _ in 0..top_margin.saturating_sub(text.len() as u16) {
                 text.push(Line::from(""));
@@ -2903,7 +3203,7 @@ fn draw_status_bar(f: &mut Frame, app: &AppState, area: Rect) {
 
 #[cfg(test)]
 mod tests {
-    use super::{truncate, PILL_LEFT_CAP, PILL_RIGHT_CAP};
+    use super::{tile_grid_dimensions, truncate, PILL_LEFT_CAP, PILL_RIGHT_CAP};
     use unicode_width::UnicodeWidthStr;
 
     #[test]
@@ -2917,5 +3217,12 @@ mod tests {
         assert!(UnicodeWidthStr::width(value.as_str()) <= 7);
         assert!(!value.contains(char::REPLACEMENT_CHARACTER));
         assert!(value.ends_with('…'));
+    }
+
+    #[test]
+    fn windows_tiles_reflow_without_losing_capacity() {
+        assert_eq!(tile_grid_dimensions(29, 4), (1, 1, 1, 29));
+        assert_eq!(tile_grid_dimensions(60, 10), (2, 2, 4, 30));
+        assert_eq!(tile_grid_dimensions(95, 20), (3, 4, 12, 31));
     }
 }

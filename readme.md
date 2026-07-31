@@ -1,20 +1,21 @@
 # 🤠 rusty-ranger-fast (Windows Edition)
 
-`rusty-ranger-fast` is a blazing-fast terminal file manager written in Rust, built on top of `ratatui` and `crossterm`. It is designed with power-users in mind, featuring ultra-fast multi-pane navigation, custom directory caching, and a rich, multi-format file preview engine.
+`rusty-ranger-fast` is a Windows-first terminal file manager written in Rust with `ratatui` and `crossterm`. It combines Miller-column navigation with a Windows-style Tiles view, asynchronous file operations, live directory watching, and a multi-format preview engine.
 
-This edition features a cross-platform backend optimized for Windows terminal environments, rendering graphics inline using half-block terminal graphics (`viuer`), alongside native support for Linux/macOS with X11/Wayland pixel-perfect `ueberzugpp` overlay integration.
+On Windows, decoded images and rendered document pages are displayed in a mouse-transparent native overlay aligned to the exact preview-cell rectangle. Text and code remain in the terminal grid.
 
 ---
 
 ## ✨ Features
 
-*   **⚡ High-Speed Navigation**: Uses a high-performance directory caching system with configurable time-to-live (TTL) and size caps.
+*   **⚡ Responsive Navigation**: Coalesced pointer input, event-driven redraws, asynchronous directory scans and file operations, live file-system watching, and a Blitz profile that defers expensive previews.
+*   **🗂️ Two Views**: Toggle between Miller columns and a responsive Windows-style Tiles grid with icon, name, type, size, modified date, hover, selection, and a details preview.
 *   **🖼️ Rich File Preview Engine**:
     *   **Images**: Supported formats: `jpg`, `jpeg`, `png`, `bmp`, `gif`, `webp`, `tiff`, `ico`. Includes zoom, rotate, and horizontal flip transforms.
     *   **Documents & Code**: Fully syntax-highlighted previews for code/text files with a beautiful **Catppuccin Mocha** palette.
-    *   **PDFs & Office**: Text previews for `.pdf`, `.docx`, `.xlsx`, `.pptx`, `.ods`, `.xls`, `.ppt`.
+    *   **PDFs & Office**: Explicit Text/Visual states for PDF, DOC/DOCX/ODT, XLS/XLSX/ODS, and PPT/PPTX/ODP. Full rendering uses LibreOffice/OpenOffice, Microsoft Office automation, Poppler, or MuPDF and reports loading/fallback/failure honestly.
     *   **Data & Structure**: Formatted rendering of Jupyter Notebooks (`.ipynb`), `.csv`, `.tsv`, and `.rtf`.
-    *   **Archives & Media**: View directory listings of archives (`.zip`, `.tar`, `.gz`, etc.), metadata of audio files (duration, bitrates, etc.), and video files.
+    *   **Archives & Media**: Archive listings, audio metadata, animated-GIF external playback, and asynchronous video thumbnails. Press `Enter` or `Space` to play media in the default Windows application.
 *   **✏️ Inline Text Editor**: Jump directly into any editable text/code file within the preview pane with one keypress, edit inline, and save changes immediately.
 *   **💻 Windows & Unix Native**: Enumerates Windows drive letters (`A:\` through `Z:\`) natively, and supports fallback path configurations.
 
@@ -25,8 +26,9 @@ This edition features a cross-platform backend optimized for Windows terminal en
 ### 1. General Navigation
 | Key | Action |
 | :--- | :--- |
-| `h` / `Left Arrow` | Navigate up to the parent directory (Left pane) |
-| `l` / `Right Arrow` / `Enter` | Open folder or file (Right pane) |
+| `h` / `Left Arrow` | Navigate to the parent in Miller view; move one tile left in Tiles view |
+| `l` / `Right Arrow` | Open a child pane in Miller view; move one tile right in Tiles view |
+| `Enter` | Open the selected folder or file |
 | `k` / `Up Arrow` | Scroll up in the directory list |
 | `j` / `Down Arrow` | Scroll down in the directory list |
 | `g` | Jump to the **top** of the directory list |
@@ -44,6 +46,7 @@ This edition features a cross-platform backend optimized for Windows terminal en
 | `Ctrl + s` | Save edited file (Only when in Edit mode) |
 | `Esc` | Exit Edit mode without saving / Quit application (from general mode) |
 | `q` | Quit application (Only when not in edit mode) |
+| `Space` | Play the selected video, audio, or animated GIF externally |
 
 ### 3. Image Transform Controls
 *(Active when hovering over any image format)*
@@ -62,7 +65,8 @@ This edition features a cross-platform backend optimized for Windows terminal en
 
 ### Requirements
 *   **Rust Compiler** (v1.56 or later). [Install Rust](https://www.rust-lang.org/tools/install).
-*   *Optional (Unix-only)*: `ueberzugpp` for pixel-perfect overlays. On Windows, inline half-block rendering is used automatically.
+*   **Windows Terminal** is recommended and configured automatically when available.
+*   Optional visual backends: LibreOffice/OpenOffice or Microsoft Office; Poppler or MuPDF for PDF rasterization; FFmpeg for video thumbnails.
 
 ### 🚀 Quick Start (Precompiled Binary)
 If you are on Windows, you can run the application immediately without installing Rust:

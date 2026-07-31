@@ -323,6 +323,13 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_NCHITTEST => HTTRANSPARENT as LRESULT,
+        // The host is responsible for recomputing the exact terminal-cell
+        // rectangle. Invalidating here prevents a stale bitmap when Windows
+        // moves the terminal between monitors or applies a new DPI.
+        WM_DPICHANGED | WM_WINDOWPOSCHANGED => {
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_DESTROY => 0,
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
@@ -403,7 +410,7 @@ fn native_window_thread(rx: Receiver<PreviewCmd>, newest_generation: Arc<AtomicU
         let mut last_term_cols: u16 = 0;
         let mut last_term_rows: u16 = 0;
         let mut last_applied_rect: (i32, i32, i32, i32) = (i32::MIN, 0, 0, 0);
-        let mut last_shown: Option<(Arc<DynamicImage>, f32, TuiRect, u16, u16)> = None;
+        let mut last_shown: Option<(Arc<DynamicImage>, f32, TuiRect, u16, u16, bool)> = None;
         let mut is_visible = false;
         let mut ultra_fast = false;
         let mut last_resync_at = std::time::Instant::now();
@@ -433,7 +440,7 @@ fn native_window_thread(rx: Receiver<PreviewCmd>, newest_generation: Arc<AtomicU
                 // Nothing new to show, but periodically re-check the terminal's
                 // on-screen position so the overlay follows a dragged/moved
                 // window. This is position-only: no image decode, no resize.
-                if let Some((img, zoom, cell_rect, cols, rows)) = last_shown.clone() {
+                if let Some((img, zoom, cell_rect, cols, rows, fast_scaling)) = last_shown.clone() {
                     reposition_overlay(
                         hwnd,
                         &img,
@@ -448,6 +455,7 @@ fn native_window_thread(rx: Receiver<PreviewCmd>, newest_generation: Arc<AtomicU
                         &mut last_applied_rect,
                         state_ptr,
                         false,
+                        fast_scaling,
                     );
                 }
                 last_resync_at = std::time::Instant::now();
@@ -506,11 +514,19 @@ fn native_window_thread(rx: Receiver<PreviewCmd>, newest_generation: Arc<AtomicU
                                 &mut last_applied_rect,
                                 state_ptr,
                                 true,
+                                requested_ultra,
                             );
                             if generation == newest_generation.load(Ordering::Acquire) {
                                 ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                                 is_visible = true;
-                                last_shown = Some((img, zoom, cell_rect, term_cols, term_rows));
+                                last_shown = Some((
+                                    img,
+                                    zoom,
+                                    cell_rect,
+                                    term_cols,
+                                    term_rows,
+                                    requested_ultra,
+                                ));
                                 last_key = Some(key);
                                 last_resync_at = std::time::Instant::now();
                             }
@@ -538,7 +554,9 @@ fn native_window_thread(rx: Receiver<PreviewCmd>, newest_generation: Arc<AtomicU
                 }
             }
             if ultra_fast {
-                thread::yield_now();
+                // A one-millisecond wait is below a display frame while
+                // avoiding the 100% CPU busy-spin caused by yield_now().
+                thread::sleep(std::time::Duration::from_millis(1));
             } else {
                 thread::sleep(std::time::Duration::from_millis(16));
             }
@@ -565,6 +583,7 @@ unsafe fn reposition_overlay(
     last_applied_rect: &mut (i32, i32, i32, i32),
     state_ptr: *mut Mutex<WindowState>,
     allow_resize: bool,
+    fast_scaling: bool,
 ) {
     if term_cols == 0 || term_rows == 0 {
         return;
@@ -591,7 +610,9 @@ unsafe fn reposition_overlay(
             );
             if !bridge.is_null() {
                 let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(*cached_term_hwnd);
-                let pad = (8.0f32 * (dpi as f32) / 96.0f32).round() as i32;
+                // The bundled Windows Terminal profile specifies 2px padding.
+                // Keep it DPI-aware; the old guessed 8px caused visible drift.
+                let pad = (2.0f32 * (dpi as f32) / 96.0f32).round() as i32;
                 (bridge, pad)
             } else {
                 (*cached_term_hwnd, 0)
@@ -614,16 +635,12 @@ unsafe fn reposition_overlay(
     let grid_width = (width - 2 * padding).max(1);
     let grid_height = (height - 2 * padding).max(1);
 
-    let cw = (grid_width / term_cols as i32).max(1);
-    let ch = (grid_height / term_rows as i32).max(1);
-
     let mut pt = POINT { x: 0, y: 0 };
     ClientToScreen(bridge_hwnd, &mut pt);
-
-    let px = pt.x + padding + cell_rect.x as i32 * cw;
-    let py = pt.y + padding + cell_rect.y as i32 * ch;
-    let pw = cell_rect.width as i32 * cw;
-    let ph = cell_rect.height as i32 * ch;
+    let (cell_x, cell_y, pw, ph) =
+        cell_rect_pixels(grid_width, grid_height, term_cols, term_rows, cell_rect);
+    let px = pt.x + padding + cell_x;
+    let py = pt.y + padding + cell_y;
 
     let rect_changed = (px, py, pw, ph) != *last_applied_rect;
 
@@ -662,7 +679,12 @@ unsafe fn reposition_overlay(
     // Decode/resize outside of WM_PAINT — this is the expensive step
     // (Lanczos3), so it only ever runs when the image or its target size
     // actually changed, not on every redraw tick.
-    let resized = img.resize_exact(fw, fh, image::imageops::FilterType::Lanczos3);
+    let filter = if fast_scaling {
+        image::imageops::FilterType::Triangle
+    } else {
+        image::imageops::FilterType::Lanczos3
+    };
+    let resized = img.resize_exact(fw, fh, filter);
     let bgra: Vec<u8> = resized
         .to_rgba8()
         .pixels()
@@ -676,6 +698,27 @@ unsafe fn reposition_overlay(
     }
 
     InvalidateRect(hwnd, std::ptr::null(), 0);
+}
+
+/// Convert a terminal-cell rectangle to pixel boundaries without accumulating
+/// integer-division error. Each edge is rounded independently, so the last
+/// cell always reaches the exact content edge at fractional DPI/scales.
+fn cell_rect_pixels(
+    grid_width: i32,
+    grid_height: i32,
+    term_cols: u16,
+    term_rows: u16,
+    rect: TuiRect,
+) -> (i32, i32, i32, i32) {
+    let cols = f64::from(term_cols.max(1));
+    let rows = f64::from(term_rows.max(1));
+    let x0 = (f64::from(rect.x) * f64::from(grid_width) / cols).round() as i32;
+    let y0 = (f64::from(rect.y) * f64::from(grid_height) / rows).round() as i32;
+    let x1 = (f64::from(rect.x.saturating_add(rect.width)) * f64::from(grid_width) / cols).round()
+        as i32;
+    let y1 = (f64::from(rect.y.saturating_add(rect.height)) * f64::from(grid_height) / rows).round()
+        as i32;
+    (x0, y0, (x1 - x0).max(1), (y1 - y0).max(1))
 }
 
 fn fitted_zoom_dimensions(
@@ -706,7 +749,8 @@ fn fitted_zoom_dimensions(
 
 #[cfg(test)]
 mod tests {
-    use super::fitted_zoom_dimensions;
+    use super::{cell_rect_pixels, fitted_zoom_dimensions};
+    use ratatui::layout::Rect;
 
     #[test]
     fn native_preview_zoom_fits_scales_and_caps_allocations() {
@@ -721,5 +765,22 @@ mod tests {
         let huge_zoom = fitted_zoom_dimensions(10, 10, 2_000, 2_000, 8.0).unwrap();
         assert_eq!(huge_zoom, (4096, 4096));
         assert_eq!(fitted_zoom_dimensions(0, 200, 200, 200, 1.0), None);
+    }
+
+    #[test]
+    fn terminal_cells_align_at_fractional_dpi_boundaries() {
+        let rect = Rect::new(17, 4, 83, 36);
+        for (width, height) in [(1200, 800), (1500, 1000), (1800, 1200), (2400, 1600)] {
+            let (x, y, w, h) = cell_rect_pixels(width, height, 100, 40, rect);
+            assert_eq!(x + w, width);
+            assert_eq!(y + h, height);
+            assert!(w > 0 && h > 0);
+        }
+
+        let first = cell_rect_pixels(1365, 767, 121, 41, Rect::new(0, 0, 1, 1));
+        let rest = cell_rect_pixels(1365, 767, 121, 41, Rect::new(1, 0, 120, 41));
+        assert_eq!(first.0 + first.2, rest.0);
+        assert_eq!(rest.0 + rest.2, 1365);
+        assert_eq!(rest.1 + rest.3, 767);
     }
 }

@@ -1630,6 +1630,7 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "pdf-extract",
+ "quick-xml",
  "ratatui",
  "serde_json",
  "sha2",

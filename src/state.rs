@@ -103,6 +103,7 @@ pub struct DriveInfo {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ContextAction {
     Open,
+    Play,
     OpenWith,
     Cut,
     Copy,
@@ -120,6 +121,7 @@ impl ContextAction {
     pub fn label(&self) -> &'static str {
         match self {
             ContextAction::Open => "Open",
+            ContextAction::Play => "Play",
             ContextAction::OpenWith => "Open With...",
             ContextAction::Cut => "Cut",
             ContextAction::Copy => "Copy",
@@ -368,6 +370,8 @@ pub struct LayoutGeometry {
     pub preview_rect: Option<Rect>,
     // Maps visible pane index to a list of (file_index, Rect)
     pub row_rects: HashMap<usize, Vec<(usize, Rect)>>,
+    pub tile_columns: usize,
+    pub tile_visible_items: usize,
     pub divider_rects: Vec<Rect>,
 
     // Left drive/quick-access sidebar
@@ -398,6 +402,8 @@ pub struct AppState {
     pub levels: Vec<DirLevel>,
     pub current_level: usize,
     last_event_time: Instant,
+    event_revision: u64,
+    last_selection_changed_at: Instant,
 
     // Settings & Toggles
     pub theme_mode: ThemeMode,
@@ -537,6 +543,8 @@ impl AppState {
             levels: vec![level],
             current_level: 0,
             last_event_time: Instant::now(),
+            event_revision: 0,
+            last_selection_changed_at: Instant::now(),
             theme_mode: if user_settings.theme_light {
                 ThemeMode::Light
             } else {
@@ -1006,7 +1014,7 @@ impl AppState {
             pending
         } else {
             let input_wait = if self.ultra_fast {
-                Duration::ZERO
+                Duration::from_millis(1)
             } else {
                 Duration::from_millis(16)
             };
@@ -1016,6 +1024,7 @@ impl AppState {
             event::read()?
         };
 
+        self.event_revision = self.event_revision.wrapping_add(1);
         match next_event {
             Event::Key(key) => {
                 // Releases are duplicates on Windows. Repeats are deliberate
@@ -1341,14 +1350,30 @@ impl AppState {
                     (KeyCode::Down, _) if self.mode == AppMode::Normal => self.move_down(),
                     (KeyCode::Up, _) if self.mode == AppMode::Normal => self.move_up(),
                     (KeyCode::Left, _) if self.mode == AppMode::Normal => {
-                        self.go_left()?;
-                        self.reset_image_state();
+                        if self.layout_mode == LayoutMode::Explorer {
+                            self.move_tile_horizontal(false);
+                        } else {
+                            self.go_left()?;
+                            self.reset_image_state();
+                        }
                     }
                     (KeyCode::Right, _) if self.mode == AppMode::Normal => {
-                        self.go_right()?;
-                        self.reset_image_state();
+                        if self.layout_mode == LayoutMode::Explorer {
+                            self.move_tile_horizontal(true);
+                        } else {
+                            self.go_right()?;
+                            self.reset_image_state();
+                        }
                     }
                     (KeyCode::Enter, _) if self.mode == AppMode::Normal => {
+                        self.open_selected();
+                    }
+                    (KeyCode::Char(' '), KeyModifiers::NONE)
+                        if self.mode == AppMode::Normal
+                            && self
+                                .selected_entry_path()
+                                .is_some_and(|path| crate::preview::is_media_path(&path)) =>
+                    {
                         self.open_selected();
                     }
 
@@ -1360,12 +1385,20 @@ impl AppState {
                         self.move_up()
                     }
                     (KeyCode::Char('h'), KeyModifiers::NONE) if self.mode == AppMode::Normal => {
-                        self.go_left()?;
-                        self.reset_image_state();
+                        if self.layout_mode == LayoutMode::Explorer {
+                            self.move_tile_horizontal(false);
+                        } else {
+                            self.go_left()?;
+                            self.reset_image_state();
+                        }
                     }
                     (KeyCode::Char('l'), KeyModifiers::NONE) if self.mode == AppMode::Normal => {
-                        self.go_right()?;
-                        self.reset_image_state();
+                        if self.layout_mode == LayoutMode::Explorer {
+                            self.move_tile_horizontal(true);
+                        } else {
+                            self.go_right()?;
+                            self.reset_image_state();
+                        }
                     }
 
                     // ── Jump top / bottom ────────────────────────────────────
@@ -1930,44 +1963,94 @@ impl AppState {
             return;
         }
         let pane_idx = self.current_level - start;
-        let visible = self
-            .layout_geometry
-            .lock()
-            .pane_rects
-            .get(pane_idx)
-            .map(|r| r.height.saturating_sub(2) as usize)
-            .unwrap_or(1)
-            .max(1);
+        let geometry = self.layout_geometry.lock().clone();
+        let (visible, columns) = if self.layout_mode == LayoutMode::Explorer {
+            (
+                geometry.tile_visible_items.max(1),
+                geometry.tile_columns.max(1),
+            )
+        } else {
+            (
+                geometry
+                    .pane_rects
+                    .get(pane_idx)
+                    .map(|r| r.height.saturating_sub(2) as usize)
+                    .unwrap_or(1)
+                    .max(1),
+                1,
+            )
+        };
         let cur = self.current_mut();
         if cur.selected < cur.scroll {
-            cur.scroll = cur.selected;
+            cur.scroll = (cur.selected / columns) * columns;
         } else if cur.selected >= cur.scroll.saturating_add(visible) {
-            cur.scroll = cur.selected + 1 - visible;
+            let selected_row_start = (cur.selected / columns) * columns;
+            cur.scroll = selected_row_start
+                .saturating_add(columns)
+                .saturating_sub(visible);
         }
-        cur.scroll = cur.scroll.min(cur.files.len().saturating_sub(visible));
+        let max_scroll = cur.files.len().saturating_sub(visible);
+        cur.scroll = cur.scroll.min(max_scroll).div_euclid(columns) * columns;
     }
 
     // ── Movement helpers ──────────────────────────────────────────────────────
 
     fn move_down(&mut self) {
+        let step = if self.layout_mode == LayoutMode::Explorer {
+            self.layout_geometry.lock().tile_columns.max(1)
+        } else {
+            1
+        };
         let current = self.current_mut();
         if current.files.is_empty() {
             return;
         }
-        if current.selected + 1 < current.files.len() {
-            current.selected += 1;
+        if current.selected + step < current.files.len() {
+            current.selected += step;
+            self.keep_selection_visible();
+            self.reset_image_state();
+        } else if step > 1 && current.selected + 1 < current.files.len() {
+            current.selected = current.files.len() - 1;
             self.keep_selection_visible();
             self.reset_image_state();
         }
     }
 
     fn move_up(&mut self) {
+        let step = if self.layout_mode == LayoutMode::Explorer {
+            self.layout_geometry.lock().tile_columns.max(1)
+        } else {
+            1
+        };
         let current = self.current_mut();
         if current.selected > 0 {
-            current.selected -= 1;
+            current.selected = current.selected.saturating_sub(step);
             self.keep_selection_visible();
             self.reset_image_state();
         }
+    }
+
+    fn move_tile_horizontal(&mut self, right: bool) {
+        if self.layout_mode != LayoutMode::Explorer {
+            return;
+        }
+        let columns = self.layout_geometry.lock().tile_columns.max(1);
+        let current = self.current_mut();
+        if right {
+            if current.selected + 1 < current.files.len()
+                && current.selected % columns + 1 < columns
+            {
+                current.selected += 1;
+            } else {
+                return;
+            }
+        } else if current.selected > 0 && !current.selected.is_multiple_of(columns) {
+            current.selected -= 1;
+        } else {
+            return;
+        }
+        self.keep_selection_visible();
+        self.reset_image_state();
     }
 
     fn go_right(&mut self) -> anyhow::Result<()> {
@@ -2081,11 +2164,16 @@ impl AppState {
     }
 
     fn page_down(&mut self) {
+        let page = if self.layout_mode == LayoutMode::Explorer {
+            self.layout_geometry.lock().tile_visible_items.max(1)
+        } else {
+            10
+        };
         let current = self.current_mut();
         if current.files.is_empty() {
             return;
         }
-        let target = (current.selected + 10).min(current.files.len() - 1);
+        let target = (current.selected + page).min(current.files.len() - 1);
         if current.selected != target {
             current.selected = target;
             self.keep_selection_visible();
@@ -2094,8 +2182,13 @@ impl AppState {
     }
 
     fn page_up(&mut self) {
+        let page = if self.layout_mode == LayoutMode::Explorer {
+            self.layout_geometry.lock().tile_visible_items.max(1)
+        } else {
+            10
+        };
         let current = self.current_mut();
-        let target = current.selected.saturating_sub(10);
+        let target = current.selected.saturating_sub(page);
         if current.selected != target {
             current.selected = target;
             self.keep_selection_visible();
@@ -2258,6 +2351,7 @@ impl AppState {
 
     /// Reset image transform state (called when navigating away)
     pub fn reset_image_state(&mut self) {
+        self.last_selection_changed_at = Instant::now();
         if self.edit_preview_mode {
             self.edit_preview_mode = false;
             if self.edit_dirty {
@@ -2272,6 +2366,14 @@ impl AppState {
         self.search_active = false;
         self.search_query.clear();
         self.search_original_selection = None;
+    }
+
+    pub fn preview_debounce_active(&self) -> bool {
+        self.ultra_fast && self.last_selection_changed_at.elapsed() < Duration::from_millis(24)
+    }
+
+    pub fn event_revision(&self) -> u64 {
+        self.event_revision
     }
 
     // ── Text-editing helpers for Rename / New Folder input ───────────────────
@@ -2768,6 +2870,9 @@ impl AppState {
         let mut items = Vec::new();
         if has_selection {
             items.push(ContextAction::Open);
+            if path.as_deref().is_some_and(crate::preview::is_media_path) {
+                items.push(ContextAction::Play);
+            }
             items.push(ContextAction::OpenWith);
             items.push(ContextAction::Cut);
             items.push(ContextAction::Copy);
@@ -2796,6 +2901,11 @@ impl AppState {
         self.mode = AppMode::Normal;
         match action {
             ContextAction::Open => {
+                if let Some(path) = targets.first() {
+                    self.open_path(path.clone());
+                }
+            }
+            ContextAction::Play => {
                 if let Some(path) = targets.first() {
                     self.open_path(path.clone());
                 }
@@ -2970,7 +3080,7 @@ impl AppState {
                     format!(
                         "File view: {}",
                         if self.layout_mode == LayoutMode::Explorer {
-                            "Explorer list + preview"
+                            "Windows tiles + details preview"
                         } else {
                             "Miller columns"
                         },
@@ -2985,7 +3095,7 @@ impl AppState {
                     format!(
                         "Performance: {}",
                         if self.ultra_fast {
-                            "ULTRA — zero input polling delay"
+                            "Blitz — deferred rich previews, coalesced input, fast image scaling"
                         } else {
                             "Balanced"
                         },

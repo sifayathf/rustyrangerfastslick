@@ -178,6 +178,7 @@ fn merge_json(destination: &mut serde_json::Value, source: serde_json::Value) {
 }
 
 fn main() -> anyhow::Result<()> {
+    preview::cleanup_render_cache();
     // Install panic hook to ensure terminal state is always restored
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -247,9 +248,19 @@ fn main() -> anyhow::Result<()> {
     terminal.clear()?;
 
     let mut app = AppState::new()?;
+    let mut drawn_revision = u64::MAX;
+    let mut last_draw = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .unwrap_or_else(std::time::Instant::now);
     loop {
         app.tick_background();
-        terminal.draw(|f| ui::draw(f, &app))?;
+        let revision = app.event_revision();
+        if revision != drawn_revision || last_draw.elapsed() >= std::time::Duration::from_millis(50)
+        {
+            terminal.draw(|f| ui::draw(f, &app))?;
+            drawn_revision = revision;
+            last_draw = std::time::Instant::now();
+        }
 
         if app.handle_events()? {
             break;
