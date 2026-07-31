@@ -1,0 +1,36 @@
+My PID: 18592 (hwnd_probe.exe)
+
+Process Lineage:
+  PID: 18592 -> Parent: 10720 | Exe: hwnd_probe.exe
+  PID: 10720 -> Parent: 10680 | Exe: explorer.exe
+
+GetConsoleWindow() returned: 0x290c8c
+Console Window PID: 18592 (hwnd_probe.exe)
+Console Window Class: "PseudoConsoleWindow" | Title: ""
+
+Window Traversal from GetConsoleWindow():
+HWND: 0x290c8c | Class: "PseudoConsoleWindow" | Title: "" | PID: 18592 (hwnd_probe.exe)
+  Parent: 0x3110c8
+  Owner:  0x3110c8
+  Ancestor (GA_ROOT): 0x290c8c
+  Ancestor (GA_ROOTOWNER): 0x3110c8
+HWND: 0x3110c8 | Class: "CASCADIA_HOSTING_WINDOW_CLASS" | Title: "Terminal" | PID: 5704 (WindowsTerminal.exe)
+  Parent: 0x0
+  Owner:  0x0
+  Ancestor (GA_ROOT): 0x3110c8
+  Ancestor (GA_ROOTOWNER): 0x3110c8
+
+Top-level Windows Search:
+Top HWND: 0x3110c8 | Class: "CASCADIA_HOSTING_WINDOW_CLASS" | Title: "Terminal" | PID: 5704 (WindowsTerminal.exe)
+Top HWND: 0x290c8c | Class: "PseudoConsoleWindow" | Title: "" | PID: 18592 (hwnd_probe.exe)
+Top HWND: 0x470be6 | Class: "PseudoConsoleWindow" | Title: "" | PID: 24628 (powershell.exe)
+Top HWND: 0x10c84 | Class: "PseudoConsoleWindow" | Title: "" | PID: 5592 (powershell.exe)
+Top HWND: 0x40ac4 | Class: "PseudoConsoleWindow" | Title: "" | PID: 12100 (powershell.exe)
+Top HWND: 0x10b38 | Class: "PseudoConsoleWindow" | Title: "" | PID: 20440 (powershell.exe)
+Top HWND: 0x204b0 | Class: "ConsoleWindowClass" | Title: "C:\WINDOWS\system32\cmd.exe" | PID: 18956 (cmd.exe)
+Top HWND: 0x2022c | Class: "ConsoleWindowClass" | Title: "C:\Users\sifay\AppData\Local\Programs\Ollama\ollama.exe" | PID: 2976 (ollama.exe)
+Top HWND: 0x408b0 | Class: "HwndWrapper[PAD.Console.Host;;2e2050b5-e49a-4e69-a2c3-56196653bf98]" | Title: "MediaContextNotificationWindow" | PID: 13256 (PAD.Console.Host.exe)
+Top HWND: 0x408ac | Class: "HwndWrapper[PAD.Console.Host;;68752c06-550f-47dc-b071-ef75230a8bc5]" | Title: "" | PID: 13256 (PAD.Console.Host.exe)
+Top HWND: 0x608b4 | Class: "HwndWrapper[PAD.Console.Host;;2bc3e0f9-0c9f-4163-8269-de2f1ca9de7e]" | Title: "Power Automate" | PID: 13256 (PAD.Console.Host.exe)
+Top HWND: 0x20938 | Class: "HwndWrapper[PAD.Console.Host;;516254e5-a874-4490-a889-8c5306da458b]" | Title: "" | PID: 13256 (PAD.Console.Host.exe)
+Top HWND: 0x40992 | Class: "HwndWrapper[PAD.Console.Host;;169a7040-4ce3-48ae-94ef-80fbcf686797]" | Title: "SystemResourceNotifyWindow" | PID: 13256 (PAD.Console.Host.exe)

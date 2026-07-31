@@ -998,6 +998,7 @@ version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c5c8ecfc6c72051981c0459f75ccc585e7ff67c70829560cda8e647882a9abff"
 dependencies = [
+ "chrono",
  "encoding_rs",
  "flate2",
  "indexmap",
@@ -1006,6 +1007,7 @@ dependencies = [
  "md-5",
  "nom 7.1.3",
  "rangemap",
+ "rayon",
  "time",
  "weezl",
 ]
@@ -1623,12 +1625,16 @@ dependencies = [
  "hex",
  "image 0.25.10",
  "lofty",
+ "lopdf",
  "once_cell",
  "parking_lot",
  "pdf-extract",
  "ratatui",
  "serde_json",
  "sha2",
+ "unicode-normalization",
+ "unicode-segmentation",
+ "unicode-width",
  "viuer",
  "windows-sys 0.61.2",
  "zip",

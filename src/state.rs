@@ -1,36 +1,48 @@
 // ================= src/state.rs =================
-use std::{
-    path::PathBuf, fs,
-    time::{Duration, Instant},
-    collections::HashMap,
-    sync::Arc,
+use crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
-use parking_lot::Mutex;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers, KeyEventKind, MouseEventKind, MouseButton};
 use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use ratatui::layout::Rect;
+use std::{
+    collections::HashMap,
+    fs,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver},
+        Arc,
+    },
+    time::{Duration, Instant, SystemTime},
+};
 
 // ── Directory listing cache ───────────────────────────────────────────────────
 // TTL prevents re-reading the filesystem every frame when the preview pane
 // hovers over a directory. Cap stops UI freezes on System32-sized folders.
 
 const DIR_CACHE_TTL: Duration = Duration::from_secs(2);
-const MAX_DIR_ENTRIES: usize  = 3_000;
+const MAX_DIR_ENTRIES: usize = 3_000;
 
 #[inline]
 fn point_in(col: u16, row: u16, r: &Rect) -> bool {
-    col >= r.x && col < r.x.saturating_add(r.width) && row >= r.y && row < r.y.saturating_add(r.height)
+    col >= r.x
+        && col < r.x.saturating_add(r.width)
+        && row >= r.y
+        && row < r.y.saturating_add(r.height)
 }
 
 #[derive(Clone)]
 pub struct DirEntryInfo {
     pub path: PathBuf,
     pub is_dir: bool,
+    pub size: u64,
+    pub modified: Option<SystemTime>,
 }
 
 struct DirCacheEntry {
     entries: Vec<DirEntryInfo>,
-    at:      Instant,
+    at: Instant,
 }
 
 static DIR_CACHE: Lazy<Mutex<HashMap<PathBuf, DirCacheEntry>>> =
@@ -41,6 +53,9 @@ pub struct DirLevel {
     pub path: PathBuf,
     pub files: Vec<DirEntryInfo>,
     pub selected: usize,
+    /// First row shown in this pane. Kept separate from `selected` so the
+    /// mouse wheel scrolls the list without changing or opening a file.
+    pub scroll: usize,
     /// Multi-selected (marked) entries, keyed by absolute path.
     pub marked: std::collections::HashSet<PathBuf>,
     /// Anchor index for Shift+Click range selection.
@@ -49,7 +64,14 @@ pub struct DirLevel {
 
 impl DirLevel {
     pub fn new(path: PathBuf, files: Vec<DirEntryInfo>) -> Self {
-        Self { path, files, selected: 0, marked: std::collections::HashSet::new(), select_anchor: 0 }
+        Self {
+            path,
+            files,
+            selected: 0,
+            scroll: 0,
+            marked: std::collections::HashSet::new(),
+            select_anchor: 0,
+        }
     }
 }
 
@@ -61,18 +83,19 @@ pub enum AppMode {
     ConfirmDeletePermanent,
     ContextMenu,
     NewFolder,
+    NewFile,
     Properties,
 }
 
 // ── Drive sidebar ──────────────────────────────────────────────────────────
 #[derive(Clone)]
 pub struct DriveInfo {
-    pub path:  PathBuf,
+    pub path: PathBuf,
     pub label: String,
-    pub fs:    String,
-    pub kind:  String,   // "Fixed" | "Removable" | "Network" | "CD-ROM" | "Unknown"
+    pub fs: String,
+    pub kind: String, // "Fixed" | "Removable" | "Network" | "CD-ROM" | "Unknown"
     pub total: u64,
-    pub free:  u64,
+    pub free: u64,
 }
 
 // ── Right-click context menu ─────────────────────────────────────────────
@@ -89,6 +112,7 @@ pub enum ContextAction {
     CopyPath,
     OpenInTerminal,
     NewFolder,
+    NewFile,
 }
 
 impl ContextAction {
@@ -105,6 +129,146 @@ impl ContextAction {
             ContextAction::CopyPath => "Copy Path",
             ContextAction::OpenInTerminal => "Open in Terminal",
             ContextAction::NewFolder => "New Folder",
+            ContextAction::NewFile => "New File...",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ThemeMode {
+    Dark,
+    Light,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LayoutMode {
+    Miller,
+    Explorer,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OfficeRenderMode {
+    Text,
+    Full,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PdfRenderMode {
+    Text,
+    Visual,
+}
+
+#[derive(Clone, Default)]
+pub struct FolderStats {
+    pub bytes: u64,
+    pub files: u64,
+    pub folders: u64,
+    pub inaccessible: u64,
+    pub complete: bool,
+}
+
+struct PropertyScan {
+    receiver: Receiver<FolderStats>,
+    cancel: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SortMode {
+    Name,
+    Modified,
+    Size,
+}
+
+impl SortMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            SortMode::Name => "Name",
+            SortMode::Modified => "Date",
+            SortMode::Size => "Size",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ToggleAction {
+    Theme,
+    LayoutMode,
+    UltraFast,
+    OfficeMode,
+    PdfMode,
+    EditMode,
+    DirPreviewClick,
+    SortName,
+    SortModified,
+    SortSize,
+    SortOrder,
+    Details,
+    SelectionStyle,
+    FontFamily,
+    FontSize,
+    FontWeight,
+    Hover,
+}
+
+pub struct AppTheme {
+    pub bg_panel: ratatui::style::Color,
+    pub bg_root: ratatui::style::Color,
+    pub border: ratatui::style::Color,
+    pub border_lo: ratatui::style::Color,
+    pub text: ratatui::style::Color,
+    pub text_soft: ratatui::style::Color,
+    pub muted: ratatui::style::Color,
+    pub accent: ratatui::style::Color,
+    pub accent2: ratatui::style::Color,
+    pub sel_bg: ratatui::style::Color,
+    pub sel_bg_inactive: ratatui::style::Color,
+    pub folder: ratatui::style::Color,
+    pub ok: ratatui::style::Color,
+    pub warn: ratatui::style::Color,
+    pub err: ratatui::style::Color,
+    pub mark: ratatui::style::Color,
+}
+
+impl AppTheme {
+    pub fn dark() -> Self {
+        Self {
+            bg_panel: ratatui::style::Color::Rgb(24, 26, 34),
+            bg_root: ratatui::style::Color::Rgb(18, 20, 26),
+            border: ratatui::style::Color::Rgb(38, 40, 50),
+            border_lo: ratatui::style::Color::Rgb(28, 30, 37),
+            text: ratatui::style::Color::Rgb(214, 218, 230),
+            text_soft: ratatui::style::Color::Rgb(160, 166, 185),
+            muted: ratatui::style::Color::Rgb(120, 126, 145),
+            accent: ratatui::style::Color::Rgb(65, 166, 166),
+            accent2: ratatui::style::Color::Rgb(137, 180, 250),
+            sel_bg: ratatui::style::Color::Rgb(32, 64, 66),
+            sel_bg_inactive: ratatui::style::Color::Rgb(40, 42, 52),
+            folder: ratatui::style::Color::Rgb(229, 192, 123),
+            ok: ratatui::style::Color::Rgb(137, 220, 165),
+            warn: ratatui::style::Color::Rgb(240, 198, 116),
+            err: ratatui::style::Color::Rgb(240, 120, 120),
+            mark: ratatui::style::Color::Rgb(210, 160, 90),
+        }
+    }
+
+    pub fn light() -> Self {
+        Self {
+            bg_panel: ratatui::style::Color::Rgb(245, 247, 250),
+            bg_root: ratatui::style::Color::Rgb(235, 238, 242),
+            border: ratatui::style::Color::Rgb(210, 215, 225),
+            border_lo: ratatui::style::Color::Rgb(225, 228, 235),
+            text: ratatui::style::Color::Rgb(30, 35, 45),
+            text_soft: ratatui::style::Color::Rgb(70, 80, 95),
+            muted: ratatui::style::Color::Rgb(120, 130, 145),
+            accent: ratatui::style::Color::Rgb(0, 122, 204),
+            accent2: ratatui::style::Color::Rgb(30, 144, 255),
+            sel_bg: ratatui::style::Color::Rgb(215, 232, 255),
+            sel_bg_inactive: ratatui::style::Color::Rgb(230, 236, 245),
+            folder: ratatui::style::Color::Rgb(218, 165, 32),
+            ok: ratatui::style::Color::Rgb(40, 160, 80),
+            warn: ratatui::style::Color::Rgb(210, 130, 20),
+            err: ratatui::style::Color::Rgb(220, 50, 50),
+            mark: ratatui::style::Color::Rgb(180, 100, 20),
         }
     }
 }
@@ -114,6 +278,7 @@ pub struct LayoutGeometry {
     pub breadcrumb_rect: Rect,
     pub status_rect: Rect,
     pub pane_rects: Vec<Rect>,
+    pub pane_level_indices: HashMap<usize, usize>,
     pub preview_rect: Option<Rect>,
     // Maps visible pane index to a list of (file_index, Rect)
     pub row_rects: HashMap<usize, Vec<(usize, Rect)>>,
@@ -123,9 +288,20 @@ pub struct LayoutGeometry {
     pub sidebar_rect: Rect,
     pub sidebar_item_rects: Vec<(Rect, PathBuf)>,
     pub sidebar_divider_rect: Rect,
+    pub toggle_rects: Vec<(Rect, ToggleAction)>,
+
+    // Clickable directory preview items
+    pub preview_dir_item_rects: Vec<(Rect, PathBuf)>,
+
+    // Preview editor & slide controls
+    pub edit_save_btn_rect: Option<Rect>,
+    pub slide_prev_rect: Option<Rect>,
+    pub slide_next_rect: Option<Rect>,
 
     // Clickable breadcrumb path segments
     pub breadcrumb_segment_rects: Vec<(Rect, PathBuf)>,
+    pub search_rect: Option<Rect>,
+    pub pane_sort_rect: Option<Rect>,
 
     // Right-click context menu
     pub context_menu_rect: Option<Rect>,
@@ -133,40 +309,77 @@ pub struct LayoutGeometry {
 }
 
 pub struct AppState {
-    pub levels:        Vec<DirLevel>,
+    pub levels: Vec<DirLevel>,
     pub current_level: usize,
-    last_event_time:   Instant,
+    last_event_time: Instant,
+
+    // Settings & Toggles
+    pub theme_mode: ThemeMode,
+    pub layout_mode: LayoutMode,
+    pub ultra_fast: bool,
+    pub office_mode: OfficeRenderMode,
+    pub pdf_mode: PdfRenderMode,
+    pub edit_preview_mode: bool,
+    pub dir_preview_clickable: bool,
+    pub pptx_slide_index: usize,
+    pub sort_mode: SortMode,
+    pub sort_descending: bool,
+    pub show_file_details: bool,
+    pub rounded_selection: bool,
+    pub font_face: String,
+    pub font_size: u16,
+    pub font_weight: u16,
+    pub hover_enabled: bool,
+    pub search_active: bool,
+    pub search_query: String,
+    pub search_original_selection: Option<usize>,
+
+    // Interactive Preview Editor state
+    pub edit_buffer: Vec<String>,
+    pub edit_cursor_row: usize,
+    pub edit_cursor_col: usize,
+    pub edit_dirty: bool,
+    pub edit_path: Option<PathBuf>,
+    pub edit_line_ending: String,
 
     // Preview interaction state
-    pub mode:            AppMode,  // current application mode
-    pub input_buffer:    String,   // used for Rename / New Folder
-    pub input_cursor:    usize,    // cursor position within input_buffer (chars)
-    pub input_sel_start: usize,    // selection start (chars) — for Ctrl+A / basename select
-    pub clipboard:       Option<(Vec<PathBuf>, bool)>, // (paths, is_cut)
-    pub image_zoom:      f32,      // 1.0 = 100%; +/- adjust
-    pub image_rotation:  u32,      // 0 / 90 / 180 / 270 degrees
-    pub image_flip_h:    bool,     // 'f' flips horizontally
-    pub preview_scroll:  usize,    // manual scroll offset for preview pane
+    pub mode: AppMode,                           // current application mode
+    pub input_buffer: String,                    // used for Rename / New Folder
+    pub input_cursor: usize,                     // cursor position within input_buffer (chars)
+    pub input_sel_start: usize, // selection start (chars) — for Ctrl+A / basename select
+    pub clipboard: Option<(Vec<PathBuf>, bool)>, // (paths, is_cut)
+    pub image_zoom: f32,        // 1.0 = 100%; +/- adjust
+    pub image_rotation: u32,    // 0 / 90 / 180 / 270 degrees
+    pub image_flip_h: bool,     // 'f' flips horizontally
+    pub preview_scroll: usize,  // manual scroll offset for preview pane
 
     // Mouse double-click tracking: (time, pane_idx, file_idx)
-    pub last_click:      Option<(Instant, usize, usize)>,
+    pub last_click: Option<(Instant, usize, usize)>,
 
     // Layout and resizing state
     pub dragging_divider: Option<usize>,
     pub dragging_sidebar: bool,
-    pub column_ratios:    Vec<f32>,
-    pub layout_geometry:  Arc<Mutex<LayoutGeometry>>,
+    pub column_ratios: Vec<f32>,
+    pub layout_geometry: Arc<Mutex<LayoutGeometry>>,
 
     // Left sidebar: drives + quick access
-    pub drives:          Vec<DriveInfo>,
-    pub quick_access:    Vec<(&'static str, PathBuf)>,
+    pub drives: Vec<DriveInfo>,
+    pub quick_access: Vec<(&'static str, PathBuf)>,
     drives_refreshed_at: Instant,
-    pub sidebar_width:   u16,
+    pub sidebar_width: u16,
 
     // Right-click context menu
     pub context_menu_target: Option<PathBuf>,
-    pub context_menu_items:  Vec<ContextAction>,
-    pub pending_menu_pos:    (u16, u16),
+    pub context_menu_items: Vec<ContextAction>,
+    pub context_menu_hover: Option<usize>,
+    pub hovered_row: Option<(usize, usize)>,
+    pending_event: Option<Event>,
+    pub pending_menu_pos: (u16, u16),
+
+    // Stable Properties target and non-blocking recursive folder totals.
+    pub properties_path: Option<PathBuf>,
+    pub properties_stats: Option<FolderStats>,
+    property_scan: Option<PropertyScan>,
 
     // Non-blocking status notifications (message, shown_at)
     pub notice: Option<(String, Instant, bool)>, // bool = is_error
@@ -177,37 +390,84 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> anyhow::Result<Self> {
+        let user_settings = crate::settings::load();
         let home = dirs::home_dir().unwrap_or_else(|| {
             #[cfg(windows)]
-            { PathBuf::from("C:\\") }
+            {
+                PathBuf::from("C:\\")
+            }
             #[cfg(not(windows))]
-            { PathBuf::from("/") }
+            {
+                PathBuf::from("/")
+            }
         });
         let files = list_dir(&home)?;
 
         let level = DirLevel::new(home.clone(), files);
 
         let mut quick_access: Vec<(&'static str, PathBuf)> = Vec::new();
-        if let Some(h) = dirs::home_dir() { quick_access.push(("🏠 Home", h)); }
-        if let Some(d) = dirs::desktop_dir() { quick_access.push(("🖥 Desktop", d)); }
-        if let Some(d) = dirs::document_dir() { quick_access.push(("📄 Documents", d)); }
-        if let Some(d) = dirs::download_dir() { quick_access.push(("⬇ Downloads", d)); }
-        if let Some(d) = dirs::picture_dir() { quick_access.push(("🖼 Pictures", d)); }
+        // Store labels without embedded emoji. Emoji cell widths vary between
+        // terminal/font combinations and used to leave the final character
+        // outside the active-row highlight on other machines.
+        if let Some(h) = dirs::home_dir() {
+            quick_access.push(("Home", h));
+        }
+        if let Some(d) = dirs::desktop_dir() {
+            quick_access.push(("Desktop", d));
+        }
+        if let Some(d) = dirs::document_dir() {
+            quick_access.push(("Documents", d));
+        }
+        if let Some(d) = dirs::download_dir() {
+            quick_access.push(("Downloads", d));
+        }
+        if let Some(d) = dirs::picture_dir() {
+            quick_access.push(("Pictures", d));
+        }
 
         Ok(Self {
-            levels:         vec![level],
-            current_level:  0,
+            levels: vec![level],
+            current_level: 0,
             last_event_time: Instant::now(),
-            mode:           AppMode::Normal,
-            input_buffer:   String::new(),
-            input_cursor:   0,
+            theme_mode: ThemeMode::Dark,
+            layout_mode: if user_settings.explorer_view {
+                LayoutMode::Explorer
+            } else {
+                LayoutMode::Miller
+            },
+            ultra_fast: user_settings.ultra_fast,
+            office_mode: OfficeRenderMode::Text,
+            pdf_mode: PdfRenderMode::Text,
+            edit_preview_mode: false,
+            dir_preview_clickable: true,
+            pptx_slide_index: 0,
+            sort_mode: SortMode::Name,
+            sort_descending: false,
+            show_file_details: false,
+            rounded_selection: false,
+            font_face: user_settings.font_face,
+            font_size: user_settings.font_size,
+            font_weight: user_settings.font_weight,
+            hover_enabled: true,
+            search_active: false,
+            search_query: String::new(),
+            search_original_selection: None,
+            edit_buffer: Vec::new(),
+            edit_cursor_row: 0,
+            edit_cursor_col: 0,
+            edit_dirty: false,
+            edit_path: None,
+            edit_line_ending: "\n".to_string(),
+            mode: AppMode::Normal,
+            input_buffer: String::new(),
+            input_cursor: 0,
             input_sel_start: 0,
-            clipboard:      None,
-            last_click:     None,
+            clipboard: None,
+            last_click: None,
             dragging_divider: None,
             dragging_sidebar: false,
-            column_ratios:    vec![0.10, 0.10, 0.12, 0.18, 0.50],
-            layout_geometry:  Arc::new(Mutex::new(LayoutGeometry::default())),
+            column_ratios: vec![0.10, 0.10, 0.12, 0.18, 0.50],
+            layout_geometry: Arc::new(Mutex::new(LayoutGeometry::default())),
             preview_scroll: 0,
             image_zoom: 1.0,
             image_rotation: 0,
@@ -218,10 +478,23 @@ impl AppState {
             sidebar_width: 26,
             context_menu_target: None,
             context_menu_items: Vec::new(),
+            context_menu_hover: None,
+            hovered_row: None,
+            pending_event: None,
             pending_menu_pos: (0, 0),
+            properties_path: None,
+            properties_stats: None,
+            property_scan: None,
             notice: None,
             native_preview: crate::native::NativePreviewManager::new(),
         })
+    }
+
+    pub fn theme(&self) -> AppTheme {
+        match self.theme_mode {
+            ThemeMode::Dark => AppTheme::dark(),
+            ThemeMode::Light => AppTheme::light(),
+        }
     }
 
     /// Re-scan drive list at most every 5s (used/free space can change).
@@ -239,14 +512,60 @@ impl AppState {
     /// Active (non-expired) notice text, if any.
     pub fn active_notice(&self) -> Option<(&str, bool)> {
         self.notice.as_ref().and_then(|(msg, at, err)| {
-            if at.elapsed() < Duration::from_secs(4) { Some((msg.as_str(), *err)) } else { None }
+            if at.elapsed() < Duration::from_secs(4) {
+                Some((msg.as_str(), *err))
+            } else {
+                None
+            }
         })
+    }
+
+    pub fn open_properties(&mut self, path: PathBuf) {
+        if let Some(scan) = self.property_scan.take() {
+            scan.cancel.store(true, Ordering::Relaxed);
+        }
+        self.properties_path = Some(path.clone());
+        self.properties_stats = None;
+        self.mode = AppMode::Properties;
+
+        if !path.is_dir() {
+            return;
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        std::thread::spawn(move || scan_folder_stats(path, sender, worker_cancel));
+        self.properties_stats = Some(FolderStats::default());
+        self.property_scan = Some(PropertyScan { receiver, cancel });
+    }
+
+    pub fn close_properties(&mut self) {
+        if let Some(scan) = self.property_scan.take() {
+            scan.cancel.store(true, Ordering::Relaxed);
+        }
+        self.properties_path = None;
+        self.properties_stats = None;
+        self.mode = AppMode::Normal;
+    }
+
+    fn refresh_property_scan(&mut self) {
+        let mut finished = false;
+        if let Some(scan) = self.property_scan.as_ref() {
+            while let Ok(stats) = scan.receiver.try_recv() {
+                finished = stats.complete;
+                self.properties_stats = Some(stats);
+            }
+        }
+        if finished {
+            self.property_scan = None;
+        }
     }
 
     /// Navigate the active pane directly to an arbitrary directory path
     /// (used by sidebar clicks, breadcrumb clicks, and drive navigation).
     pub fn navigate_to(&mut self, path: &std::path::Path) {
-        match list_dir(path) {
+        match self.load_sorted_dir(path) {
             Ok(files) => {
                 self.levels = vec![DirLevel::new(path.to_path_buf(), files)];
                 self.current_level = 0;
@@ -264,13 +583,56 @@ impl AppState {
         &mut self.levels[self.current_level]
     }
 
-    pub fn handle_events(&mut self) -> anyhow::Result<bool> {
-        // Poll with timeout to prevent blocking forever
-        if !event::poll(Duration::from_millis(100))? {
-            return Ok(false);
-        }
+    fn load_sorted_dir(&self, path: &std::path::Path) -> anyhow::Result<Vec<DirEntryInfo>> {
+        let mut files = list_dir(path)?;
+        sort_dir_entries(&mut files, self.sort_mode, self.sort_descending);
+        Ok(files)
+    }
 
-        match event::read()? {
+    fn resort_levels(&mut self) {
+        let mode = self.sort_mode;
+        let descending = self.sort_descending;
+        for level in &mut self.levels {
+            let selected_path = level
+                .files
+                .get(level.selected)
+                .map(|entry| entry.path.clone());
+            sort_dir_entries(&mut level.files, mode, descending);
+            if let Some(selected_path) = selected_path {
+                if let Some(index) = level
+                    .files
+                    .iter()
+                    .position(|entry| entry.path == selected_path)
+                {
+                    level.selected = index;
+                    level.select_anchor = index;
+                }
+            }
+            level.scroll = level.scroll.min(level.files.len().saturating_sub(1));
+        }
+    }
+
+    pub fn handle_events(&mut self) -> anyhow::Result<bool> {
+        self.refresh_property_scan();
+
+        // Preserve the first non-movement event found while coalescing pointer
+        // movement. This keeps keys/clicks lossless without replaying hundreds
+        // of stale Windows Terminal mouse coordinates.
+        let next_event = if let Some(pending) = self.pending_event.take() {
+            pending
+        } else {
+            let input_wait = if self.ultra_fast {
+                Duration::ZERO
+            } else {
+                Duration::from_millis(16)
+            };
+            if !event::poll(input_wait)? {
+                return Ok(false);
+            }
+            event::read()?
+        };
+
+        match next_event {
             Event::Key(key) => {
                 // Only process KeyPress events — ignore KeyRelease/KeyRepeat.
                 // Critical on Windows: prevents double-triggering.
@@ -280,10 +642,54 @@ impl AppState {
 
                 self.last_event_time = Instant::now();
 
+                if self.edit_preview_mode && self.mode == AppMode::Normal {
+                    if self.handle_edit_key(key.code, key.modifiers) {
+                        return Ok(false);
+                    }
+                }
+
+                if self.search_active {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Esc, _) => {
+                            self.cancel_search();
+                        }
+                        (KeyCode::Enter, _) => {
+                            self.accept_search();
+                        }
+                        (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
+                            self.accept_search();
+                        }
+                        (KeyCode::Backspace, _) => {
+                            self.search_query.pop();
+                            self.select_first_search_match();
+                        }
+                        (KeyCode::Down, _) | (KeyCode::Tab, _) => {
+                            self.select_next_search_match(true);
+                        }
+                        (KeyCode::Up, _) | (KeyCode::BackTab, _) => {
+                            self.select_next_search_match(false);
+                        }
+                        (KeyCode::Char(c), modifiers)
+                            if modifiers == KeyModifiers::NONE
+                                || modifiers == KeyModifiers::SHIFT =>
+                        {
+                            self.search_query.push(c);
+                            self.select_first_search_match();
+                        }
+                        _ => {}
+                    }
+                    return Ok(false);
+                }
+
                 match (key.code, key.modifiers) {
                     // ── Quit ────────────────────────────────────────────────
                     // Only allow quit when in Normal mode
-                    (KeyCode::Char('q'), KeyModifiers::NONE) if self.mode == AppMode::Normal => return Ok(true),
+                    (KeyCode::Char('q'), KeyModifiers::NONE) if self.mode == AppMode::Normal => {
+                        return Ok(true)
+                    }
+                    (KeyCode::Esc, _) if self.mode == AppMode::Properties => {
+                        self.close_properties();
+                    }
                     (KeyCode::Esc, _) if self.mode != AppMode::Normal => {
                         // Escape cancels modes
                         self.mode = AppMode::Normal;
@@ -304,24 +710,38 @@ impl AppState {
                             self.mode = AppMode::ConfirmDelete;
                         }
                     }
-                    (KeyCode::F(7), KeyModifiers::NONE)
-                    | (KeyCode::Char('n'), KeyModifiers::CONTROL) if self.mode == AppMode::Normal => {
+                    (KeyCode::F(7), KeyModifiers::NONE) if self.mode == AppMode::Normal => {
                         self.mode = AppMode::NewFolder;
                         self.input_buffer.clear();
                         self.input_cursor = 0;
                         self.input_sel_start = 0;
                     }
                     (KeyCode::Char('N'), m)
-                        if self.mode == AppMode::Normal && m.contains(KeyModifiers::CONTROL) && m.contains(KeyModifiers::SHIFT) => {
+                        if self.mode == AppMode::Normal
+                            && m.contains(KeyModifiers::CONTROL)
+                            && m.contains(KeyModifiers::SHIFT) =>
+                    {
                         self.mode = AppMode::NewFolder;
                         self.input_buffer.clear();
                         self.input_cursor = 0;
                         self.input_sel_start = 0;
                     }
+                    (KeyCode::Char('n'), KeyModifiers::CONTROL) if self.mode == AppMode::Normal => {
+                        self.mode = AppMode::NewFile;
+                        self.input_buffer.clear();
+                        self.input_cursor = 0;
+                        self.input_sel_start = 0;
+                    }
                     (KeyCode::Enter, KeyModifiers::ALT) if self.mode == AppMode::Normal => {
-                        if !self.current().files.is_empty() {
-                            self.mode = AppMode::Properties;
+                        if let Some(path) = self.selected_entry_path() {
+                            self.open_properties(path);
                         }
+                    }
+                    (KeyCode::Char('f'), KeyModifiers::CONTROL) if self.mode == AppMode::Normal => {
+                        self.begin_search();
+                    }
+                    (KeyCode::Char('/'), KeyModifiers::NONE) if self.mode == AppMode::Normal => {
+                        self.begin_search();
                     }
 
                     // ── Clipboard Operations (Copy, Cut, Paste) ─────────────
@@ -357,12 +777,18 @@ impl AppState {
                         self.input_sel_start = 0;
                         self.input_cursor = self.input_buffer.chars().count();
                     }
-                    (KeyCode::Char(c), m) if self.mode == AppMode::Rename && (m == KeyModifiers::NONE || m == KeyModifiers::SHIFT) => {
+                    (KeyCode::Char(c), m)
+                        if self.mode == AppMode::Rename
+                            && (m == KeyModifiers::NONE || m == KeyModifiers::SHIFT) =>
+                    {
                         self.rename_input_replace_selection_with(&c.to_string());
                         return Ok(false);
                     }
-                    (KeyCode::Char(c), _) if self.mode == AppMode::NewFolder => {
-                        self.input_buffer.insert(self.byte_idx(self.input_cursor), c);
+                    (KeyCode::Char(c), _)
+                        if self.mode == AppMode::NewFolder || self.mode == AppMode::NewFile =>
+                    {
+                        self.input_buffer
+                            .insert(self.byte_idx(self.input_cursor), c);
                         self.input_cursor += 1;
                         return Ok(false);
                     }
@@ -378,7 +804,9 @@ impl AppState {
                         }
                         return Ok(false);
                     }
-                    (KeyCode::Backspace, _) if self.mode == AppMode::NewFolder => {
+                    (KeyCode::Backspace, _)
+                        if self.mode == AppMode::NewFolder || self.mode == AppMode::NewFile =>
+                    {
                         if self.input_cursor > 0 {
                             let idx = self.byte_idx(self.input_cursor - 1);
                             let end = self.byte_idx(self.input_cursor);
@@ -387,7 +815,12 @@ impl AppState {
                         }
                         return Ok(false);
                     }
-                    (KeyCode::Delete, _) if self.mode == AppMode::Rename || self.mode == AppMode::NewFolder => {
+                    (KeyCode::Delete, _)
+                        if matches!(
+                            self.mode,
+                            AppMode::Rename | AppMode::NewFolder | AppMode::NewFile
+                        ) =>
+                    {
                         let len = self.input_buffer.chars().count();
                         if self.input_cursor < len {
                             let idx = self.byte_idx(self.input_cursor);
@@ -397,23 +830,43 @@ impl AppState {
                         self.input_sel_start = self.input_cursor;
                         return Ok(false);
                     }
-                    (KeyCode::Left, _) if self.mode == AppMode::Rename || self.mode == AppMode::NewFolder => {
+                    (KeyCode::Left, _)
+                        if matches!(
+                            self.mode,
+                            AppMode::Rename | AppMode::NewFolder | AppMode::NewFile
+                        ) =>
+                    {
                         self.input_cursor = self.input_cursor.saturating_sub(1);
                         self.input_sel_start = self.input_cursor;
                         return Ok(false);
                     }
-                    (KeyCode::Right, _) if self.mode == AppMode::Rename || self.mode == AppMode::NewFolder => {
+                    (KeyCode::Right, _)
+                        if matches!(
+                            self.mode,
+                            AppMode::Rename | AppMode::NewFolder | AppMode::NewFile
+                        ) =>
+                    {
                         let len = self.input_buffer.chars().count();
                         self.input_cursor = (self.input_cursor + 1).min(len);
                         self.input_sel_start = self.input_cursor;
                         return Ok(false);
                     }
-                    (KeyCode::Home, _) if self.mode == AppMode::Rename || self.mode == AppMode::NewFolder => {
+                    (KeyCode::Home, _)
+                        if matches!(
+                            self.mode,
+                            AppMode::Rename | AppMode::NewFolder | AppMode::NewFile
+                        ) =>
+                    {
                         self.input_cursor = 0;
                         self.input_sel_start = 0;
                         return Ok(false);
                     }
-                    (KeyCode::End, _) if self.mode == AppMode::Rename || self.mode == AppMode::NewFolder => {
+                    (KeyCode::End, _)
+                        if matches!(
+                            self.mode,
+                            AppMode::Rename | AppMode::NewFolder | AppMode::NewFile
+                        ) =>
+                    {
                         let len = self.input_buffer.chars().count();
                         self.input_cursor = len;
                         self.input_sel_start = len;
@@ -427,11 +880,19 @@ impl AppState {
                         self.commit_new_folder();
                         return Ok(false);
                     }
-                    (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) if self.mode == AppMode::ConfirmDelete => {
+                    (KeyCode::Enter, _) if self.mode == AppMode::NewFile => {
+                        self.commit_new_file();
+                        return Ok(false);
+                    }
+                    (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _)
+                        if self.mode == AppMode::ConfirmDelete =>
+                    {
                         self.do_delete(false);
                         return Ok(false);
                     }
-                    (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) if self.mode == AppMode::ConfirmDeletePermanent => {
+                    (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _)
+                        if self.mode == AppMode::ConfirmDeletePermanent =>
+                    {
                         self.do_delete(true);
                         return Ok(false);
                     }
@@ -472,43 +933,79 @@ impl AppState {
                         }
                     }
 
+                    // ── Preview scroll (Shift+Up/Down) ───────────────────────
+                    (KeyCode::Down, KeyModifiers::SHIFT) if self.mode == AppMode::Normal => {
+                        self.preview_scroll = self.preview_scroll.saturating_add(3);
+                    }
+                    (KeyCode::Up, KeyModifiers::SHIFT) if self.mode == AppMode::Normal => {
+                        self.preview_scroll = self.preview_scroll.saturating_sub(3);
+                    }
+
                     // ── Navigation — only when Normal mode ──────────────────
                     (KeyCode::Down, _) if self.mode == AppMode::Normal => self.move_down(),
-                    (KeyCode::Up, _)   if self.mode == AppMode::Normal => self.move_up(),
-                    (KeyCode::Left, _) if self.mode == AppMode::Normal => { self.go_left()?; self.reset_image_state(); }
-                    (KeyCode::Right, _) if self.mode == AppMode::Normal => { self.go_right()?; self.reset_image_state(); }
-                    (KeyCode::Enter, _) if self.mode == AppMode::Normal => { self.open_selected(); }
+                    (KeyCode::Up, _) if self.mode == AppMode::Normal => self.move_up(),
+                    (KeyCode::Left, _) if self.mode == AppMode::Normal => {
+                        self.go_left()?;
+                        self.reset_image_state();
+                    }
+                    (KeyCode::Right, _) if self.mode == AppMode::Normal => {
+                        self.go_right()?;
+                        self.reset_image_state();
+                    }
+                    (KeyCode::Enter, _) if self.mode == AppMode::Normal => {
+                        self.open_selected();
+                    }
 
                     // ── Navigation — Vim keys ────────────────────────────────
-                    (KeyCode::Char('j'), KeyModifiers::NONE) if self.mode == AppMode::Normal => self.move_down(),
-                    (KeyCode::Char('k'), KeyModifiers::NONE) if self.mode == AppMode::Normal => self.move_up(),
-                    (KeyCode::Char('h'), KeyModifiers::NONE) if self.mode == AppMode::Normal => { self.go_left()?; self.reset_image_state(); }
-                    (KeyCode::Char('l'), KeyModifiers::NONE) if self.mode == AppMode::Normal => { self.go_right()?; self.reset_image_state(); }
+                    (KeyCode::Char('j'), KeyModifiers::NONE) if self.mode == AppMode::Normal => {
+                        self.move_down()
+                    }
+                    (KeyCode::Char('k'), KeyModifiers::NONE) if self.mode == AppMode::Normal => {
+                        self.move_up()
+                    }
+                    (KeyCode::Char('h'), KeyModifiers::NONE) if self.mode == AppMode::Normal => {
+                        self.go_left()?;
+                        self.reset_image_state();
+                    }
+                    (KeyCode::Char('l'), KeyModifiers::NONE) if self.mode == AppMode::Normal => {
+                        self.go_right()?;
+                        self.reset_image_state();
+                    }
 
                     // ── Jump top / bottom ────────────────────────────────────
-                    (KeyCode::Char('g'), KeyModifiers::NONE) if self.mode == AppMode::Normal => self.jump_top(),
-                    (KeyCode::Char('G'), KeyModifiers::SHIFT) if self.mode == AppMode::Normal => self.jump_bottom(),
+                    (KeyCode::Char('g'), KeyModifiers::NONE) if self.mode == AppMode::Normal => {
+                        self.jump_top()
+                    }
+                    (KeyCode::Char('G'), KeyModifiers::SHIFT) if self.mode == AppMode::Normal => {
+                        self.jump_bottom()
+                    }
 
                     // ── Page navigation ──────────────────────────────────────
-                    (KeyCode::PageDown, _)
-                    | (KeyCode::Char('d'), KeyModifiers::CONTROL) if self.mode == AppMode::Normal => {
+                    (KeyCode::PageDown, _) | (KeyCode::Char('d'), KeyModifiers::CONTROL)
+                        if self.mode == AppMode::Normal =>
+                    {
                         self.page_down()
                     }
-                    (KeyCode::PageUp, _)
-                    | (KeyCode::Char('u'), KeyModifiers::CONTROL) if self.mode == AppMode::Normal => {
+                    (KeyCode::PageUp, _) | (KeyCode::Char('u'), KeyModifiers::CONTROL)
+                        if self.mode == AppMode::Normal =>
+                    {
                         self.page_up()
                     }
 
                     // ── Preview scroll ───────────────────────────────────────
-                    (KeyCode::Char(']'), KeyModifiers::NONE) | (KeyCode::Char('/'), KeyModifiers::NONE) => {
+                    (KeyCode::Char(']'), KeyModifiers::NONE) => {
                         self.preview_scroll = self.preview_scroll.saturating_add(5);
                     }
-                    (KeyCode::Char('['), KeyModifiers::NONE) | (KeyCode::Char('?'), KeyModifiers::NONE) | (KeyCode::Char('/'), KeyModifiers::SHIFT) => {
+                    (KeyCode::Char('['), KeyModifiers::NONE)
+                    | (KeyCode::Char('?'), KeyModifiers::NONE)
+                    | (KeyCode::Char('/'), KeyModifiers::SHIFT) => {
                         self.preview_scroll = self.preview_scroll.saturating_sub(5);
                     }
 
                     // ── Home directory ───────────────────────────────────────
-                    (KeyCode::Char('~'), KeyModifiers::SHIFT) if self.mode == AppMode::Normal => self.go_home()?,
+                    (KeyCode::Char('~'), KeyModifiers::SHIFT) if self.mode == AppMode::Normal => {
+                        self.go_home()?
+                    }
 
                     // ── Root / Drives ────────────────────────────────────────
                     (KeyCode::Char('\\'), KeyModifiers::NONE) if self.mode == AppMode::Normal => {
@@ -521,19 +1018,88 @@ impl AppState {
                     _ => {}
                 }
             }
-            Event::Mouse(mouse) => {
+            Event::Mouse(mut mouse) => {
                 self.last_event_time = Instant::now();
                 match mouse.kind {
-                    MouseEventKind::ScrollDown => {
+                    MouseEventKind::Moved => {
+                        // Mouse tracking can arrive much faster than a full TUI
+                        // frame. Render only the newest position and retain the
+                        // first meaningful event for the next iteration.
+                        while event::poll(Duration::ZERO)? {
+                            match event::read()? {
+                                Event::Mouse(next) if next.kind == MouseEventKind::Moved => {
+                                    mouse = next;
+                                }
+                                other => {
+                                    self.pending_event = Some(other);
+                                    break;
+                                }
+                            }
+                        }
                         let geo = self.layout_geometry.lock().clone();
-                        self.handle_scroll(&geo, mouse.column, mouse.row, true);
+                        self.hovered_row = self
+                            .hover_enabled
+                            .then(|| {
+                                geo.row_rects.iter().find_map(|(pane_idx, rows)| {
+                                    rows.iter()
+                                        .find(|(_, rect)| point_in(mouse.column, mouse.row, rect))
+                                        .map(|(file_idx, _)| (*pane_idx, *file_idx))
+                                })
+                            })
+                            .flatten();
+                        if self.mode == AppMode::ContextMenu {
+                            self.context_menu_hover = geo
+                                .context_menu_item_rects
+                                .iter()
+                                .position(|(rect, _)| point_in(mouse.column, mouse.row, rect));
+                        }
+                    }
+                    MouseEventKind::ScrollDown => {
+                        let mut steps = 1usize;
+                        while steps < 32 && event::poll(Duration::ZERO)? {
+                            match event::read()? {
+                                Event::Mouse(next) if next.kind == MouseEventKind::ScrollDown => {
+                                    steps += 1;
+                                }
+                                other => {
+                                    self.pending_event = Some(other);
+                                    break;
+                                }
+                            }
+                        }
+                        let geo = self.layout_geometry.lock().clone();
+                        self.handle_scroll(&geo, mouse.column, mouse.row, true, steps);
                     }
                     MouseEventKind::ScrollUp => {
+                        let mut steps = 1usize;
+                        while steps < 32 && event::poll(Duration::ZERO)? {
+                            match event::read()? {
+                                Event::Mouse(next) if next.kind == MouseEventKind::ScrollUp => {
+                                    steps += 1;
+                                }
+                                other => {
+                                    self.pending_event = Some(other);
+                                    break;
+                                }
+                            }
+                        }
                         let geo = self.layout_geometry.lock().clone();
-                        self.handle_scroll(&geo, mouse.column, mouse.row, false);
+                        self.handle_scroll(&geo, mouse.column, mouse.row, false, steps);
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
                         let geo = self.layout_geometry.lock().clone();
+
+                        if geo
+                            .search_rect
+                            .as_ref()
+                            .is_some_and(|rect| point_in(mouse.column, mouse.row, rect))
+                        {
+                            self.begin_search();
+                            return Ok(false);
+                        }
+                        if self.search_active {
+                            self.accept_search();
+                        }
 
                         // ── Context menu open: any click either selects an item or closes it ──
                         if self.mode == AppMode::ContextMenu {
@@ -555,13 +1121,28 @@ impl AppState {
                         // Clicking elsewhere while editing text commits/cancels the input.
                         if self.mode == AppMode::Rename {
                             self.commit_rename();
+                            if self.mode == AppMode::Rename {
+                                return Ok(false);
+                            }
                         } else if self.mode == AppMode::NewFolder {
                             self.commit_new_folder();
+                            if self.mode == AppMode::NewFolder {
+                                return Ok(false);
+                            }
+                        } else if self.mode == AppMode::NewFile {
+                            self.commit_new_file();
+                            if self.mode == AppMode::NewFile {
+                                return Ok(false);
+                            }
                         } else if self.mode == AppMode::ConfirmDelete
                             || self.mode == AppMode::ConfirmDeletePermanent
                             || self.mode == AppMode::Properties
                         {
-                            self.mode = AppMode::Normal;
+                            if self.mode == AppMode::Properties {
+                                self.close_properties();
+                            } else {
+                                self.mode = AppMode::Normal;
+                            }
                         }
 
                         // ── Sidebar resize divider ──
@@ -570,8 +1151,69 @@ impl AppState {
                             return Ok(false);
                         }
 
-                        // ── Sidebar: drives / quick access ──
+                        // ── Settings Toggles ──
                         let mut handled = false;
+                        for (rect, action) in geo.toggle_rects.iter() {
+                            if point_in(mouse.column, mouse.row, rect) {
+                                self.toggle_setting(*action);
+                                handled = true;
+                                break;
+                            }
+                        }
+                        if handled {
+                            return Ok(false);
+                        }
+
+                        // ── Save button in Preview Editor ──
+                        if let Some(rect) = geo.edit_save_btn_rect {
+                            if point_in(mouse.column, mouse.row, &rect) {
+                                self.save_edited_preview();
+                                return Ok(false);
+                            }
+                        }
+
+                        // ── Slide Prev / Next in visual preview ──
+                        if let Some(rect) = geo.slide_prev_rect {
+                            if point_in(mouse.column, mouse.row, &rect) {
+                                self.pptx_slide_index = self.pptx_slide_index.saturating_sub(1);
+                                return Ok(false);
+                            }
+                        }
+                        if let Some(rect) = geo.slide_next_rect {
+                            if point_in(mouse.column, mouse.row, &rect) {
+                                self.pptx_slide_index = self.pptx_slide_index.saturating_add(1);
+                                return Ok(false);
+                            }
+                        }
+
+                        // ── Clickable Directory Preview Items ──
+                        if self.dir_preview_clickable {
+                            for (rect, path) in geo.preview_dir_item_rects.iter() {
+                                if point_in(mouse.column, mouse.row, rect) {
+                                    if path.is_dir() {
+                                        self.navigate_to(path);
+                                    } else if let Some(parent) = path.parent() {
+                                        let file_name = path.file_name();
+                                        self.navigate_to(parent);
+                                        if let Some(name) = file_name {
+                                            if let Some(cur) = self.levels.last_mut() {
+                                                if let Some(idx) = cur
+                                                    .files
+                                                    .iter()
+                                                    .position(|f| f.path.file_name() == Some(name))
+                                                {
+                                                    cur.selected = idx;
+                                                    cur.select_anchor = idx;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    return Ok(false);
+                                }
+                            }
+                        }
+
+                        // ── Sidebar: drives / quick access ──
                         for (rect, path) in geo.sidebar_item_rects.iter() {
                             if point_in(mouse.column, mouse.row, rect) {
                                 self.navigate_to(path);
@@ -579,7 +1221,9 @@ impl AppState {
                                 break;
                             }
                         }
-                        if handled { return Ok(false); }
+                        if handled {
+                            return Ok(false);
+                        }
 
                         // ── Breadcrumb: clickable path segments ──
                         for (rect, path) in geo.breadcrumb_segment_rects.iter() {
@@ -589,7 +1233,18 @@ impl AppState {
                                 break;
                             }
                         }
-                        if handled { return Ok(false); }
+                        if handled {
+                            return Ok(false);
+                        }
+
+                        if geo
+                            .pane_sort_rect
+                            .as_ref()
+                            .is_some_and(|rect| point_in(mouse.column, mouse.row, rect))
+                        {
+                            self.select_sort_mode(self.sort_mode);
+                            return Ok(false);
+                        }
 
                         // ── Divider drag ──
                         for (idx, dr) in geo.divider_rects.iter().enumerate() {
@@ -599,10 +1254,18 @@ impl AppState {
                                 break;
                             }
                         }
-                        if handled { return Ok(false); }
+                        if handled {
+                            return Ok(false);
+                        }
 
                         // ── File/folder rows ──
-                        self.handle_row_click(&geo, mouse.column, mouse.row, mouse.modifiers, false);
+                        self.handle_row_click(
+                            &geo,
+                            mouse.column,
+                            mouse.row,
+                            mouse.modifiers,
+                            false,
+                        );
                     }
                     MouseEventKind::Down(MouseButton::Right) => {
                         let geo = self.layout_geometry.lock().clone();
@@ -611,8 +1274,16 @@ impl AppState {
                         }
                         // Right-click selects the item under the cursor first, then opens
                         // the context menu at the mouse position.
-                        self.handle_row_click(&geo, mouse.column, mouse.row, KeyModifiers::NONE, true);
-                        let target = self.selected_entry_path();
+                        let hit_row = self.handle_row_click(
+                            &geo,
+                            mouse.column,
+                            mouse.row,
+                            KeyModifiers::NONE,
+                            true,
+                        );
+                        // Empty pane/preview space gets the background menu. It
+                        // must never apply actions to a stale highlighted row.
+                        let target = hit_row.then(|| self.selected_entry_path()).flatten();
                         self.open_context_menu(target);
                         self.pending_menu_pos = (mouse.column, mouse.row);
                     }
@@ -624,26 +1295,37 @@ impl AppState {
                             let geo = self.layout_geometry.lock().clone();
                             if let Some(_first_pane) = geo.pane_rects.first() {
                                 let term_w = crossterm::terminal::size().unwrap_or((100, 30)).0;
-                                let old_bound = geo.divider_rects.get(idx).map(|r| r.x).unwrap_or(0);
+                                let old_bound =
+                                    geo.divider_rects.get(idx).map(|r| r.x).unwrap_or(0);
                                 let new_bound = mouse.column;
 
-                                if old_bound > 0 && new_bound != old_bound && new_bound > 0 && new_bound < term_w {
-                                    let delta_ratio = (new_bound as f32 - old_bound as f32) / term_w as f32;
+                                if old_bound > 0
+                                    && new_bound != old_bound
+                                    && new_bound > 0
+                                    && new_bound < term_w
+                                {
+                                    let delta_ratio =
+                                        (new_bound as f32 - old_bound as f32) / term_w as f32;
 
                                     let num = self.levels.len();
                                     let start = if num > 4 { num - 4 } else { 0 };
                                     let panes = &self.levels[start..];
                                     let np = panes.len();
-                                    let has_preview = panes.last().map_or(false, |l| !l.files.is_empty());
+                                    let has_preview =
+                                        panes.last().map_or(false, |l| !l.files.is_empty());
                                     let n_cols = if has_preview { np + 1 } else { np };
 
                                     let start_ratio_idx = 5 - n_cols;
                                     let ratio_idx_left = start_ratio_idx + idx;
                                     let ratio_idx_right = ratio_idx_left + 1;
 
-                                    if ratio_idx_left < self.column_ratios.len() && ratio_idx_right < self.column_ratios.len() {
-                                        let val_left = self.column_ratios[ratio_idx_left] + delta_ratio;
-                                        let val_right = self.column_ratios[ratio_idx_right] - delta_ratio;
+                                    if ratio_idx_left < self.column_ratios.len()
+                                        && ratio_idx_right < self.column_ratios.len()
+                                    {
+                                        let val_left =
+                                            self.column_ratios[ratio_idx_left] + delta_ratio;
+                                        let val_right =
+                                            self.column_ratios[ratio_idx_right] - delta_ratio;
 
                                         if val_left > 0.06 && val_right > 0.06 {
                                             self.column_ratios[ratio_idx_left] = val_left;
@@ -666,23 +1348,91 @@ impl AppState {
         Ok(false)
     }
 
-    fn handle_scroll(&mut self, geo: &LayoutGeometry, col: u16, row: u16, down: bool) {
+    fn handle_scroll(
+        &mut self,
+        geo: &LayoutGeometry,
+        col: u16,
+        row: u16,
+        down: bool,
+        steps: usize,
+    ) {
+        let rows = 3usize.saturating_mul(steps.max(1));
         if let Some(pr) = geo.preview_rect {
             if point_in(col, row, &pr) {
-                if down { self.preview_scroll = self.preview_scroll.saturating_add(3); }
-                else { self.preview_scroll = self.preview_scroll.saturating_sub(3); }
+                let selected = self.selected_file();
+                let ext = selected
+                    .as_ref()
+                    .and_then(|path| path.extension())
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+
+                // Visual presentations and PDFs are paged content, not
+                // scrollable text blocks. The wheel requests the adjacent
+                // rendered page instead of moving a metadata header.
+                let visual_presentation = matches!(ext.as_str(), "ppt" | "pptx" | "odp")
+                    && self.office_mode == OfficeRenderMode::Full;
+                let visual_pdf = ext == "pdf" && self.pdf_mode == PdfRenderMode::Visual;
+                if visual_presentation || visual_pdf {
+                    if down {
+                        let last = selected
+                            .as_ref()
+                            .and_then(|path| {
+                                if visual_pdf {
+                                    crate::preview::pdf_page_count(path)
+                                } else {
+                                    crate::preview::presentation_slide_count(path)
+                                }
+                            })
+                            .map(|count| count.saturating_sub(1));
+                        self.pptx_slide_index = match last {
+                            Some(last) => self.pptx_slide_index.saturating_add(steps).min(last),
+                            None => self.pptx_slide_index.saturating_add(steps),
+                        };
+                    } else {
+                        self.pptx_slide_index = self.pptx_slide_index.saturating_sub(steps);
+                    }
+                    self.preview_scroll = 0;
+                } else if crate::preview::is_visual_preview(
+                    selected.as_ref(),
+                    self.office_mode,
+                    self.pdf_mode,
+                ) {
+                    // Static visual previews have nothing textual to scroll.
+                    self.preview_scroll = 0;
+                } else if down {
+                    self.preview_scroll = self.preview_scroll.saturating_add(rows);
+                } else {
+                    self.preview_scroll = self.preview_scroll.saturating_sub(rows);
+                }
                 return;
             }
         }
         for (idx, pr) in geo.pane_rects.iter().enumerate() {
             if point_in(col, row, pr) {
+                if self.search_active
+                    && !self.search_query.is_empty()
+                    && idx + 1 == geo.pane_rects.len()
+                {
+                    self.select_next_search_match(down);
+                    return;
+                }
                 let num = self.levels.len();
                 let start = if num > 4 { num - 4 } else { 0 };
-                let real_idx = start + idx;
+                let real_idx = geo
+                    .pane_level_indices
+                    .get(&idx)
+                    .copied()
+                    .unwrap_or(start + idx);
                 if real_idx < self.levels.len() {
-                    self.current_level = real_idx;
-                    self.levels.truncate(self.current_level + 1);
-                    if down { self.move_down(); } else { self.move_up(); }
+                    let visible = pr.height.saturating_sub(2) as usize;
+                    let level = &mut self.levels[real_idx];
+                    let max_scroll = level.files.len().saturating_sub(visible);
+                    if down {
+                        level.scroll = level.scroll.saturating_add(rows).min(max_scroll);
+                    } else {
+                        level.scroll = level.scroll.saturating_sub(rows);
+                    }
                 }
                 return;
             }
@@ -692,20 +1442,35 @@ impl AppState {
     /// Shared row hit-testing for left-click selection and right-click.
     /// `for_context_menu` skips double-click/rename detection since a right
     /// click should just select, not toggle rename or open.
-    fn handle_row_click(&mut self, geo: &LayoutGeometry, col: u16, row: u16, mods: KeyModifiers, for_context_menu: bool) {
+    fn handle_row_click(
+        &mut self,
+        geo: &LayoutGeometry,
+        col: u16,
+        row: u16,
+        mods: KeyModifiers,
+        for_context_menu: bool,
+    ) -> bool {
         for (pane_idx, rows) in geo.row_rects.iter() {
             for (file_idx, rect) in rows {
                 if point_in(col, row, rect) {
                     let num = self.levels.len();
                     let start = if num > 4 { num - 4 } else { 0 };
-                    let real_level_idx = start + pane_idx;
-                    if real_level_idx >= self.levels.len() { return; }
+                    let real_level_idx = geo
+                        .pane_level_indices
+                        .get(pane_idx)
+                        .copied()
+                        .unwrap_or(start + pane_idx);
+                    if real_level_idx >= self.levels.len() {
+                        return false;
+                    }
 
                     let was_active_pane = self.current_level == real_level_idx;
                     self.current_level = real_level_idx;
                     self.levels.truncate(self.current_level + 1);
 
-                    if *file_idx >= self.current().files.len() { return; }
+                    if *file_idx >= self.current().files.len() {
+                        return false;
+                    }
 
                     if for_context_menu {
                         // Right-click: select without clobbering an existing multi-selection.
@@ -717,18 +1482,18 @@ impl AppState {
                         }
                         self.reset_image_state();
                         self.mode = AppMode::Normal;
-                        return;
+                        return true;
                     }
 
                     if mods.contains(KeyModifiers::SHIFT) {
                         self.mark_range(*file_idx);
                         self.reset_image_state();
-                        return;
+                        return true;
                     }
                     if mods.contains(KeyModifiers::CONTROL) {
                         self.toggle_mark(*file_idx);
                         self.reset_image_state();
-                        return;
+                        return true;
                     }
 
                     let now = Instant::now();
@@ -743,7 +1508,9 @@ impl AppState {
 
                     // A slower second click on an already-selected, already-active row
                     // (Explorer-style click-click-pause) starts an inline rename.
-                    let is_slow_rename_click = !is_double_click && was_active_pane && !had_marks
+                    let is_slow_rename_click = !is_double_click
+                        && was_active_pane
+                        && !had_marks
                         && old_selected == *file_idx
                         && matches!(last_click_val,
                             Some((last_time, last_pane, last_file))
@@ -765,12 +1532,40 @@ impl AppState {
                         self.last_click = Some((now, *pane_idx, *file_idx));
                         self.reset_image_state();
                     }
-                    return;
+                    return true;
                 }
             }
         }
-        // Clicked empty space inside a pane area but not on any row: just clear marks.
-        self.clear_marks();
+        // Only directory-pane background clicks clear marks. Preview, sidebar,
+        // breadcrumb, and status clicks must not mutate directory selection.
+        if geo.pane_rects.iter().any(|rect| point_in(col, row, rect)) {
+            self.clear_marks();
+        }
+        false
+    }
+
+    fn keep_selection_visible(&mut self) {
+        let num = self.levels.len();
+        let start = num.saturating_sub(4);
+        if self.current_level < start {
+            return;
+        }
+        let pane_idx = self.current_level - start;
+        let visible = self
+            .layout_geometry
+            .lock()
+            .pane_rects
+            .get(pane_idx)
+            .map(|r| r.height.saturating_sub(2) as usize)
+            .unwrap_or(1)
+            .max(1);
+        let cur = self.current_mut();
+        if cur.selected < cur.scroll {
+            cur.scroll = cur.selected;
+        } else if cur.selected >= cur.scroll.saturating_add(visible) {
+            cur.scroll = cur.selected + 1 - visible;
+        }
+        cur.scroll = cur.scroll.min(cur.files.len().saturating_sub(visible));
     }
 
     // ── Movement helpers ──────────────────────────────────────────────────────
@@ -782,6 +1577,7 @@ impl AppState {
         }
         if current.selected + 1 < current.files.len() {
             current.selected += 1;
+            self.keep_selection_visible();
             self.reset_image_state();
         }
     }
@@ -790,6 +1586,7 @@ impl AppState {
         let current = self.current_mut();
         if current.selected > 0 {
             current.selected -= 1;
+            self.keep_selection_visible();
             self.reset_image_state();
         }
     }
@@ -803,7 +1600,7 @@ impl AppState {
         let selected_entry = &current.files[current.selected];
 
         if selected_entry.is_dir {
-            let files = list_dir(&selected_entry.path)?;
+            let files = self.load_sorted_dir(&selected_entry.path)?;
 
             let new_level = DirLevel::new(selected_entry.path.clone(), files);
 
@@ -826,10 +1623,11 @@ impl AppState {
             let current = self.current();
             if let Some(parent) = current.path.parent() {
                 let parent_path = parent.to_path_buf();
-                let files = list_dir(&parent_path)?;
+                let files = self.load_sorted_dir(&parent_path)?;
 
                 // Keep the cursor on the directory we came from
-                let selected = files.iter()
+                let selected = files
+                    .iter()
                     .position(|e| e.path == current.path)
                     .unwrap_or(0);
 
@@ -848,6 +1646,7 @@ impl AppState {
         let current = self.current_mut();
         if current.selected != 0 {
             current.selected = 0;
+            current.scroll = 0;
             self.reset_image_state();
         }
     }
@@ -858,17 +1657,20 @@ impl AppState {
             let last = current.files.len() - 1;
             if current.selected != last {
                 current.selected = last;
+                self.keep_selection_visible();
                 self.reset_image_state();
             }
         }
     }
-    
+
     pub fn open_selected(&mut self) {
         let current = self.current();
-        if current.files.is_empty() { return; }
-        
+        if current.files.is_empty() {
+            return;
+        }
+
         let selected_entry = &current.files[current.selected];
-        
+
         if selected_entry.is_dir {
             // It's a directory, go right
             let _ = self.go_right();
@@ -900,6 +1702,7 @@ impl AppState {
         let target = (current.selected + 10).min(current.files.len() - 1);
         if current.selected != target {
             current.selected = target;
+            self.keep_selection_visible();
             self.reset_image_state();
         }
     }
@@ -909,13 +1712,14 @@ impl AppState {
         let target = current.selected.saturating_sub(10);
         if current.selected != target {
             current.selected = target;
+            self.keep_selection_visible();
             self.reset_image_state();
         }
     }
 
     fn go_home(&mut self) -> anyhow::Result<()> {
         if let Some(home) = dirs::home_dir() {
-            let files = list_dir(&home)?;
+            let files = self.load_sorted_dir(&home)?;
             self.levels = vec![DirLevel::new(home, files)];
             self.current_level = 0;
         }
@@ -925,7 +1729,7 @@ impl AppState {
     #[cfg(not(windows))]
     fn go_root(&mut self) -> anyhow::Result<()> {
         let root = PathBuf::from("/");
-        let files = list_dir(&root)?;
+        let files = self.load_sorted_dir(&root)?;
         self.levels = vec![DirLevel::new(root, files)];
         self.current_level = 0;
         Ok(())
@@ -947,9 +1751,15 @@ impl AppState {
 
     pub fn selected_file(&self) -> Option<PathBuf> {
         let cur = self.current();
-        if cur.files.is_empty() { return None; }
+        if cur.files.is_empty() {
+            return None;
+        }
         let p = &cur.files[cur.selected];
-        if !p.is_dir { Some(p.path.clone()) } else { None }
+        if !p.is_dir {
+            Some(p.path.clone())
+        } else {
+            None
+        }
     }
 
     /// Path of the currently highlighted entry, whether it's a file or a directory.
@@ -957,25 +1767,128 @@ impl AppState {
     /// use `selected_file` where only *files* are meaningful (e.g. image preview).
     pub fn selected_entry_path(&self) -> Option<PathBuf> {
         let cur = self.current();
-        if cur.files.is_empty() { return None; }
+        if cur.files.is_empty() {
+            return None;
+        }
         Some(cur.files[cur.selected].path.clone())
+    }
+
+    pub fn begin_search(&mut self) {
+        if !self.search_active {
+            self.search_original_selection = Some(self.current().selected);
+            self.search_query.clear();
+        }
+        self.search_active = true;
+    }
+
+    fn accept_search(&mut self) {
+        self.search_active = false;
+        self.search_query.clear();
+        self.search_original_selection = None;
+    }
+
+    fn cancel_search(&mut self) {
+        if let Some(index) = self.search_original_selection.take() {
+            let last = self.current().files.len().saturating_sub(1);
+            self.current_mut().selected = index.min(last);
+            self.keep_selection_visible();
+        }
+        self.search_active = false;
+        self.search_query.clear();
+        self.preview_scroll = 0;
+    }
+
+    pub fn search_matches(&self) -> Vec<usize> {
+        if self.search_query.is_empty() {
+            return Vec::new();
+        }
+        self.current()
+            .files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                filename_matches(entry, &self.search_query).then_some(index)
+            })
+            .collect()
+    }
+
+    pub fn search_match_position(&self) -> (usize, usize) {
+        let matches = self.search_matches();
+        let position = matches
+            .iter()
+            .position(|index| *index == self.current().selected)
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        (position, matches.len())
+    }
+
+    fn select_first_search_match(&mut self) {
+        let Some(index) = self.search_matches().first().copied() else {
+            if self.search_query.is_empty() {
+                if let Some(original) = self.search_original_selection {
+                    self.current_mut().selected =
+                        original.min(self.current().files.len().saturating_sub(1));
+                    self.keep_selection_visible();
+                }
+            }
+            return;
+        };
+        self.current_mut().selected = index;
+        self.keep_selection_visible();
+        self.preview_scroll = 0;
+        self.pptx_slide_index = 0;
+    }
+
+    fn select_next_search_match(&mut self, forward: bool) {
+        let matches = self.search_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let selected = self.current().selected;
+        let current_position = matches.iter().position(|index| *index == selected);
+        let next_position = match (current_position, forward) {
+            (Some(position), true) => (position + 1) % matches.len(),
+            (Some(0), false) | (None, false) => matches.len() - 1,
+            (Some(position), false) => position - 1,
+            (None, true) => 0,
+        };
+        self.current_mut().selected = matches[next_position];
+        self.keep_selection_visible();
+        self.preview_scroll = 0;
+        self.pptx_slide_index = 0;
     }
 
     /// True if the selected file is an image
     fn is_image_selected(&self) -> bool {
         self.selected_file().map_or(false, |p| {
-            let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-            matches!(ext.as_str(), "jpg"|"jpeg"|"png"|"bmp"|"gif"|"webp"|"tiff"|"tif"|"ico")
+            let ext = p
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            matches!(
+                ext.as_str(),
+                "jpg" | "jpeg" | "png" | "bmp" | "gif" | "webp" | "tiff" | "tif" | "ico"
+            )
         })
     }
 
     /// Reset image transform state (called when navigating away)
     pub fn reset_image_state(&mut self) {
-        self.image_zoom     = 1.0;
+        if self.edit_preview_mode {
+            self.edit_preview_mode = false;
+            if self.edit_dirty {
+                self.set_notice("Left edit mode; unsaved changes are kept", false);
+            }
+        }
+        self.image_zoom = 1.0;
         self.image_rotation = 0;
-        self.image_flip_h   = false;
-        self.mode           = AppMode::Normal;
+        self.image_flip_h = false;
+        self.mode = AppMode::Normal;
         self.preview_scroll = 0;
+        self.search_active = false;
+        self.search_query.clear();
+        self.search_original_selection = None;
     }
 
     /// Calculate the visual boundaries of all columns in character cells
@@ -1014,7 +1927,9 @@ impl AppState {
     // ── Text-editing helpers for Rename / New Folder input ───────────────────
 
     fn byte_idx(&self, char_idx: usize) -> usize {
-        self.input_buffer.char_indices().nth(char_idx)
+        self.input_buffer
+            .char_indices()
+            .nth(char_idx)
             .map(|(b, _)| b)
             .unwrap_or(self.input_buffer.len())
     }
@@ -1035,7 +1950,7 @@ impl AppState {
 
     /// Windows filenames may not contain: \ / : * ? " < > | and may not be "." or "..".
     fn validate_filename(name: &str) -> Result<(), String> {
-        if name.is_empty() {
+        if name.is_empty() || name.chars().all(char::is_whitespace) {
             return Err("Name can't be empty".into());
         }
         if name == "." || name == ".." {
@@ -1048,6 +1963,21 @@ impl AppState {
         if name.trim_end_matches('.') != name || name.trim_end() != name {
             return Err("Name can't end with a space or a period".into());
         }
+        // Windows reserves these DOS device names even when an extension is
+        // present (for example, "CON.txt").
+        let stem = name
+            .split('.')
+            .next()
+            .unwrap_or(name)
+            .trim_end()
+            .to_ascii_uppercase();
+        let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || (stem.len() == 4
+                && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                && matches!(stem.as_bytes()[3], b'1'..=b'9'));
+        if reserved {
+            return Err("That name is reserved by Windows".into());
+        }
         Ok(())
     }
 
@@ -1058,13 +1988,17 @@ impl AppState {
         if !cur.marked.is_empty() {
             return cur.marked.iter().cloned().collect();
         }
-        if cur.files.is_empty() { return Vec::new(); }
+        if cur.files.is_empty() {
+            return Vec::new();
+        }
         vec![cur.files[cur.selected].path.clone()]
     }
 
     pub fn toggle_mark(&mut self, idx: usize) {
         let cur = self.current_mut();
-        if idx >= cur.files.len() { return; }
+        if idx >= cur.files.len() {
+            return;
+        }
         let path = cur.files[idx].path.clone();
         if !cur.marked.remove(&path) {
             cur.marked.insert(path);
@@ -1075,9 +2009,15 @@ impl AppState {
 
     pub fn mark_range(&mut self, to: usize) {
         let cur = self.current_mut();
-        if cur.files.is_empty() { return; }
+        if cur.files.is_empty() {
+            return;
+        }
         let to = to.min(cur.files.len() - 1);
-        let (lo, hi) = if cur.select_anchor <= to { (cur.select_anchor, to) } else { (to, cur.select_anchor) };
+        let (lo, hi) = if cur.select_anchor <= to {
+            (cur.select_anchor, to)
+        } else {
+            (to, cur.select_anchor)
+        };
         for i in lo..=hi {
             cur.marked.insert(cur.files[i].path.clone());
         }
@@ -1092,9 +2032,15 @@ impl AppState {
 
     pub fn start_rename(&mut self) {
         let cur = self.current();
-        if cur.files.is_empty() { return; }
-        let name = cur.files[cur.selected].path.file_name()
-            .unwrap_or_default().to_string_lossy().to_string();
+        if cur.files.is_empty() {
+            return;
+        }
+        let name = cur.files[cur.selected]
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         let is_dir = cur.files[cur.selected].is_dir;
         self.input_buffer = name.clone();
         // Select the basename but not the extension (files only).
@@ -1112,14 +2058,16 @@ impl AppState {
     }
 
     fn commit_rename(&mut self) {
-        let new_name = self.input_buffer.trim().to_string();
+        let new_name = self.input_buffer.clone();
         if let Err(e) = Self::validate_filename(&new_name) {
             self.set_notice(e, true);
-            self.mode = AppMode::Normal;
             return;
         }
         let cur = self.current();
-        if cur.files.is_empty() { self.mode = AppMode::Normal; return; }
+        if cur.files.is_empty() {
+            self.mode = AppMode::Normal;
+            return;
+        }
         let old_path = cur.files[cur.selected].path.clone();
         let mut new_path = old_path.clone();
         new_path.set_file_name(&new_name);
@@ -1130,14 +2078,14 @@ impl AppState {
         }
         if new_path.exists() {
             self.set_notice(format!("\"{}\" already exists", new_name), true);
-            self.mode = AppMode::Normal;
             return;
         }
         match fs::rename(&old_path, &new_path) {
             Ok(_) => {
                 if let Some(parent) = old_path.parent() {
                     DIR_CACHE.lock().remove(parent);
-                    if let Ok(files) = list_dir(parent) {
+                    crate::preview::invalidate_cached_dir(Some(parent));
+                    if let Ok(files) = self.load_sorted_dir(parent) {
                         let cur = self.current_mut();
                         cur.files = files;
                         // Preserve selection on the renamed item.
@@ -1149,7 +2097,10 @@ impl AppState {
                 }
                 self.set_notice(format!("Renamed to \"{}\"", new_name), false);
             }
-            Err(e) => self.set_notice(format!("Rename failed: {}", e), true),
+            Err(e) => {
+                self.set_notice(format!("Rename failed: {}", e), true);
+                return;
+            }
         }
         self.mode = AppMode::Normal;
     }
@@ -1157,23 +2108,22 @@ impl AppState {
     // ── New folder ─────────────────────────────────────────────────────────
 
     fn commit_new_folder(&mut self) {
-        let name = self.input_buffer.trim().to_string();
+        let name = self.input_buffer.clone();
         if let Err(e) = Self::validate_filename(&name) {
             self.set_notice(e, true);
-            self.mode = AppMode::Normal;
             return;
         }
         let parent = self.current().path.clone();
         let new_dir = parent.join(&name);
         if new_dir.exists() {
             self.set_notice(format!("\"{}\" already exists", name), true);
-            self.mode = AppMode::Normal;
             return;
         }
         match fs::create_dir(&new_dir) {
             Ok(_) => {
                 DIR_CACHE.lock().remove(&parent);
-                if let Ok(files) = list_dir(&parent) {
+                crate::preview::invalidate_cached_dir(Some(&parent));
+                if let Ok(files) = self.load_sorted_dir(&parent) {
                     let cur = self.current_mut();
                     cur.files = files;
                     if let Some(pos) = cur.files.iter().position(|f| f.path == new_dir) {
@@ -1182,28 +2132,89 @@ impl AppState {
                 }
                 self.set_notice(format!("Created folder \"{}\"", name), false);
             }
-            Err(e) => self.set_notice(format!("Couldn't create folder: {}", e), true),
+            Err(e) => {
+                self.set_notice(format!("Couldn't create folder: {}", e), true);
+                return;
+            }
         }
         self.mode = AppMode::Normal;
+    }
+
+    fn commit_new_file(&mut self) {
+        let name = self.input_buffer.clone();
+        if let Err(e) = Self::validate_filename(&name) {
+            self.set_notice(e, true);
+            return;
+        }
+        let parent = self.current().path.clone();
+        let new_file = parent.join(&name);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&new_file)
+        {
+            Ok(_) => {
+                DIR_CACHE.lock().remove(&parent);
+                crate::preview::invalidate_cached_dir(Some(&parent));
+                if let Ok(files) = self.load_sorted_dir(&parent) {
+                    let cur = self.current_mut();
+                    cur.files = files;
+                    if let Some(pos) = cur.files.iter().position(|entry| entry.path == new_file) {
+                        cur.selected = pos;
+                        cur.select_anchor = pos;
+                    }
+                }
+                self.set_notice(format!("Created file \"{}\"", name), false);
+                self.mode = AppMode::Normal;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.set_notice(format!("\"{}\" already exists", name), true);
+            }
+            Err(e) => {
+                self.set_notice(format!("Couldn't create file: {}", e), true);
+            }
+        }
     }
 
     // ── Delete ─────────────────────────────────────────────────────────────
 
     fn do_delete(&mut self, permanent: bool) {
         let paths = self.selected_paths();
-        if paths.is_empty() { self.mode = AppMode::Normal; return; }
+        if paths.is_empty() {
+            self.mode = AppMode::Normal;
+            return;
+        }
         let mut errors = 0usize;
         let mut deleted = 0usize;
-        for path in &paths {
-            let result = if path.is_dir() { fs::remove_dir_all(path) } else { fs::remove_file(path) };
-            match result {
-                Ok(_) => deleted += 1,
-                Err(_) => errors += 1,
+
+        #[cfg(windows)]
+        if !permanent {
+            match move_to_recycle_bin(&paths) {
+                Ok(()) => deleted = paths.len(),
+                Err(_) => errors = paths.len(),
+            }
+        }
+
+        #[cfg(not(windows))]
+        let _ = permanent;
+
+        if permanent || cfg!(not(windows)) {
+            for path in &paths {
+                let result = if path.is_dir() {
+                    fs::remove_dir_all(path)
+                } else {
+                    fs::remove_file(path)
+                };
+                match result {
+                    Ok(_) => deleted += 1,
+                    Err(_) => errors += 1,
+                }
             }
         }
         if let Some(parent) = paths[0].parent().map(|p| p.to_path_buf()) {
             DIR_CACHE.lock().remove(&parent);
-            if let Ok(files) = list_dir(&parent) {
+            crate::preview::invalidate_cached_dir(Some(&parent));
+            if let Ok(files) = self.load_sorted_dir(&parent) {
                 let cur = self.current_mut();
                 cur.files = files;
                 cur.marked.clear();
@@ -1212,11 +2223,24 @@ impl AppState {
                 }
             }
         }
-        let _ = permanent;
         if errors > 0 {
-            self.set_notice(format!("Deleted {} item(s), {} failed (in use or access denied)", deleted, errors), errors == deleted);
+            self.set_notice(
+                format!(
+                    "Deleted {} item(s), {} failed (in use or access denied)",
+                    deleted, errors
+                ),
+                errors == deleted,
+            );
         } else {
-            self.set_notice(format!("Deleted {} item(s)", deleted), false);
+            let destination = if !permanent && cfg!(windows) {
+                "to Recycle Bin"
+            } else {
+                "permanently"
+            };
+            self.set_notice(
+                format!("Deleted {} item(s) {}", deleted, destination),
+                false,
+            );
         }
         self.mode = AppMode::Normal;
     }
@@ -1224,13 +2248,26 @@ impl AppState {
     // ── Paste ──────────────────────────────────────────────────────────────
 
     pub fn do_paste(&mut self) {
-        let Some((srcs, is_cut)) = self.clipboard.clone() else { return; };
+        let Some((srcs, is_cut)) = self.clipboard.clone() else {
+            return;
+        };
         let dest_dir = self.current().path.clone();
         let mut ok = 0usize;
         let mut errors: Vec<String> = Vec::new();
 
         for src_path in &srcs {
-            let Some(file_name) = src_path.file_name() else { continue; };
+            let Some(file_name) = src_path.file_name() else {
+                continue;
+            };
+
+            if src_path.is_dir() && destination_is_inside_source(src_path, &dest_dir) {
+                errors.push(format!(
+                    "{}: can't copy or move a folder into itself",
+                    file_name.to_string_lossy()
+                ));
+                continue;
+            }
+
             let mut dest_path = dest_dir.join(file_name);
 
             // Collision handling: never silently overwrite — auto-suffix instead.
@@ -1242,17 +2279,17 @@ impl AppState {
             }
 
             let result = if is_cut {
-                fs::rename(src_path, &dest_path)
-                    .or_else(|_| {
-                        // Cross-drive move: rename fails, fall back to copy+delete.
-                        if src_path.is_dir() {
-                            copy_dir_all(src_path, &dest_path)
-                                .and_then(|_| fs::remove_dir_all(src_path))
-                        } else {
-                            fs::copy(src_path, &dest_path).map(|_| ())
-                                .and_then(|_| fs::remove_file(src_path))
-                        }
-                    })
+                fs::rename(src_path, &dest_path).or_else(|_| {
+                    // Cross-drive move: rename fails, fall back to copy+delete.
+                    if src_path.is_dir() {
+                        copy_dir_all(src_path, &dest_path)
+                            .and_then(|_| fs::remove_dir_all(src_path))
+                    } else {
+                        fs::copy(src_path, &dest_path)
+                            .map(|_| ())
+                            .and_then(|_| fs::remove_file(src_path))
+                    }
+                })
             } else if src_path.is_dir() {
                 copy_dir_all(src_path, &dest_path)
             } else {
@@ -1262,14 +2299,18 @@ impl AppState {
             match result {
                 Ok(_) => {
                     ok += 1;
-                    if let Some(p) = src_path.parent() { DIR_CACHE.lock().remove(p); }
+                    if let Some(p) = src_path.parent() {
+                        DIR_CACHE.lock().remove(p);
+                        crate::preview::invalidate_cached_dir(Some(p));
+                    }
                 }
                 Err(e) => errors.push(format!("{}: {}", file_name.to_string_lossy(), e)),
             }
         }
 
         DIR_CACHE.lock().remove(&dest_dir);
-        if let Ok(files) = list_dir(&dest_dir) {
+        crate::preview::invalidate_cached_dir(Some(&dest_dir));
+        if let Ok(files) = self.load_sorted_dir(&dest_dir) {
             self.current_mut().files = files;
         }
         if is_cut && errors.is_empty() {
@@ -1278,13 +2319,17 @@ impl AppState {
         if errors.is_empty() {
             self.set_notice(format!("Pasted {} item(s)", ok), false);
         } else {
-            self.set_notice(format!("Pasted {} item(s), {} failed", ok, errors.len()), true);
+            self.set_notice(
+                format!("Pasted {} item(s), {} failed", ok, errors.len()),
+                true,
+            );
         }
     }
 
     // ── Context menu ──────────────────────────────────────────────────────
 
     pub fn open_context_menu(&mut self, path: Option<PathBuf>) {
+        self.context_menu_hover = None;
         self.context_menu_target = path.clone();
         let has_selection = path.is_some();
         let has_clipboard = self.clipboard.is_some();
@@ -1295,15 +2340,20 @@ impl AppState {
             items.push(ContextAction::Cut);
             items.push(ContextAction::Copy);
         }
-        if has_clipboard { items.push(ContextAction::Paste); }
+        if has_clipboard {
+            items.push(ContextAction::Paste);
+        }
         if has_selection {
             items.push(ContextAction::Rename);
             items.push(ContextAction::Delete);
             items.push(ContextAction::CopyPath);
         }
         items.push(ContextAction::OpenInTerminal);
+        items.push(ContextAction::NewFile);
         items.push(ContextAction::NewFolder);
-        if has_selection { items.push(ContextAction::Properties); }
+        if has_selection {
+            items.push(ContextAction::Properties);
+        }
         self.context_menu_items = items;
         self.mode = AppMode::ContextMenu;
     }
@@ -1312,20 +2362,30 @@ impl AppState {
         let target = self.context_menu_target.clone();
         self.mode = AppMode::Normal;
         match action {
-            ContextAction::Open => { self.open_selected(); }
+            ContextAction::Open => {
+                self.open_selected();
+            }
             ContextAction::OpenWith => self.do_open_with(target),
             ContextAction::Cut => {
                 let paths = self.selected_paths();
-                if !paths.is_empty() { self.clipboard = Some((paths, true)); }
+                if !paths.is_empty() {
+                    self.clipboard = Some((paths, true));
+                }
             }
             ContextAction::Copy => {
                 let paths = self.selected_paths();
-                if !paths.is_empty() { self.clipboard = Some((paths, false)); }
+                if !paths.is_empty() {
+                    self.clipboard = Some((paths, false));
+                }
             }
             ContextAction::Paste => self.do_paste(),
             ContextAction::Rename => self.start_rename(),
             ContextAction::Delete => self.mode = AppMode::ConfirmDelete,
-            ContextAction::Properties => self.mode = AppMode::Properties,
+            ContextAction::Properties => {
+                if let Some(path) = target.or_else(|| self.selected_entry_path()) {
+                    self.open_properties(path);
+                }
+            }
             ContextAction::CopyPath => self.do_copy_path(target),
             ContextAction::OpenInTerminal => self.do_open_in_terminal(),
             ContextAction::NewFolder => {
@@ -1334,11 +2394,22 @@ impl AppState {
                 self.input_cursor = 0;
                 self.input_sel_start = 0;
             }
+            ContextAction::NewFile => {
+                self.mode = AppMode::NewFile;
+                self.input_buffer.clear();
+                self.input_cursor = 0;
+                self.input_sel_start = 0;
+            }
         }
     }
 
     fn do_copy_path(&mut self, target: Option<PathBuf>) {
-        let Some(path) = target.or_else(|| self.selected_entry_path()).or_else(|| Some(self.current().path.clone())) else { return; };
+        let Some(path) = target
+            .or_else(|| self.selected_entry_path())
+            .or_else(|| Some(self.current().path.clone()))
+        else {
+            return;
+        };
         let text = path.to_string_lossy().to_string();
         #[cfg(windows)]
         {
@@ -1362,7 +2433,12 @@ impl AppState {
         let dir_str = dir.to_string_lossy().to_string();
         #[cfg(windows)]
         {
-            if std::process::Command::new("wt").arg("-d").arg(&dir_str).spawn().is_err() {
+            if std::process::Command::new("wt")
+                .arg("-d")
+                .arg(&dir_str)
+                .spawn()
+                .is_err()
+            {
                 let _ = std::process::Command::new("cmd")
                     .args(["/C", "start", "cmd", "/K", "cd", "/d"])
                     .arg(&dir_str)
@@ -1378,7 +2454,9 @@ impl AppState {
     }
 
     fn do_open_with(&mut self, target: Option<PathBuf>) {
-        let Some(path) = target.or_else(|| self.selected_entry_path()) else { return; };
+        let Some(path) = target.or_else(|| self.selected_entry_path()) else {
+            return;
+        };
         #[cfg(windows)]
         {
             let path_str = path.to_string_lossy().to_string();
@@ -1388,21 +2466,677 @@ impl AppState {
                 .spawn();
         }
         #[cfg(not(windows))]
-        { let _ = path; }
+        {
+            let _ = path;
+        }
+    }
+
+    fn persist_user_settings(&self) {
+        let _ = crate::settings::save(&crate::settings::UserSettings {
+            explorer_view: self.layout_mode == LayoutMode::Explorer,
+            font_face: self.font_face.clone(),
+            font_size: self.font_size,
+            font_weight: self.font_weight,
+            ultra_fast: self.ultra_fast,
+        });
+    }
+
+    pub fn toggle_setting(&mut self, action: ToggleAction) {
+        match action {
+            ToggleAction::Theme => {
+                self.theme_mode = match self.theme_mode {
+                    ThemeMode::Dark => ThemeMode::Light,
+                    ThemeMode::Light => ThemeMode::Dark,
+                };
+                self.set_notice(
+                    format!(
+                        "Theme: {}",
+                        if self.theme_mode == ThemeMode::Dark {
+                            "Dark Mode"
+                        } else {
+                            "Light Mode"
+                        }
+                    ),
+                    false,
+                );
+            }
+            ToggleAction::LayoutMode => {
+                self.layout_mode = match self.layout_mode {
+                    LayoutMode::Miller => LayoutMode::Explorer,
+                    LayoutMode::Explorer => LayoutMode::Miller,
+                };
+                self.hovered_row = None;
+                self.persist_user_settings();
+                self.set_notice(
+                    format!(
+                        "File view: {}",
+                        if self.layout_mode == LayoutMode::Explorer {
+                            "Explorer list + preview"
+                        } else {
+                            "Miller columns"
+                        },
+                    ),
+                    false,
+                );
+            }
+            ToggleAction::UltraFast => {
+                self.ultra_fast = !self.ultra_fast;
+                self.persist_user_settings();
+                self.set_notice(
+                    format!(
+                        "Performance: {}",
+                        if self.ultra_fast {
+                            "ULTRA — zero input polling delay"
+                        } else {
+                            "Balanced"
+                        },
+                    ),
+                    false,
+                );
+            }
+            ToggleAction::OfficeMode => {
+                self.office_mode = match self.office_mode {
+                    OfficeRenderMode::Text => OfficeRenderMode::Full,
+                    OfficeRenderMode::Full => OfficeRenderMode::Text,
+                };
+                self.set_notice(
+                    format!(
+                        "Office mode: {}",
+                        if self.office_mode == OfficeRenderMode::Text {
+                            "Text"
+                        } else {
+                            "Full (Visual)"
+                        }
+                    ),
+                    false,
+                );
+            }
+            ToggleAction::PdfMode => {
+                self.pdf_mode = match self.pdf_mode {
+                    PdfRenderMode::Text => PdfRenderMode::Visual,
+                    PdfRenderMode::Visual => PdfRenderMode::Text,
+                };
+                self.set_notice(
+                    format!(
+                        "PDF mode: {}",
+                        if self.pdf_mode == PdfRenderMode::Text {
+                            "Text"
+                        } else {
+                            "Visual"
+                        }
+                    ),
+                    false,
+                );
+            }
+            ToggleAction::EditMode => {
+                if self.edit_preview_mode {
+                    self.edit_preview_mode = false;
+                    self.set_notice(
+                        if self.edit_dirty {
+                            "Preview Edit Mode: OFF (unsaved changes kept)"
+                        } else {
+                            "Preview Edit Mode: OFF"
+                        },
+                        false,
+                    );
+                } else {
+                    match self.sync_edit_buffer_with_selected() {
+                        Ok(()) => {
+                            self.edit_preview_mode = true;
+                            self.set_notice("Preview Edit Mode: ON — Esc exits", false);
+                        }
+                        Err(e) => {
+                            self.edit_preview_mode = false;
+                            self.set_notice(e, true);
+                        }
+                    }
+                }
+            }
+            ToggleAction::DirPreviewClick => {
+                self.dir_preview_clickable = !self.dir_preview_clickable;
+                self.set_notice(
+                    format!(
+                        "Directory Preview Clickable: {}",
+                        if self.dir_preview_clickable {
+                            "ON"
+                        } else {
+                            "OFF"
+                        }
+                    ),
+                    false,
+                );
+            }
+            ToggleAction::SortName => self.select_sort_mode(SortMode::Name),
+            ToggleAction::SortModified => self.select_sort_mode(SortMode::Modified),
+            ToggleAction::SortSize => self.select_sort_mode(SortMode::Size),
+            ToggleAction::SortOrder => {
+                self.sort_descending = !self.sort_descending;
+                self.resort_levels();
+                self.set_notice(
+                    format!(
+                        "Sort order: {}",
+                        if self.sort_descending {
+                            "Descending"
+                        } else {
+                            "Ascending"
+                        }
+                    ),
+                    false,
+                );
+            }
+            ToggleAction::Details => {
+                self.show_file_details = !self.show_file_details;
+                self.set_notice(
+                    format!(
+                        "File size and timestamp: {}",
+                        if self.show_file_details {
+                            "Shown"
+                        } else {
+                            "Hidden"
+                        }
+                    ),
+                    false,
+                );
+            }
+            ToggleAction::SelectionStyle => {
+                self.rounded_selection = !self.rounded_selection;
+                self.set_notice(
+                    format!(
+                        "Global control shape: {}",
+                        if self.rounded_selection {
+                            "Pill"
+                        } else {
+                            "Flat"
+                        }
+                    ),
+                    false,
+                );
+            }
+            ToggleAction::FontFamily => {
+                const FACES: [&str; 4] =
+                    ["Cascadia Code", "Nirmala UI", "Consolas", "Lucida Console"];
+                let current = FACES
+                    .iter()
+                    .position(|value| *value == self.font_face)
+                    .unwrap_or(0);
+                self.font_face = FACES[(current + 1) % FACES.len()].to_string();
+                self.persist_user_settings();
+                self.set_notice(
+                    format!("Terminal font: {} (applies on next launch)", self.font_face),
+                    false,
+                );
+            }
+            ToggleAction::FontSize => {
+                const SIZES: [u16; 6] = [8, 9, 10, 11, 12, 14];
+                let current = SIZES
+                    .iter()
+                    .position(|value| *value == self.font_size)
+                    .unwrap_or(0);
+                self.font_size = SIZES[(current + 1) % SIZES.len()];
+                self.persist_user_settings();
+                self.set_notice(
+                    format!(
+                        "Terminal font size: {} pt (applies fully on next launch)",
+                        self.font_size
+                    ),
+                    false,
+                );
+            }
+            ToggleAction::FontWeight => {
+                const WEIGHTS: [u16; 6] = [300, 400, 500, 600, 700, 800];
+                let current = WEIGHTS
+                    .iter()
+                    .position(|value| *value == self.font_weight)
+                    .unwrap_or(0);
+                self.font_weight = WEIGHTS[(current + 1) % WEIGHTS.len()];
+                self.persist_user_settings();
+                self.set_notice(
+                    format!(
+                        "Terminal font weight: {}{}",
+                        self.font_weight,
+                        if self.font_weight >= 600 {
+                            " (bold now; exact weight on next launch)"
+                        } else {
+                            " (exact weight on next launch)"
+                        },
+                    ),
+                    false,
+                );
+            }
+            ToggleAction::Hover => {
+                self.hover_enabled = !self.hover_enabled;
+                if !self.hover_enabled {
+                    self.hovered_row = None;
+                }
+                self.set_notice(
+                    format!(
+                        "Pointer hover highlighting: {}",
+                        if self.hover_enabled { "ON" } else { "OFF" }
+                    ),
+                    false,
+                );
+            }
+        }
+    }
+
+    fn select_sort_mode(&mut self, mode: SortMode) {
+        if self.sort_mode == mode {
+            self.sort_descending = !self.sort_descending;
+        } else {
+            self.sort_mode = mode;
+            self.sort_descending = false;
+        }
+        self.resort_levels();
+        self.set_notice(
+            format!(
+                "Sorted by {} ({})",
+                self.sort_mode.label(),
+                if self.sort_descending {
+                    "descending"
+                } else {
+                    "ascending"
+                },
+            ),
+            false,
+        );
+    }
+
+    pub fn sync_edit_buffer_with_selected(&mut self) -> Result<(), String> {
+        let p = self
+            .selected_file()
+            .ok_or_else(|| "Select a text file before enabling Edit".to_string())?;
+        if !p.is_file() {
+            return Err("Only files can be edited".to_string());
+        }
+
+        if self.edit_dirty && self.edit_path.as_ref() == Some(&p) {
+            // Resume the in-memory draft rather than silently replacing it.
+            return Ok(());
+        }
+        if self.edit_dirty && self.edit_path.as_ref() != Some(&p) {
+            let old_name = self
+                .edit_path
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .unwrap_or_default()
+                .to_string_lossy();
+            return Err(format!(
+                "Unsaved changes for {} are kept; reselect it to resume or save",
+                old_name
+            ));
+        }
+
+        let content =
+            fs::read_to_string(&p).map_err(|e| format!("Can't edit {}: {}", p.display(), e))?;
+        let (lines, line_ending) = split_edit_text(&content);
+        self.edit_buffer = lines;
+        self.edit_line_ending = line_ending.to_string();
+        self.edit_cursor_row = 0;
+        self.edit_cursor_col = 0;
+        self.preview_scroll = 0;
+        self.edit_dirty = false;
+        self.edit_path = Some(p);
+        Ok(())
+    }
+
+    pub fn save_edited_preview(&mut self) {
+        if let Some(path) = &self.edit_path {
+            let text = self.edit_buffer.join(&self.edit_line_ending);
+            match fs::write(path, text) {
+                Ok(_) => {
+                    self.edit_dirty = false;
+                    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+                    self.set_notice(format!("✓ Saved {}", file_name), false);
+                }
+                Err(e) => {
+                    self.set_notice(format!("⚠ Failed to save: {}", e), true);
+                }
+            }
+        }
+    }
+
+    pub fn handle_edit_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        if !self.edit_preview_mode {
+            return false;
+        }
+
+        if code == KeyCode::Esc {
+            self.edit_preview_mode = false;
+            self.set_notice(
+                if self.edit_dirty {
+                    "Left edit mode; unsaved changes are kept"
+                } else {
+                    "Left edit mode"
+                },
+                false,
+            );
+            return true;
+        }
+
+        if self.edit_buffer.is_empty() {
+            return true;
+        }
+
+        if modifiers.contains(KeyModifiers::CONTROL) {
+            if code == KeyCode::Char('s') || code == KeyCode::Char('S') {
+                self.save_edited_preview();
+                return true;
+            }
+        }
+
+        match code {
+            KeyCode::Char(c)
+                if modifiers == KeyModifiers::NONE || modifiers == KeyModifiers::SHIFT =>
+            {
+                if self.edit_cursor_row < self.edit_buffer.len() {
+                    let line = &mut self.edit_buffer[self.edit_cursor_row];
+                    let idx = line
+                        .char_indices()
+                        .nth(self.edit_cursor_col)
+                        .map(|(i, _)| i)
+                        .unwrap_or(line.len());
+                    line.insert(idx, c);
+                    self.edit_cursor_col += 1;
+                    self.edit_dirty = true;
+                    return true;
+                }
+            }
+            KeyCode::Enter => {
+                if self.edit_cursor_row < self.edit_buffer.len() {
+                    let line = self.edit_buffer[self.edit_cursor_row].clone();
+                    let idx = line
+                        .char_indices()
+                        .nth(self.edit_cursor_col)
+                        .map(|(i, _)| i)
+                        .unwrap_or(line.len());
+                    let (head, tail) = line.split_at(idx);
+                    self.edit_buffer[self.edit_cursor_row] = head.to_string();
+                    self.edit_buffer
+                        .insert(self.edit_cursor_row + 1, tail.to_string());
+                    self.edit_cursor_row += 1;
+                    self.edit_cursor_col = 0;
+                    self.edit_dirty = true;
+                    return true;
+                }
+            }
+            KeyCode::Backspace => {
+                if self.edit_cursor_col > 0 {
+                    let line = &mut self.edit_buffer[self.edit_cursor_row];
+                    let idx = line
+                        .char_indices()
+                        .nth(self.edit_cursor_col - 1)
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    let end = line
+                        .char_indices()
+                        .nth(self.edit_cursor_col)
+                        .map(|(i, _)| i)
+                        .unwrap_or(line.len());
+                    line.replace_range(idx..end, "");
+                    self.edit_cursor_col -= 1;
+                    self.edit_dirty = true;
+                    return true;
+                } else if self.edit_cursor_row > 0 {
+                    let curr = self.edit_buffer.remove(self.edit_cursor_row);
+                    self.edit_cursor_row -= 1;
+                    let prev = &mut self.edit_buffer[self.edit_cursor_row];
+                    self.edit_cursor_col = prev.chars().count();
+                    prev.push_str(&curr);
+                    self.edit_dirty = true;
+                    return true;
+                }
+            }
+            KeyCode::Delete => {
+                if self.edit_cursor_row < self.edit_buffer.len() {
+                    let len = self.edit_buffer[self.edit_cursor_row].chars().count();
+                    if self.edit_cursor_col < len {
+                        let line = &mut self.edit_buffer[self.edit_cursor_row];
+                        let idx = line
+                            .char_indices()
+                            .nth(self.edit_cursor_col)
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        let end = line
+                            .char_indices()
+                            .nth(self.edit_cursor_col + 1)
+                            .map(|(i, _)| i)
+                            .unwrap_or(line.len());
+                        line.replace_range(idx..end, "");
+                        self.edit_dirty = true;
+                        return true;
+                    } else if self.edit_cursor_row + 1 < self.edit_buffer.len() {
+                        let next = self.edit_buffer.remove(self.edit_cursor_row + 1);
+                        self.edit_buffer[self.edit_cursor_row].push_str(&next);
+                        self.edit_dirty = true;
+                        return true;
+                    }
+                }
+            }
+            KeyCode::Up => {
+                if self.edit_cursor_row > 0 {
+                    self.edit_cursor_row -= 1;
+                    let len = self.edit_buffer[self.edit_cursor_row].chars().count();
+                    self.edit_cursor_col = self.edit_cursor_col.min(len);
+                    return true;
+                }
+            }
+            KeyCode::Down => {
+                if self.edit_cursor_row + 1 < self.edit_buffer.len() {
+                    self.edit_cursor_row += 1;
+                    let len = self.edit_buffer[self.edit_cursor_row].chars().count();
+                    self.edit_cursor_col = self.edit_cursor_col.min(len);
+                    return true;
+                }
+            }
+            KeyCode::Left => {
+                if self.edit_cursor_col > 0 {
+                    self.edit_cursor_col -= 1;
+                    return true;
+                } else if self.edit_cursor_row > 0 {
+                    self.edit_cursor_row -= 1;
+                    self.edit_cursor_col = self.edit_buffer[self.edit_cursor_row].chars().count();
+                    return true;
+                }
+            }
+            KeyCode::Right => {
+                if self.edit_cursor_row < self.edit_buffer.len() {
+                    let len = self.edit_buffer[self.edit_cursor_row].chars().count();
+                    if self.edit_cursor_col < len {
+                        self.edit_cursor_col += 1;
+                        return true;
+                    } else if self.edit_cursor_row + 1 < self.edit_buffer.len() {
+                        self.edit_cursor_row += 1;
+                        self.edit_cursor_col = 0;
+                        return true;
+                    }
+                }
+            }
+            KeyCode::Home => {
+                self.edit_cursor_col = 0;
+                return true;
+            }
+            KeyCode::End => {
+                if self.edit_cursor_row < self.edit_buffer.len() {
+                    self.edit_cursor_col = self.edit_buffer[self.edit_cursor_row].chars().count();
+                    return true;
+                }
+            }
+            KeyCode::Tab => {
+                if self.edit_cursor_row < self.edit_buffer.len() {
+                    let line = &mut self.edit_buffer[self.edit_cursor_row];
+                    let idx = line
+                        .char_indices()
+                        .nth(self.edit_cursor_col)
+                        .map(|(i, _)| i)
+                        .unwrap_or(line.len());
+                    line.insert_str(idx, "    ");
+                    self.edit_cursor_col += 4;
+                    self.edit_dirty = true;
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        false
     }
 }
 
 // ── Text/code extension check ─────────────────────────────────────────────────
 
+fn scan_folder_stats(
+    root: PathBuf,
+    sender: std::sync::mpsc::Sender<FolderStats>,
+    cancel: Arc<AtomicBool>,
+) {
+    let mut stats = FolderStats::default();
+    let mut pending = vec![root];
+    let mut last_update = Instant::now();
+
+    while let Some(directory) = pending.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(_) => {
+                stats.inaccessible = stats.inaccessible.saturating_add(1);
+                continue;
+            }
+        };
+        for entry in entries {
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    stats.inaccessible = stats.inaccessible.saturating_add(1);
+                    continue;
+                }
+            };
+            let metadata = match fs::symlink_metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    stats.inaccessible = stats.inaccessible.saturating_add(1);
+                    continue;
+                }
+            };
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                // Do not follow links: doing so can loop or leave the selected tree.
+                stats.inaccessible = stats.inaccessible.saturating_add(1);
+            } else if file_type.is_dir() {
+                stats.folders = stats.folders.saturating_add(1);
+                pending.push(entry.path());
+            } else {
+                stats.files = stats.files.saturating_add(1);
+                stats.bytes = stats.bytes.saturating_add(metadata.len());
+            }
+
+            if last_update.elapsed() >= Duration::from_millis(120) {
+                if sender.send(stats.clone()).is_err() {
+                    return;
+                }
+                last_update = Instant::now();
+            }
+        }
+    }
+
+    stats.complete = true;
+    let _ = sender.send(stats);
+}
+
+pub fn filename_matches(entry: &DirEntryInfo, query: &str) -> bool {
+    !query.is_empty()
+        && entry.path.file_name().is_some_and(|name| {
+            name.to_string_lossy()
+                .to_lowercase()
+                .contains(&query.to_lowercase())
+        })
+}
+
+fn split_edit_text(content: &str) -> (Vec<String>, &'static str) {
+    let line_ending = if content.contains("\r\n") {
+        "\r\n"
+    } else if content.contains('\r') {
+        "\r"
+    } else {
+        "\n"
+    };
+    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+    // `split` intentionally keeps a final empty element. That represents the
+    // newline at EOF as a real editable boundary, so Backspace/Delete/Enter
+    // behave naturally at the bottom of the file.
+    let mut lines = normalized
+        .split('\n')
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    (lines, line_ending)
+}
+
 pub fn is_text_or_code(p: &PathBuf) -> bool {
-    let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-    matches!(ext.as_str(),
-        "rs"|"py"|"js"|"ts"|"tsx"|"jsx"|"html"|"htm"|"css"|"scss"|
-        "json"|"toml"|"yaml"|"yml"|"sh"|"bash"|"zsh"|"ps1"|"bat"|
-        "c"|"cpp"|"h"|"hpp"|"java"|"kt"|"go"|"rb"|"php"|"cs"|"lua"|
-        "sql"|"xml"|"md"|"markdown"|"txt"|"log"|"ini"|"cfg"|"conf"|
-        "swift"|"dart"|"r"|"jl"|"hs"|"ex"|"exs"|"vue"|"svelte"|
-        "astro"|"rtf"|"csv"|"tsv"|"rst"
+    let ext = p
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    matches!(
+        ext.as_str(),
+        "rs" | "py"
+            | "js"
+            | "ts"
+            | "tsx"
+            | "jsx"
+            | "html"
+            | "htm"
+            | "css"
+            | "scss"
+            | "json"
+            | "toml"
+            | "yaml"
+            | "yml"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "ps1"
+            | "bat"
+            | "c"
+            | "cpp"
+            | "h"
+            | "hpp"
+            | "java"
+            | "kt"
+            | "go"
+            | "rb"
+            | "php"
+            | "cs"
+            | "lua"
+            | "sql"
+            | "xml"
+            | "md"
+            | "markdown"
+            | "txt"
+            | "log"
+            | "ini"
+            | "cfg"
+            | "conf"
+            | "swift"
+            | "dart"
+            | "r"
+            | "jl"
+            | "hs"
+            | "ex"
+            | "exs"
+            | "vue"
+            | "svelte"
+            | "astro"
+            | "rtf"
+            | "csv"
+            | "tsv"
+            | "rst"
     )
 }
 
@@ -1433,31 +3167,93 @@ pub fn list_dir<P: AsRef<std::path::Path>>(path: P) -> anyhow::Result<Vec<DirEnt
         .map(|e| {
             let path = e.path();
             let is_dir = e.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-            DirEntryInfo { path, is_dir }
+            let metadata = e.metadata().ok();
+            let size = metadata
+                .as_ref()
+                .filter(|meta| !meta.is_dir())
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            let modified = metadata.and_then(|meta| meta.modified().ok());
+            DirEntryInfo {
+                path,
+                is_dir,
+                size,
+                modified,
+            }
         })
         .take(MAX_DIR_ENTRIES) // cap to prevent Sort + UI lag on huge dirs
         .collect();
 
     // Sort: directories first, then files, both alphabetically (case-insensitive)
-    entries.sort_by(|a, b| {
-        match (a.is_dir, b.is_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => {
-                let a_name = a.path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-                let b_name = b.path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-                a_name.cmp(&b_name)
-            }
+    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => {
+            let a_name = a
+                .path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase();
+            let b_name = b
+                .path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase();
+            a_name.cmp(&b_name)
         }
     });
 
     // Store in cache
-    DIR_CACHE.lock().insert(path_buf, DirCacheEntry {
-        entries: entries.clone(),
-        at:      Instant::now(),
-    });
+    DIR_CACHE.lock().insert(
+        path_buf,
+        DirCacheEntry {
+            entries: entries.clone(),
+            at: Instant::now(),
+        },
+    );
 
     Ok(entries)
+}
+
+pub(crate) fn sort_dir_entries(entries: &mut [DirEntryInfo], mode: SortMode, descending: bool) {
+    entries.sort_by(|a, b| {
+        let directory_order = match (a.is_dir, b.is_dir) {
+            (true, false) => return std::cmp::Ordering::Less,
+            (false, true) => return std::cmp::Ordering::Greater,
+            _ => std::cmp::Ordering::Equal,
+        };
+        if directory_order != std::cmp::Ordering::Equal {
+            return directory_order;
+        }
+
+        let name_a = a
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
+        let name_b = b
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
+        let order = match mode {
+            SortMode::Name => name_a.cmp(&name_b),
+            SortMode::Modified => a
+                .modified
+                .cmp(&b.modified)
+                .then_with(|| name_a.cmp(&name_b)),
+            SortMode::Size => a.size.cmp(&b.size).then_with(|| name_a.cmp(&name_b)),
+        };
+        if descending {
+            order.reverse()
+        } else {
+            order
+        }
+    });
 }
 
 /// Enumerate all available Windows drive letters (A:\ … Z:\).
@@ -1473,14 +3269,68 @@ pub fn list_windows_drives() -> Vec<DirEntryInfo> {
         .map(|i| {
             let letter = (b'A' + i as u8) as char;
             let path = PathBuf::from(format!("{}:\\", letter));
-            DirEntryInfo { path, is_dir: true }
+            DirEntryInfo {
+                path,
+                is_dir: true,
+                size: 0,
+                modified: None,
+            }
         })
         .collect()
 }
 
 // ── Recursive copy helper ─────────────────────────────────────────────────────
 
-fn copy_dir_all(src: impl AsRef<std::path::Path>, dst: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+#[cfg(windows)]
+fn move_to_recycle_bin(paths: &[PathBuf]) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::{
+        SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FO_DELETE,
+        SHFILEOPSTRUCTW,
+    };
+
+    // SHFileOperation expects a double-NUL-terminated list of paths.
+    let mut from: Vec<u16> = Vec::new();
+    for path in paths {
+        from.extend(path.as_os_str().encode_wide());
+        from.push(0);
+    }
+    from.push(0);
+
+    let mut operation = SHFILEOPSTRUCTW {
+        hwnd: std::ptr::null_mut(),
+        wFunc: FO_DELETE,
+        pFrom: from.as_ptr(),
+        pTo: std::ptr::null(),
+        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT) as u16,
+        fAnyOperationsAborted: 0,
+        hNameMappings: std::ptr::null_mut(),
+        lpszProgressTitle: std::ptr::null(),
+    };
+    let status = unsafe { SHFileOperationW(&mut operation) };
+    if status == 0 && operation.fAnyOperationsAborted == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Recycle Bin operation failed (code {status})"),
+        ))
+    }
+}
+
+fn destination_is_inside_source(src: &std::path::Path, destination_dir: &std::path::Path) -> bool {
+    // Both paths normally exist at paste time. Canonicalization also resolves
+    // `..`, drive-letter casing, and junction/symlink aliases on Windows.
+    match (fs::canonicalize(src), fs::canonicalize(destination_dir)) {
+        (Ok(src), Ok(destination)) => destination.starts_with(src),
+        _ => destination_dir.starts_with(src),
+    }
+}
+
+fn copy_dir_all(
+    src: impl AsRef<std::path::Path>,
+    dst: impl AsRef<std::path::Path>,
+) -> std::io::Result<()> {
     fs::create_dir_all(&dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
@@ -1539,7 +3389,10 @@ pub fn list_drives_info() -> Vec<DriveInfo> {
     use std::os::windows::ffi::OsStrExt;
 
     fn wide(s: &str) -> Vec<u16> {
-        std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
     }
     fn drive_kind(t: u32) -> &'static str {
         match t {
@@ -1615,4 +3468,167 @@ pub fn list_drives_info() -> Vec<DriveInfo> {
         total: 0,
         free: 0,
     }]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_windows_reserved_and_malformed_names() {
+        for name in [
+            "", "   ", ".", "..", "bad.", "bad ", "a/b", "CON", "con.txt", "LPT9.log",
+        ] {
+            assert!(
+                AppState::validate_filename(name).is_err(),
+                "{name:?} should be invalid"
+            );
+        }
+        for name in [
+            "report.txt",
+            ".gitignore",
+            "COM10",
+            " leading space.txt",
+            "résumé.md",
+        ] {
+            assert!(
+                AppState::validate_filename(name).is_ok(),
+                "{name:?} should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn detects_destination_inside_source() {
+        let base = std::env::temp_dir().join(format!(
+            "rusty-ranger-path-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = base.join("source");
+        let child = source.join("child");
+        let sibling = base.join("sibling");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+
+        assert!(destination_is_inside_source(&source, &source));
+        assert!(destination_is_inside_source(&source, &child));
+        assert!(!destination_is_inside_source(&source, &sibling));
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn unique_destination_preserves_extensions() {
+        let base =
+            std::env::temp_dir().join(format!("rusty-ranger-dest-test-{}", std::process::id()));
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("photo.jpg"), b"one").unwrap();
+        fs::write(base.join("photo (2).jpg"), b"two").unwrap();
+
+        assert_eq!(
+            unique_dest_path(&base, std::ffi::OsStr::new("photo.jpg")),
+            base.join("photo (3).jpg")
+        );
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn editor_preserves_lines_and_line_endings() {
+        let (lines, ending) = split_edit_text("one\r\ntwo\r\n\r\n");
+        assert_eq!(lines, ["one", "two", "", ""]);
+        assert_eq!(ending, "\r\n");
+        assert_eq!(lines.join(ending), "one\r\ntwo\r\n\r\n");
+
+        let (lines, ending) = split_edit_text("single line");
+        assert_eq!(lines, ["single line"]);
+        assert_eq!(ending, "\n");
+    }
+
+    #[test]
+    fn editor_expands_tabs_without_changing_the_buffer() {
+        let source = "\tlet\tx = 1;";
+        assert_eq!(crate::preview::expand_editor_tabs(source), "    let x = 1;");
+        assert_eq!(source, "\tlet\tx = 1;");
+    }
+
+    #[test]
+    fn sorting_keeps_folders_first_and_supports_metadata() {
+        let mut entries = vec![
+            DirEntryInfo {
+                path: PathBuf::from("large.txt"),
+                is_dir: false,
+                size: 500,
+                modified: Some(std::time::UNIX_EPOCH + Duration::from_secs(10)),
+            },
+            DirEntryInfo {
+                path: PathBuf::from("folder"),
+                is_dir: true,
+                size: 0,
+                modified: Some(std::time::UNIX_EPOCH + Duration::from_secs(5)),
+            },
+            DirEntryInfo {
+                path: PathBuf::from("small.txt"),
+                is_dir: false,
+                size: 10,
+                modified: Some(std::time::UNIX_EPOCH + Duration::from_secs(20)),
+            },
+        ];
+
+        sort_dir_entries(&mut entries, SortMode::Size, false);
+        assert_eq!(entries[0].path, PathBuf::from("folder"));
+        assert_eq!(entries[1].path, PathBuf::from("small.txt"));
+        assert_eq!(entries[2].path, PathBuf::from("large.txt"));
+
+        sort_dir_entries(&mut entries, SortMode::Modified, true);
+        assert_eq!(entries[0].path, PathBuf::from("folder"));
+        assert_eq!(entries[1].path, PathBuf::from("small.txt"));
+        assert_eq!(entries[2].path, PathBuf::from("large.txt"));
+    }
+
+    #[test]
+    fn folder_scan_reports_recursive_totals() {
+        let base = std::env::temp_dir().join(format!(
+            "rusty-ranger-properties-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(base.join("nested").join("deeper")).unwrap();
+        fs::write(base.join("one.bin"), [1_u8, 2, 3]).unwrap();
+        fs::write(base.join("nested").join("two.bin"), [4_u8, 5]).unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        scan_folder_stats(base.clone(), sender, Arc::new(AtomicBool::new(false)));
+        let stats = receiver.try_iter().last().expect("final folder totals");
+
+        assert!(stats.complete);
+        assert_eq!(stats.files, 2);
+        assert_eq!(stats.folders, 2);
+        assert_eq!(stats.bytes, 5);
+        assert_eq!(stats.inaccessible, 0);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn filename_filter_is_case_insensitive_and_literal() {
+        let entry = DirEntryInfo {
+            path: PathBuf::from("Quarterly Report [FINAL].PDF"),
+            is_dir: false,
+            size: 0,
+            modified: None,
+        };
+        assert!(filename_matches(&entry, "report"));
+        assert!(filename_matches(&entry, "[FINAL]"));
+        assert!(filename_matches(&entry, ".pdf"));
+        assert!(!filename_matches(&entry, "draft"));
+        assert!(!filename_matches(&entry, ""));
+    }
 }
