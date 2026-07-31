@@ -665,28 +665,6 @@ fn draw_sidebar(f: &mut Frame, app: &AppState, area: Rect, geo: &mut LayoutGeome
             f.render_widget(Paragraph::new(Line::from(spans)), options_rect);
             y += 1;
         }
-        draw_toggle(
-            f,
-            geo,
-            &mut y,
-            "📊",
-            "Office",
-            "Text",
-            "Full",
-            app.effective_office_mode() == crate::state::OfficeRenderMode::Full,
-            crate::state::ToggleAction::OfficeMode,
-        );
-        draw_toggle(
-            f,
-            geo,
-            &mut y,
-            "📄",
-            "PDF",
-            "Text",
-            "Visual",
-            app.effective_pdf_mode() == crate::state::PdfRenderMode::Visual,
-            crate::state::ToggleAction::PdfMode,
-        );
         if y < max_y {
             let rect = Rect {
                 x: inner.x,
@@ -2612,16 +2590,6 @@ fn draw_preview_pane(
         app.native_preview.hide();
         f.render_widget(
             Paragraph::new(Text::from(vec![
-                Line::from(vec![
-                    Span::styled(
-                        format!(" {} ", app.preview_mode.label().to_ascii_uppercase()),
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(t.accent2)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled("  Settling selection…", Style::default().fg(C_MUTED)),
-                ]),
                 Line::from(Span::styled(
                     format!("  {name}"),
                     Style::default().fg(C_TEXT).add_modifier(Modifier::BOLD),
@@ -2641,11 +2609,11 @@ fn draw_preview_pane(
         f.render_widget(
             Paragraph::new(Text::from(vec![
                 Line::from(Span::styled(
-                    "  Preparing preview…",
-                    Style::default().fg(C_WARN).add_modifier(Modifier::BOLD),
+                    format!("  {name}"),
+                    Style::default().fg(C_TEXT).add_modifier(Modifier::BOLD),
                 )),
                 Line::from(Span::styled(
-                    format!("  {name}  ·  {ext}  ·  {size_str}"),
+                    format!("  {ext}  ·  {size_str}"),
                     Style::default().fg(C_MUTED),
                 )),
             ])),
@@ -2689,6 +2657,22 @@ fn draw_preview_pane(
         }
         PreviewContent::Status(info) => {
             app.native_preview.hide();
+            if app.preview_mode == PreviewMode::Normal
+                && info.kind == preview::PreviewStatusKind::Loading
+                && !info.lines.is_empty()
+            {
+                let mut content_lines = Vec::new();
+                for line in theme_preview_lines(info.lines.clone(), app.theme_mode) {
+                    let mut spans = line.spans;
+                    spans.insert(0, Span::raw("  "));
+                    content_lines.push(Line::from(spans));
+                }
+                let para = Paragraph::new(Text::from(content_lines))
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll, 0));
+                f.render_widget(para, inner);
+                return;
+            }
             let (badge, color) = match info.kind {
                 preview::PreviewStatusKind::Loading => ("RENDERING", C_WARN),
                 preview::PreviewStatusKind::Fallback => ("FALLBACK", C_WARN),

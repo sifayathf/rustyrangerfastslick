@@ -13,7 +13,7 @@ On Windows, decoded images and rendered document pages are displayed in a mouse-
 *   **🖼️ Rich File Preview Engine**:
     *   **Images**: Supported formats: `jpg`, `jpeg`, `png`, `bmp`, `gif`, `webp`, `tiff`, `ico`. Includes zoom, rotate, and horizontal flip transforms.
     *   **Documents & Code**: Fully syntax-highlighted previews for code/text files with a beautiful **Catppuccin Mocha** palette.
-    *   **PDFs & Office**: Explicit Text/Visual states for PDF, DOC/DOCX/ODT, XLS/XLSX/ODS, and PPT/PPTX/ODP. Full rendering uses LibreOffice/OpenOffice, Microsoft Office automation, Poppler, or MuPDF and reports loading/fallback/failure honestly.
+    *   **PDFs & Office**: Normal provides quiet text immediately and upgrades to a cached visual in the background; Full uses LibreOffice/OpenOffice, Microsoft Office automation, Poppler, or MuPDF and reports renderer failures honestly; Blitz stays lightweight.
     *   **Data & Structure**: Formatted rendering of Jupyter Notebooks (`.ipynb`), `.csv`, `.tsv`, and `.rtf`.
     *   **Archives & Media**: Archive listings, audio metadata, animated-GIF external playback, and asynchronous video thumbnails. Press `Enter` or `Space` to play media in the default Windows application.
 *   **✏️ Inline Text Editor**: Jump directly into any editable text/code file within the preview pane with one keypress, edit inline, and save changes immediately.
@@ -50,7 +50,7 @@ On Windows, decoded images and rendered document pages are displayed in a mouse-
 | Click preview, then `Left` / `Right` or `PageUp` / `PageDown` | Move between rendered PDF pages or presentation slides |
 | Mouse wheel over paged preview | Move between pages/slides without scrolling the header |
 
-Preview modes are selected in the sidebar: **Normal** stages rich previews after a short settle delay, **Full** forces complete Office/PDF page rendering, and **Blitz** uses cached visuals or lightweight metadata without blocking navigation.
+Preview modes are selected in the sidebar: **Normal** shows useful content without refresh banners while a rich preview is prepared, **Full** forces complete Office/PDF page rendering, and **Blitz** uses cached visuals or quiet lightweight metadata without blocking navigation. The main mode is authoritative; legacy Office/PDF settings cannot silently turn Normal into Full.
 
 ### 3. Image Transform Controls
 *(Active when hovering over any image format)*

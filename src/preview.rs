@@ -249,9 +249,6 @@ fn record_render_failure(path: PathBuf, detail: impl Into<String>) {
 const PREVIEW_CACHE_CAPACITY: usize = 8;
 static PREVIEW_CACHE: Lazy<Mutex<VecDeque<(PreviewCacheKey, PreviewContent)>>> =
     Lazy::new(|| Mutex::new(VecDeque::new()));
-static PREVIEW_PARSE_PENDING: Lazy<Mutex<std::collections::HashSet<PreviewCacheKey>>> =
-    Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
-const ASYNC_PREVIEW_THRESHOLD: u64 = 256 * 1024;
 
 fn invalidate_preview_path(path: &std::path::Path) {
     PREVIEW_CACHE
@@ -350,8 +347,6 @@ pub fn render(
     p: &PathBuf,
     rotation: u32,
     flip_h: bool,
-    office_mode: crate::state::OfficeRenderMode,
-    pdf_mode: crate::state::PdfRenderMode,
     slide_idx: usize,
     preview_mode: crate::state::PreviewMode,
 ) -> PreviewContent {
@@ -369,16 +364,8 @@ pub fn render(
     let modified = metadata.as_ref().and_then(|value| value.modified().ok());
     let created = metadata.as_ref().and_then(|value| value.created().ok());
     let len = metadata.as_ref().map_or(0, |value| value.len());
-    let office_mode = if preview_mode == crate::state::PreviewMode::Full {
-        crate::state::OfficeRenderMode::Full
-    } else {
-        office_mode
-    };
-    let pdf_mode = if preview_mode == crate::state::PreviewMode::Full {
-        crate::state::PdfRenderMode::Visual
-    } else {
-        pdf_mode
-    };
+    let office_mode = preview_mode.office_policy();
+    let pdf_mode = preview_mode.pdf_policy();
     let blitz = preview_mode == crate::state::PreviewMode::Blitz;
     let office_full = office_mode == crate::state::OfficeRenderMode::Full;
     let pdf_visual = pdf_mode == crate::state::PdfRenderMode::Visual;
@@ -426,24 +413,33 @@ pub fn render(
             })
     };
     if let Some(cached) = cached {
+        let cached_loading = matches!(
+            &cached,
+            PreviewContent::Status(status) if status.kind == PreviewStatusKind::Loading
+        );
         let cached_ready_visual = match (&cached, ready_visual_path.as_ref()) {
             (PreviewContent::ImageFallback(info), Some(ready_path)) => info.path == *ready_path,
             _ => false,
         };
-        if !visual_requested || !visual_ready || cached_ready_visual {
+        // Loading is transient state, not a finished cache entry. Re-check it
+        // so renderer completion or the failure cooldown can settle Normal
+        // back to its quiet text preview instead of polling forever.
+        if !cached_loading && (!visual_requested || !visual_ready || cached_ready_visual) {
             return cached;
         }
     }
 
     if blitz && is_blitz_expensive(p, &ext) {
         if let Some(path) = ready_visual_path.as_ref().filter(|path| path.exists()) {
-            let content =
-                render_image_with_caption(path, rotation, flip_h, "Cached visual preview · Blitz");
+            let content = render_image_with_caption(path, rotation, flip_h, "Cached preview");
             cache_preview(cache_key, content.clone());
             return content;
         }
         if ext == "pptx" {
-            if let Some(content) = try_render_pptx_slide_media(p, rotation, flip_h, slide_idx) {
+            if let Some(mut content) = try_render_pptx_slide_media(p, rotation, flip_h, slide_idx) {
+                if let PreviewContent::ImageFallback(info) = &mut content {
+                    info.caption = Some("Cached slide artwork".to_string());
+                }
                 cache_preview(cache_key, content.clone());
                 return content;
             }
@@ -454,7 +450,10 @@ pub fn render(
                 "docx" | "odt" | "xlsx" | "ods" | "pptx" | "odp"
             )
         {
-            if let Some(content) = try_render_embedded_office_thumbnail(p, rotation, flip_h) {
+            if let Some(mut content) = try_render_embedded_office_thumbnail(p, rotation, flip_h) {
+                if let PreviewContent::ImageFallback(info) = &mut content {
+                    info.caption = Some("Cached document thumbnail".to_string());
+                }
                 cache_preview(cache_key, content.clone());
                 return content;
             }
@@ -463,28 +462,23 @@ pub fn render(
             .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|value| format!("Modified timestamp: {}", value.as_secs()))
             .unwrap_or_else(|| "Modified timestamp unavailable".to_string());
-        let content = preview_status(
-            PreviewStatusKind::Info,
-            "Blitz lightweight preview",
-            format!(
-                "{} · {} · rich conversion paused during rapid navigation",
-                p.file_name().unwrap_or_default().to_string_lossy(),
-                human_size(len)
-            ),
-            Some("Blitz"),
-            Some("Cached visual previews appear immediately. Switch to Normal or Full for uncached rich rendering."),
-            vec![
-                Line::from(Span::styled(
-                    format!("Type: {}", ext.to_ascii_uppercase()),
+        let content = PreviewContent::Highlighted(vec![
+            Line::from(Span::styled(
+                p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                Style::default().fg(SH_FG).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(vec![
+                Span::styled(
+                    format!("{} · ", ext.to_ascii_uppercase()),
                     Style::default().fg(SH_FN),
-                )),
-                Line::from(Span::styled(modified_label, Style::default().fg(SH_CMT))),
-                Line::from(Span::styled(
-                    "Enter opens the file externally",
-                    Style::default().fg(SH_FG),
-                )),
-            ],
-        );
+                ),
+                Span::styled(human_size(len), Style::default().fg(SH_CMT)),
+            ]),
+            Line::from(Span::styled(modified_label, Style::default().fg(SH_CMT))),
+        ]);
         cache_preview(cache_key, content.clone());
         return content;
     }
@@ -520,44 +514,6 @@ pub fn render(
         false
     };
 
-    if len >= ASYNC_PREVIEW_THRESHOLD && !visual_requested && should_parse_in_background(&ext) {
-        let mut pending = PREVIEW_PARSE_PENDING.lock();
-        if pending.insert(cache_key.clone()) {
-            let source = p.clone();
-            let worker_key = cache_key.clone();
-            let worker_ext = ext.clone();
-            std::thread::spawn(move || {
-                let content = normalize_preview_content(render_uncached(
-                    &source,
-                    &worker_ext,
-                    rotation,
-                    flip_h,
-                    office_mode,
-                    pdf_mode,
-                    slide_idx,
-                ));
-                let metadata = fs::metadata(&source).ok();
-                let still_current = metadata.as_ref().and_then(|value| value.modified().ok())
-                    == worker_key.modified
-                    && metadata.as_ref().map_or(0, |value| value.len()) == worker_key.len;
-                if still_current {
-                    cache_preview(worker_key.clone(), content);
-                }
-                PREVIEW_PARSE_PENDING.lock().remove(&worker_key);
-            });
-        }
-        return PreviewContent::Highlighted(vec![
-            Line::from(Span::styled(
-                "Preparing preview…",
-                Style::default().fg(SH_FN).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                format!("{} is being parsed in the background", human_size(len)),
-                Style::default().fg(SH_CMT),
-            )),
-        ]);
-    }
-
     let content = normalize_preview_content(render_uncached(
         p,
         &ext,
@@ -585,29 +541,6 @@ pub fn render(
     };
     cache_preview(cache_key, content.clone());
     content
-}
-
-fn should_parse_in_background(ext: &str) -> bool {
-    !matches!(
-        ext,
-        "jpg"
-            | "jpeg"
-            | "png"
-            | "bmp"
-            | "gif"
-            | "webp"
-            | "tiff"
-            | "tif"
-            | "ico"
-            | "mp3"
-            | "flac"
-            | "wav"
-            | "ogg"
-            | "aac"
-            | "m4a"
-            | "opus"
-            | "wma"
-    )
 }
 
 fn render_uncached(
@@ -4929,24 +4862,8 @@ mod tests {
         });
         fs::write(&path, serde_json::to_vec(&notebook).unwrap()).unwrap();
 
-        let first = render(
-            &path,
-            0,
-            false,
-            crate::state::OfficeRenderMode::Text,
-            crate::state::PdfRenderMode::Text,
-            0,
-            crate::state::PreviewMode::Normal,
-        );
-        let second = render(
-            &path,
-            0,
-            false,
-            crate::state::OfficeRenderMode::Text,
-            crate::state::PdfRenderMode::Text,
-            0,
-            crate::state::PreviewMode::Normal,
-        );
+        let first = render(&path, 0, false, 0, crate::state::PreviewMode::Normal);
+        let second = render(&path, 0, false, 0, crate::state::PreviewMode::Normal);
         match (first, second) {
             (PreviewContent::Code(first), PreviewContent::Code(second)) => {
                 assert!(Arc::ptr_eq(&first, &second));
@@ -5032,23 +4949,64 @@ mod tests {
     fn blitz_returns_useful_metadata_instead_of_a_deferred_placeholder() {
         let path = unique_test_path("blitz-metadata", "pdf");
         fs::write(&path, b"not a real pdf").unwrap();
-        match render(
-            &path,
-            0,
-            false,
-            crate::state::OfficeRenderMode::Text,
-            crate::state::PdfRenderMode::Text,
-            0,
-            crate::state::PreviewMode::Blitz,
-        ) {
-            PreviewContent::Status(status) => {
-                assert_eq!(status.kind, PreviewStatusKind::Info);
-                assert_eq!(status.title, "Blitz lightweight preview");
-                assert!(!status.detail.contains("deferred"));
-                assert!(!status.lines.is_empty());
+        match render(&path, 0, false, 0, crate::state::PreviewMode::Blitz) {
+            PreviewContent::Highlighted(lines) => {
+                let rendered = lines
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(rendered.contains("PDF"));
+                assert!(!rendered.contains("Blitz"));
+                assert!(!rendered.contains("deferred"));
             }
             _ => panic!("Blitz should return lightweight metadata"),
         }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn normal_mode_drops_stale_loading_and_never_surfaces_renderer_fallback() {
+        let path = unique_test_path("normal-quiet-fallback", "pdf");
+        fs::write(&path, b"%PDF-1.4\ninvalid test document").unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let key = PreviewCacheKey {
+            path: path.clone(),
+            modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+            len: metadata.len(),
+            rotation: 0,
+            flip_h: false,
+            office_full: false,
+            pdf_visual: false,
+            slide_idx: 0,
+            preview_mode: crate::state::PreviewMode::Normal,
+        };
+        cache_preview(
+            key,
+            preview_status(
+                PreviewStatusKind::Loading,
+                "old loading state",
+                "must be rechecked",
+                None,
+                None,
+                Vec::new(),
+            ),
+        );
+        let visual_cache = get_pdf_cache_path(&path, 0);
+        record_render_failure(visual_cache.clone(), "forced test renderer failure");
+
+        let rendered = render(&path, 0, false, 0, crate::state::PreviewMode::Normal);
+        assert!(!matches!(
+            rendered,
+            PreviewContent::Status(PreviewStatusInfo {
+                kind: PreviewStatusKind::Loading | PreviewStatusKind::Fallback,
+                ..
+            })
+        ));
+
+        PREVIEW_CACHE.lock().retain(|(key, _)| key.path != path);
+        OFFICE_RENDER_FAILURES.lock().remove(&visual_cache);
         fs::remove_file(path).unwrap();
     }
 
@@ -5194,24 +5152,8 @@ mod tests {
         ));
         image::DynamicImage::new_rgb8(2, 3).save(&path).unwrap();
 
-        let first = render(
-            &path,
-            0,
-            false,
-            crate::state::OfficeRenderMode::Text,
-            crate::state::PdfRenderMode::Text,
-            0,
-            crate::state::PreviewMode::Normal,
-        );
-        let rotated = render(
-            &path,
-            90,
-            false,
-            crate::state::OfficeRenderMode::Text,
-            crate::state::PdfRenderMode::Text,
-            0,
-            crate::state::PreviewMode::Normal,
-        );
+        let first = render(&path, 0, false, 0, crate::state::PreviewMode::Normal);
+        let rotated = render(&path, 90, false, 0, crate::state::PreviewMode::Normal);
         match (first, rotated) {
             (PreviewContent::ImageFallback(first), PreviewContent::ImageFallback(rotated)) => {
                 assert_eq!(first.dimensions, Some((2, 3)));

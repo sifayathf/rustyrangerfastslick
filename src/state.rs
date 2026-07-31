@@ -169,24 +169,30 @@ pub enum PreviewMode {
 }
 
 impl PreviewMode {
-    pub fn label(self) -> &'static str {
+    pub fn is_blitz(self) -> bool {
+        self == PreviewMode::Blitz
+    }
+
+    pub fn office_policy(self) -> OfficeRenderMode {
         match self {
-            PreviewMode::Normal => "Normal",
-            PreviewMode::Full => "Full",
-            PreviewMode::Blitz => "Blitz",
+            PreviewMode::Full => OfficeRenderMode::Full,
+            PreviewMode::Normal | PreviewMode::Blitz => OfficeRenderMode::Text,
         }
     }
 
-    pub fn is_blitz(self) -> bool {
-        self == PreviewMode::Blitz
+    pub fn pdf_policy(self) -> PdfRenderMode {
+        match self {
+            PreviewMode::Full => PdfRenderMode::Visual,
+            PreviewMode::Normal | PreviewMode::Blitz => PdfRenderMode::Text,
+        }
     }
 }
 
 fn preview_settle_delay(mode: PreviewMode) -> Duration {
     match mode {
-        PreviewMode::Normal => Duration::from_millis(140),
+        PreviewMode::Normal => Duration::from_millis(80),
         PreviewMode::Full => Duration::from_millis(160),
-        PreviewMode::Blitz => Duration::from_millis(220),
+        PreviewMode::Blitz => Duration::from_millis(40),
     }
 }
 
@@ -334,8 +340,6 @@ pub enum ToggleAction {
     PreviewNormal,
     PreviewFull,
     PreviewBlitz,
-    OfficeMode,
-    PdfMode,
     EditMode,
     DirPreviewClick,
     SortName,
@@ -357,8 +361,6 @@ struct PreviewRequestKey {
     len: u64,
     rotation: u32,
     flip_h: bool,
-    office_mode: OfficeRenderMode,
-    pdf_mode: PdfRenderMode,
     page_index: usize,
     preview_mode: PreviewMode,
 }
@@ -398,8 +400,6 @@ fn spawn_preview_worker() -> PreviewWorker {
                 &request.key.path,
                 request.key.rotation,
                 request.key.flip_h,
-                request.key.office_mode,
-                request.key.pdf_mode,
                 page_index,
                 request.key.preview_mode,
             );
@@ -838,8 +838,6 @@ impl AppState {
             len: metadata.as_ref().map_or(0, |value| value.len()),
             rotation: self.image_rotation,
             flip_h: self.image_flip_h,
-            office_mode: self.office_mode,
-            pdf_mode: self.pdf_mode,
             page_index: self.preview_page_index,
             preview_mode: self.preview_mode,
         })
@@ -886,7 +884,7 @@ impl AppState {
                 if info.kind == crate::preview::PreviewStatusKind::Loading
         );
         self.prepared_preview = Some((event.key, event.content));
-        self.preview_retry_at = loading.then(|| Instant::now() + Duration::from_millis(100));
+        self.preview_retry_at = loading.then(|| Instant::now() + Duration::from_millis(300));
     }
 
     fn refresh_preview_request(&mut self) {
@@ -945,19 +943,11 @@ impl AppState {
     }
 
     pub fn effective_office_mode(&self) -> OfficeRenderMode {
-        if self.preview_mode == PreviewMode::Full {
-            OfficeRenderMode::Full
-        } else {
-            self.office_mode
-        }
+        self.preview_mode.office_policy()
     }
 
     pub fn effective_pdf_mode(&self) -> PdfRenderMode {
-        if self.preview_mode == PreviewMode::Full {
-            PdfRenderMode::Visual
-        } else {
-            self.pdf_mode
-        }
+        self.preview_mode.pdf_policy()
     }
 
     pub fn is_paged_visual_selected(&self) -> bool {
@@ -3438,46 +3428,6 @@ impl AppState {
                     false,
                 );
             }
-            ToggleAction::OfficeMode => {
-                self.office_mode = match self.office_mode {
-                    OfficeRenderMode::Text => OfficeRenderMode::Full,
-                    OfficeRenderMode::Full => OfficeRenderMode::Text,
-                };
-                self.last_selection_changed_at = Instant::now();
-                self.invalidate_preview_pipeline(true);
-                self.set_notice(
-                    format!(
-                        "Office mode: {}",
-                        if self.office_mode == OfficeRenderMode::Text {
-                            "Text"
-                        } else {
-                            "Full (Visual)"
-                        }
-                    ),
-                    false,
-                );
-                self.persist_user_settings();
-            }
-            ToggleAction::PdfMode => {
-                self.pdf_mode = match self.pdf_mode {
-                    PdfRenderMode::Text => PdfRenderMode::Visual,
-                    PdfRenderMode::Visual => PdfRenderMode::Text,
-                };
-                self.last_selection_changed_at = Instant::now();
-                self.invalidate_preview_pipeline(true);
-                self.set_notice(
-                    format!(
-                        "PDF mode: {}",
-                        if self.pdf_mode == PdfRenderMode::Text {
-                            "Text"
-                        } else {
-                            "Visual"
-                        }
-                    ),
-                    false,
-                );
-                self.persist_user_settings();
-            }
             ToggleAction::EditMode => {
                 if self.edit_preview_mode {
                     self.edit_preview_mode = false;
@@ -4560,7 +4510,7 @@ mod tests {
     fn preview_modes_have_distinct_settle_policies() {
         assert_eq!(
             preview_settle_delay(PreviewMode::Normal),
-            Duration::from_millis(140)
+            Duration::from_millis(80)
         );
         assert_eq!(
             preview_settle_delay(PreviewMode::Full),
@@ -4568,8 +4518,14 @@ mod tests {
         );
         assert_eq!(
             preview_settle_delay(PreviewMode::Blitz),
-            Duration::from_millis(220)
+            Duration::from_millis(40)
         );
+        assert_eq!(PreviewMode::Normal.office_policy(), OfficeRenderMode::Text);
+        assert_eq!(PreviewMode::Normal.pdf_policy(), PdfRenderMode::Text);
+        assert_eq!(PreviewMode::Full.office_policy(), OfficeRenderMode::Full);
+        assert_eq!(PreviewMode::Full.pdf_policy(), PdfRenderMode::Visual);
+        assert_eq!(PreviewMode::Blitz.office_policy(), OfficeRenderMode::Text);
+        assert_eq!(PreviewMode::Blitz.pdf_policy(), PdfRenderMode::Text);
     }
 
     #[test]
